@@ -114,8 +114,7 @@ def scan_checks(sg):
 
 
 def no_light_checks(sg):
-    print("
-no light (the 5 Oct dry run): nothing to report, and it says so")
+    print("\nno light (the 5 Oct dry run): nothing to report, and it says so")
     tmp = tempfile.mkdtemp(prefix="rampol-dark-")
     run, bench = sim_scan(tmp, sg, imax=0.0)
     d = an.load_scan(run.folder, sg.load_capture)
