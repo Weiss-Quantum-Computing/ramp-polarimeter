@@ -270,9 +270,11 @@ def harmonic_fit(theta_deg, I, sem=None, diagnostics=None):
         lower = imin < 2 * sig_imin
         er = np.where(lower, imax / (2 * sig_imin), imax / imin)
         vis = B / a0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mod_snr = float(np.nanmedian(B / np.sqrt(np.maximum(var_b, 1e-30))))
     out.update(B=B, psi=psi, imax=imax, imin=imin, vis=vis, er=er,
                er_lower=lower, sig_psi=sig_psi, sig_imin=sig_imin,
-               rms=np.sqrt(s2), n_angles=K)
+               rms=np.sqrt(s2), n_angles=K, mod_snr=mod_snr)
     return out
 
 
@@ -350,7 +352,11 @@ def dip_er(pol, window_deg=8.0, min_samples=6, polarizer_er=None):
                                  im * np.sin(2 * r)])
             coef, *_ = np.linalg.lstsq(M, I[seg], rcond=None)
             c0, Ak, Ek = coef
-            if Ak <= 0:
+            # A dip is only a dip if the light is modulated and the fitted
+            # sin^2 has about the scale the per-sample fit predicts (Ak ~ 1).
+            # Without these, noise crossings count: a no-light dry run on
+            # 5 Oct 2026 reported 94 "dips" from 0.6 mV of noise.
+            if not 0.5 < Ak < 2.0:
                 continue
             j = a + int(np.argmin(np.abs(dl + np.rad2deg(Ek / Ak))))
             imax_c = float(imax_t[j])
@@ -359,6 +365,8 @@ def dip_er(pol, window_deg=8.0, min_samples=6, polarizer_er=None):
             dof = max(b - a - 3, 1)
             cov = np.linalg.pinv(M.T @ M) * (res @ res / dof)
             sig = float(np.sqrt(max(cov[0, 0], 0)))
+            if imax_c < 20 * max(sig, float(np.median(pol["sig_imin"][seg]))):
+                continue
             lower = imin < 2 * sig
             er = imax_c / (2 * sig) if lower else imax_c / imin
             er_light = None

@@ -890,8 +890,12 @@ class App:
             self.log(f"Loaded {d.name}: {pol['n_angles']} angles, {len(d.t)} samples, "
                      f"rest azimuth {pol['psi_rest']:+.3f} deg, {len(res['dips'])} "
                      f"dip ER points, {len(res['refine'])} refined windows")
+            if pol.get("mod_snr", 99) < 10:
+                self.log(f"  ! the light is not modulated by the analyzer (median "
+                         f"B/sigma {pol['mod_snr']:.1f}): no light, or the analyzer "
+                         f"is not in the beam - angles and ER from this scan are noise")
             dr = pol.get("drift_resid")
-            if dr is not None:
+            if dr is not None and pol.get("mod_snr", 99) >= 10:
                 self.log(f"  ref returns predict each other to {dr * 1e3:.2f}e-3 (leave-one-out "
                          f"rms): ER_fit is drift-limited above ~{1 / max(dr, 1e-9):.0f}; "
                          f"the dip and refine points are not")

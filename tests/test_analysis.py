@@ -113,10 +113,22 @@ def scan_checks(sg):
     check("windows parse", an.parse_windows("-1.5-0.5, 4.8-5.6") == [(-1.5e-3, 0.5e-3), (4.8e-3, 5.6e-3)])
 
 
+def no_light_checks(sg):
+    print("
+no light (the 5 Oct dry run): nothing to report, and it says so")
+    tmp = tempfile.mkdtemp(prefix="rampol-dark-")
+    run, bench = sim_scan(tmp, sg, imax=0.0)
+    d = an.load_scan(run.folder, sg.load_capture)
+    pol = an.polarization(d)
+    check("modulation flagged as unresolved", pol["mod_snr"] < 10, f"{pol['mod_snr']:.1f}")
+    check("no dips found in noise", len(an.dip_er(pol)) == 0, len(an.dip_er(pol)))
+
+
 def main():
     sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
     harmonic_checks()
     scan_checks(sg)
+    no_light_checks(sg)
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED: {', '.join(FAILS)}")
