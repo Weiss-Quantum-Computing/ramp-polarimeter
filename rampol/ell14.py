@@ -53,8 +53,13 @@ def _serial_module():
         try:
             import serial
         except ImportError as exc:
-            raise ImportError("ELL14 hardware access needs pyserial: "
-                              "python -m pip install --user pyserial") from exc
+            import os
+            raise ImportError(
+                f"ELL14 hardware access needs pyserial, and this Python could "
+                f"not import it: {exc!r}. Python: {sys.executable}; per-user "
+                f"site-packages: {user} "
+                f"({'present' if os.path.isdir(user) else 'MISSING'}). "
+                f"Install with: python -m pip install --user pyserial") from exc
     return serial
 
 

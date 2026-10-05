@@ -117,7 +117,9 @@ class App:
                 self.log("Stopped.")
             except Exception as exc:
                 self.log(f"ERROR: {exc}")
-                self.log("".join(traceback.format_exc().splitlines(True)[-4:]).rstrip())
+                # the whole chain: an ImportError's real cause is the one
+                # BEFORE the last few lines
+                self.log(traceback.format_exc().rstrip())
             finally:
                 # not busy BEFORE the callback runs, so a callback can start
                 # the next operation (dark -> unblock prompt -> scan)
