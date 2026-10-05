@@ -203,8 +203,38 @@ def stopped_mid_step_checks(sg):
           shots_seen.count("partial") == 19 and shots_seen.count("done") == 2, shots_seen)
 
 
+def few_angles_checks():
+    print("\n3 angles over 45 deg (the 5 Oct test-2 scan) and a ramp turning the negative way")
+    th = np.array([0.0, 22.5, 45.0])
+    t = np.linspace(-12e-3, 38e-3, 2000)
+    # raised-cosine 4.5 ms up, 0.5 ms hold, 4.5 ms down, to -180 deg
+    up = 0.5 * (1 - np.cos(np.pi * np.clip(t, 0, 4.5e-3) / 4.5e-3))
+    down = 0.5 * (1 - np.cos(np.pi * np.clip(9.5e-3 - t, 0, 4.5e-3) / 4.5e-3))
+    psi = -90.0 - 180.0 * np.minimum(up, down)
+    rng = np.random.default_rng(3)
+    I = malus(th, psi, 5.2, np.full(len(t), 900.0)) + rng.normal(0, 1.1e-3, (3, len(t)))
+    f = an.harmonic_fit(th, I, sem=np.full(3, 1.1e-3))
+    check("no residual left: errors from the shot scatter, said so",
+          f["dof"] == 0 and f["err_source"].startswith("shot scatter")
+          and np.all(np.isfinite(f["sig_imin"])) and np.median(f["sig_imin"]) > 1e-4,
+          f"{f['err_source']}, sig_Imin {np.median(f['sig_imin']) * 1e3:.2f} mV")
+    check("angle coverage reported", abs(f["theta_span"] - 45.0) < 1e-6, f["theta_span"])
+    rot = an.unwrap_psi(f["psi"]) - an.unwrap_psi(f["psi"])[0]
+    kinds = [s["kind"] for s in an.segments(t, rot)]
+    check("a ramp to -180 is still rest / up / hold / down / after",
+          kinds == ["rest", "up", "hold", "down", "after"], kinds)
+    from rampol import checks
+    plan = dict(config.DEFAULTS["scan"], start=0.0, stop=45.0, step=22.5)
+    sg_prof = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"]).scope_profiles.PROFILES["msox2014a"]
+    found = checks.settings_checks({}, sg_prof, {}, plan)
+    check("the pre-run check warns about too few, bunched angles",
+          sum(1 for lv, m in found if lv == "WARN" and ("angles" in m)) == 2,
+          [m for lv, m in found if lv == "WARN"])
+
+
 def main():
     sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
+    few_angles_checks()
     stopped_mid_step_checks(sg)
     harmonic_checks()
     scan_checks(sg)

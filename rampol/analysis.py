@@ -347,8 +347,10 @@ def harmonic_fit(theta_deg, I, sem=None, diagnostics=None):
     p = A.shape[1]
     if K < p:
         raise ValueError(f"{K} angles cannot fit {p} terms")
-    if sem is not None and np.all(np.isfinite(sem)) and np.all(np.asarray(sem) > 0):
+    sem_ok = sem is not None and np.all(np.isfinite(sem)) and np.all(np.asarray(sem) > 0)
+    if sem_ok:
         w = 1.0 / np.asarray(sem, float) ** 2
+        sigma0_sq = 1.0 / w.mean()        # the shot-scatter variance the weights stand for
         w = w / w.mean()
     else:
         w = np.ones(K)
@@ -356,8 +358,25 @@ def harmonic_fit(theta_deg, I, sem=None, diagnostics=None):
     Aw = A * sw
     coef, *_ = np.linalg.lstsq(Aw, I * sw, rcond=None)          # (p, N)
     resid = I - A @ coef
-    dof = max(K - p, 1)
-    s2 = np.sum(w[:, None] * resid ** 2, axis=0) / dof          # (N,)
+    dof = K - p
+    if dof >= 2:
+        s2 = np.sum(w[:, None] * resid ** 2, axis=0) / dof      # (N,) from the residual
+        err_source = "residual"
+    elif sem_ok:
+        # As many angles as terms (3 angles, 5 Oct 2026 test-2): the fit passes
+        # through every point, the residual is zero and says nothing. Fall back
+        # on the shot-to-shot scatter - statistical error only, no model check.
+        s2 = np.full(I.shape[1], sigma0_sq)
+        err_source = "shot scatter (no residual)"
+    else:
+        s2 = np.full(I.shape[1], np.nan)
+        err_source = "none"
+    # how much of the 2-theta circle the angles cover: Malus is periodic in
+    # 2 theta, and angles bunched in a quarter of it leave a0, B and psi
+    # strongly correlated however many there are
+    ang = np.sort(np.mod(2 * th, 2 * np.pi))
+    gaps = np.diff(np.r_[ang, ang[0] + 2 * np.pi]) if K else np.array([2 * np.pi])
+    theta_span = float(np.rad2deg(2 * np.pi - gaps.max()) / 2)
     cov = np.linalg.inv(Aw.T @ Aw)                              # (p, p), unit variance
     out = {k: coef[i] for i, k in enumerate(names)}
     a0, c2, s2c = out["a0"], out["c2"], out["s2"]
@@ -383,7 +402,8 @@ def harmonic_fit(theta_deg, I, sem=None, diagnostics=None):
         mod_snr = float(np.nanmedian(B / np.sqrt(np.maximum(var_b, 1e-30))))
     out.update(B=B, psi=psi, imax=imax, imin=imin, vis=vis, er=er,
                er_lower=lower, sig_psi=sig_psi, sig_imin=sig_imin,
-               rms=np.sqrt(s2), n_angles=K, mod_snr=mod_snr)
+               rms=np.sqrt(s2), n_angles=K, mod_snr=mod_snr, dof=dof,
+               err_source=err_source, theta_span=theta_span)
     return out
 
 
@@ -538,7 +558,9 @@ def segments(t, rotation, static_deg_per_ms=2.0, min_ms=0.3):
         if static[a]:
             base = "hold" if abs(rmean) > 45 else ("rest" if leg == 0 else "after")
         else:
-            base = "up" if rotation[b - 1] > rotation[a] else "down"
+            # away from rest is "up" whichever way the crystals turn it: in
+            # test-2's analyzer frame the ramp ran 0 -> -180 deg
+            base = "up" if abs(rotation[b - 1]) > abs(rotation[a]) else "down"
             if base == "up" and not (out and out[-1]["base"] == "up"):
                 leg += 1
         if out and out[-1]["base"] == base:

@@ -77,6 +77,21 @@ def settings_checks(settings, prof, roles, plan):
             out.append((WARN, "the record starts at or after the trigger: there is no "
                               "pre-trigger stretch for the rest level and the "
                               "missed-lock check"))
+    try:
+        from .scan import angle_list
+        angles = angle_list(float(plan["start"]), float(plan["stop"]), float(plan["step"]))
+    except (KeyError, ValueError):
+        angles = []
+    if angles:
+        span = min(max(angles) - min(angles), 180.0)
+        if len(angles) < 6:
+            out.append((WARN, f"{len(angles)} analyzer angles: the fit has 3 terms, so "
+                              f"with fewer than ~6 there is little or no residual to "
+                              f"check it against. 6-18 angles over 180 deg is the useful range"))
+        if span < 90:
+            out.append((WARN, f"the angles span {span:g} deg: Malus repeats every 180 deg, "
+                              f"and angles bunched in under 90 leave the fitted extinction "
+                              f"poorly determined - spread them over 0-170"))
     rep, wait = _f(plan.get("rep_s")), _f(plan.get("wait_s"))
     if np.isfinite(rep) and np.isfinite(wait) and wait <= rep:
         out.append((FAIL, f"trigger wait {wait:g} s is not longer than the repetition "

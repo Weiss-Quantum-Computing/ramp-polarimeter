@@ -1278,6 +1278,15 @@ class App:
                      f"{pol['n_angles']} angles, {len(d.t)} samples, "
                      f"rest azimuth {pol['psi_rest']:+.3f} deg, {len(res['dips'])} "
                      f"dip ER points, {len(res['refine'])} refined windows")
+            if pol.get("dof", 9) < 2:
+                self.log(f"  ! {pol['n_angles']} angles for a 3-term fit: no residual is "
+                         f"left, so the error bars come from the shot scatter only "
+                         f"({pol.get('err_source')}) and nothing checks the Malus model. "
+                         f"Measure 6+ angles over 0-170 deg.")
+            if pol.get("theta_span", 180) < 90:
+                self.log(f"  ! the angles cover {pol['theta_span']:.0f} deg of the 180 deg "
+                         f"Malus period: Imin and the ER from the fit are poorly "
+                         f"determined. Spread them over 0-170 deg.")
             if pol.get("mod_snr", 99) < 10:
                 self.log(f"  ! the light is not modulated by the analyzer (median "
                          f"B/sigma {pol['mod_snr']:.1f}): no light, or the analyzer "
