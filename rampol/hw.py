@@ -97,6 +97,13 @@ class ScopeLink:
         always put back, whatever happens."""
         cancelled = cancelled or (lambda: False)
         per = max(1, shots // blocks) if mode == "average" else 1
+        # what the acquisition was before, so the scope is left as found
+        acq = {}
+        for root in (self.prof.acq_type, self.prof.acq_count):
+            try:
+                acq[root] = self.scope.get(root)
+            except Exception:
+                pass
         plan = {}
         if dither_codes and blocks > 1:
             plan = self.scope.dither_plan(chans, dither_codes)
@@ -134,6 +141,14 @@ class ScopeLink:
             if plan:
                 for ch, exc in self.scope.restore_offsets(plan).items():
                     self.log(f"  dither: could not restore CH{ch} offset ({exc})")
+            # count first, while the type is still AVERage (the MSO-X ignores a
+            # count written in any other mode), then the type
+            for root in (self.prof.acq_count, self.prof.acq_type):
+                if root in acq:
+                    try:
+                        self.scope.put(root, acq[root])
+                    except Exception as exc:
+                        self.log(f"  could not restore {root} {acq[root]} ({exc})")
             try:
                 self.scope.run()
             except Exception:
