@@ -130,6 +130,7 @@ class ScanRun:
         self.clock = clock
         self.fmt = fmt
         self.manifest = None
+        self._on_step = None
 
     # -- manifest ---------------------------------------------------------
     def exists(self):
@@ -180,12 +181,14 @@ class ScanRun:
         self.save()
 
     # -- running ----------------------------------------------------------
-    def run(self, kinds=None):
+    def run(self, kinds=None, on_step=None):
         """Measure every step not yet done (optionally only of `kinds`).
         Returns the number of steps completed in this call. Raises Cancelled
-        if stopped, after saving."""
+        if stopped, after saving. on_step(step) is called after each step is
+        saved - the window uses it to redraw as the data comes in."""
         m = self.manifest
         plan = m["plan"]
+        self._on_step = on_step
         todo = [s for s in m["steps"] if s["status"] != "done"
                 and (kinds is None or s["kind"] in kinds)]
         total = len(todo)
@@ -204,6 +207,9 @@ class ScanRun:
             self.measure(s, plan)
             done += 1
             self.save()
+            self.done_count = getattr(self, "done_count", 0) + 1
+            if on_step is not None:
+                on_step(s)
         self.progress(done, total, "done")
         return done
 
@@ -213,6 +219,7 @@ class ScanRun:
         names = {ch: n for ch, (_, n) in self.channels.items()}
         s["t_start"] = now()
         s["clock"] = float(self.clock())
+        s["files"], s["hits"] = [], []
         if s["kind"] != "dark":
             s["landed"] = float(self.rot.approach(
                 s["target"], backoff=plan.get("backoff_deg", 3.0)))
@@ -256,6 +263,16 @@ class ScanRun:
                 path = sg.write_capture(b, self.fmt, cols, meta)
                 files.append(os.path.basename(path))
                 hits.append(h)
+                # Record every shot as it lands, not only the finished step: a
+                # step is 8 shots x 10 s on the spin-echo sequence, and a stop
+                # mid-step otherwise left its shots on disk but nowhere in the
+                # manifest (5 Oct 2026, 16-ms-spin-echo-test-2). A resume
+                # re-measures a 'partial' step from its first shot.
+                s["files"], s["hits"] = list(files), list(hits)
+                s["status"] = "partial"
+                self.save()
+                if self._on_step is not None:
+                    self._on_step(s)
 
             link.acquire_blocks(chans, mode, blocks, shots,
                                 dither_codes=int(plan.get("dither_codes", 3)),

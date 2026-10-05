@@ -52,6 +52,9 @@ class App:
         self.compare = None         # analysis of the compare scan
         self.cursor_t = None
         self.target = None          # last analyzer angle asked for (Go to / step / jog)
+        self.scan_cache = {}        # folder -> {step key: reduced step}, see an.load_scan
+        self.live_thread = None     # background analysis while a scan runs
+        self.live_pending = None
         self.plot_tabs = {}
         self.plot_dirty = set()
         self.busy_widgets = []
@@ -1019,7 +1022,7 @@ class App:
                 return
             run.load()
             self.run = run
-            self.worker(run.run, done=self.scan_done)
+            self.worker(lambda: self._run_scan(run), done=self.scan_done)
             return
         s = c["scan"]
         angles = scanmod.ordered(scanmod.angle_list(s["start"], s["stop"], s["step"]),
@@ -1033,9 +1036,10 @@ class App:
         self.run = run
         self.log(f"Scan {run.name}: {len(angles)} angles, {len(steps)} steps -> {run.folder}")
         if self.with_dark.get():
-            self.dark_then(run, lambda: self.worker(run.run, done=self.scan_done))
+            self.dark_then(run, lambda: self.worker(lambda: self._run_scan(run),
+                                                    done=self.scan_done))
         else:
-            self.worker(run.run, done=self.scan_done)
+            self.worker(lambda: self._run_scan(run), done=self.scan_done)
 
     def dark_then(self, run, after, vdiv_note=""):
         """Ask for the beam to be blocked, take the dark steps, ask for it to be
@@ -1122,7 +1126,7 @@ class App:
         run.add_steps(steps)
         self.run = run
         self.log(f"Refine: {len(plans)} windows, {len(steps)} steps at PD {vdiv:g} V/div")
-        go = lambda: self.worker(lambda: run.run(kinds={"null"}), done=self.scan_done)
+        go = lambda: self.worker(lambda: self._run_scan(run, {"null"}), done=self.scan_done)
         if not n_dark:
             self.dark_then(run, go, vdiv_note=f" (dark at {vdiv:g} V/div)")
         else:
@@ -1165,20 +1169,93 @@ class App:
         if sg is None:
             raise RuntimeError("Scope Grab is not loaded, so captures cannot be read")
         a = self.cfg["analysis"]
+        cache = self.scan_cache.setdefault(os.path.normcase(os.path.abspath(path)), {})
         d = an.load_scan(path, sg.load_capture, trim=int(a["trim"]),
-                         lock_tol=float(a.get("lock_tol", 0.0)))
-        pol = an.polarization(d, correct_drift=correct_drift)
-        dips = an.dip_er(pol, polarizer_er=a["polarizer_er"])
-        refine = an.refine_result(d, pol, polarizer_er=a["polarizer_er"])
-        mon = an.monitor_prediction(d, pol, a["deg_per_mon_v"])
-        return {"d": d, "pol": pol, "dips": dips, "refine": refine, "mon": mon,
-                "path": path}
+                         lock_tol=float(a.get("lock_tol", 0.0)), cache=cache)
+        steps = d.manifest.get("steps", [])
+        res = {"d": d, "path": path, "pol": None, "dips": [], "refine": [], "mon": None,
+               "raw": an.scan_matrix(d, "scan", correct_drift),
+               "n_done": sum(1 for x in steps if x.get("status") == "done"),
+               "n_partial": sum(1 for x in steps if x.get("status") == "partial"
+                                and x.get("files")),
+               "n_total": sum(1 for x in steps if x.get("status") != "skipped")}
+        try:
+            pol = an.polarization(d, correct_drift=correct_drift)
+        except ValueError:
+            return res                    # fewer than 3 angles so far: traces only
+        res.update(pol=pol, dips=an.dip_er(pol, polarizer_er=a["polarizer_er"]),
+                   refine=an.refine_result(d, pol, polarizer_er=a["polarizer_er"]),
+                   mon=an.monitor_prediction(d, pol, a["deg_per_mon_v"]))
+        return res
+
+    def live_refresh(self, folder):
+        """Re-analyse a scan that is still being measured, in a thread of its
+        own (the worker is busy with the instruments), and draw what there is.
+        Only the steps finished since the last refresh are read. A refresh
+        asked for while one runs is queued, not stacked."""
+        if self.live_thread is not None and self.live_thread.is_alive():
+            self.live_pending = folder
+            return
+        self.live_pending = None
+        drift = bool(self.drift_on.get())
+        name = os.path.basename(folder)
+        if name not in self.scan_box["values"]:
+            self.refresh_scan_list()
+        out = self.outdir.get().strip() or self.cfg["outdir"]
+        same = os.path.normcase(os.path.dirname(os.path.abspath(folder))) == \
+            os.path.normcase(os.path.abspath(out))
+        self.show_scan.set(name if same else folder)
+
+        def bg():
+            try:
+                res = self.analyse(folder, drift)
+            except Exception as exc:
+                res = None
+                self.log(f"  live view: {exc}")
+            self.call(self._live_done, res)
+        self.live_thread = threading.Thread(target=bg, daemon=True)
+        self.live_thread.start()
+
+    def _live_done(self, res):
+        if res is not None:
+            self.result = res
+            n = res["pol"]["n_angles"] if res["pol"] else len(res["raw"][0])
+            part = " + 1 in progress" if res.get("n_partial") else ""
+            self.plot_status.configure(
+                text=f"live: {res['n_done']}{part} of {res['n_total']} steps, {n} analyzer "
+                     f"angle(s)" + ("" if res["pol"] else " - the fit needs 3"),
+                foreground="#060")
+            self.mark_dirty()
+        if self.live_pending:
+            folder, self.live_pending = self.live_pending, None
+            self.live_refresh(folder)
+
+    def _run_scan(self, run, kinds=None):
+        """Worker: measure, redrawing after every step. A stop or an error
+        still returns, so the steps measured are loaded and shown."""
+        start = getattr(run, "done_count", 0)
+        try:
+            return run.run(kinds=kinds,
+                           on_step=lambda s: self.call(self.live_refresh, run.folder))
+        except hw.Cancelled:
+            n = getattr(run, "done_count", 0) - start
+            self.log(f"Stopped after {n} step(s); showing what was measured. Start the "
+                     f"scan again under the same name to resume it.")
+            return n
+        except Exception as exc:
+            n = getattr(run, "done_count", 0) - start
+            self.log(f"ERROR during the scan: {exc}")
+            self.log(f"  {n} step(s) were measured and are shown; start the scan again "
+                     f"under the same name to resume it.")
+            return n
 
     def do_load_shown(self):
         path = self._scan_path(self.show_scan.get())
         if not path:
             return
-        if self.busy and self.run is None:
+        if self.busy:
+            # a scan is using the worker: analyse in the background instead
+            self.live_refresh(path)
             return
         drift = bool(self.drift_on.get())
 
@@ -1188,9 +1265,17 @@ class App:
         def done(res):
             self.result = res
             pol, d = res["pol"], res["d"]
+            self.plot_status.configure(text=PLOT_HINT, foreground="#666")
             for n in d.notes:
                 self.log(f"  {n}")
-            self.log(f"Loaded {d.name}: {pol['n_angles']} angles, {len(d.t)} samples, "
+            if pol is None:
+                self.log(f"Loaded {d.name}: {res['n_done']} of {res['n_total']} steps, "
+                         f"{len(res['raw'][0])} analyzer angle(s) - traces only, the fit "
+                         f"needs 3")
+                self.mark_dirty()
+                return
+            self.log(f"Loaded {d.name}: {res['n_done']} of {res['n_total']} steps, "
+                     f"{pol['n_angles']} angles, {len(d.t)} samples, "
                      f"rest azimuth {pol['psi_rest']:+.3f} deg, {len(res['dips'])} "
                      f"dip ER points, {len(res['refine'])} refined windows")
             if pol.get("mod_snr", 99) < 10:
@@ -1263,6 +1348,13 @@ class App:
             ax.text(0.5, 0.5, "No scan loaded", ha="center", va="center",
                     transform=ax.transAxes, color="#888")
             ax.set_axis_off()
+        elif self.result["pol"] is None and draw != self.draw_traces:  # == on bound methods; "is" is always False
+            ax = fig.add_subplot(111)
+            n = len(self.result["raw"][0])
+            ax.text(0.5, 0.5, f"{n} analyzer angle(s) measured so far - this tab needs "
+                              f"the fit, which needs 3.\nThe Traces tab shows them now.",
+                    ha="center", va="center", transform=ax.transAxes, color="#888")
+            ax.set_axis_off()
         else:
             try:
                 draw(fig)
@@ -1326,7 +1418,10 @@ class App:
 
     def draw_traces(self, fig):
         res = self.result
-        pol, d = res["pol"], res["d"]
+        d = res["d"]
+        theta, I, _sem, steps = res["raw"]
+        pol = res["pol"] or {"theta": theta, "I": I, "steps": steps,
+                             "n_angles": len(theta)}
         t = d.t * 1e3
         has_mon = any(r in d.roles for r in ("MonX1", "MonX2", "CmdX1", "CmdX2"))
         ax = fig.add_subplot(211 if has_mon else 111)
@@ -1347,7 +1442,10 @@ class App:
             for r, col, ls in (("MonX1", "#1f77b4", "-"), ("MonX2", "#2ca02c", "-"),
                                ("CmdX1", "#1f77b4", "--"), ("CmdX2", "#2ca02c", "--")):
                 if r in d.roles:
-                    v = np.mean([s["v"][r] for s in pol["steps"]], axis=0)
+                    src = [s for s in (pol["steps"] or d.steps) if r in s["v"]]
+                    if not src:
+                        continue
+                    v = np.mean([s["v"][r] for s in src], axis=0)
                     ax2.plot(t, v, lw=0.8, color=col, ls=ls,
                              label=f"CH{d.roles[r]} {names[r]}")
             ax2.set_ylabel("monitor (V, 1 V/kV) and command (V)")
@@ -1562,6 +1660,8 @@ class App:
         if not self.result:
             return
         pol = self.result["pol"]
+        if pol is None:
+            return
 
         def f(x, fmt):
             return "" if x is None or (isinstance(x, float) and not np.isfinite(x)) else format(x, fmt)

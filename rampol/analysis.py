@@ -56,7 +56,70 @@ def _role_columns(columns, channels):
     return out
 
 
-def load_scan(path, load_capture, trim=10, lock_tol=0.0):
+def _step_key(folder, s, trim):
+    """What a step's reduced data depends on: its files as they are on disk."""
+    parts = [trim]
+    for f in s.get("files", []):
+        try:
+            st = os.stat(os.path.join(folder, f))
+            parts.append((f, st.st_size, st.st_mtime_ns))
+        except OSError:
+            parts.append((f, None, None))
+    return tuple(parts)
+
+
+def _reduce_step(s, folder, chans, load_capture, trim, notes):
+    """Read one step's files and reduce them as they come: per role the sum
+    and sum of squares (for mean and standard error) and the off-screen mask;
+    the PD's shots are kept, as float32, for the missed-lock check. Holding
+    every shot of every channel instead peaked above 1 GB for a 36-angle
+    scan of 100 kpt single shots."""
+    acc, t, pd_shots, cols_map = {}, None, [], None
+    n = None
+    for f in s["files"]:
+        fp = os.path.join(folder, f)
+        if not os.path.exists(fp):
+            notes.append(f"missing {f}")
+            continue
+        columns, data = load_capture(fp)
+        cols_map = _role_columns(columns, chans)
+        data = data[trim:, :]
+        if n is None:
+            n, t = data.shape[0], data[:, 0].copy()
+        if data.shape[0] < n:          # a short file: keep what all of them have
+            n, t = data.shape[0], t[:data.shape[0]]
+            for a in acc.values():
+                a["sum"], a["sq"] = a["sum"][:n], a["sq"][:n]
+                a["lo"], a["hi"] = a["lo"][:n], a["hi"][:n]
+            pd_shots = [p[:n] for p in pd_shots]
+        for role, j in cols_map.items():
+            y = data[:n, j]
+            a = acc.setdefault(role, {"sum": np.zeros(n), "sq": np.zeros(n),
+                                      "lo": np.full(n, np.inf), "hi": np.full(n, -np.inf),
+                                      "k": 0})
+            a["sum"] += y
+            a["sq"] += y * y
+            np.minimum(a["lo"], y, out=a["lo"])
+            np.maximum(a["hi"], y, out=a["hi"])
+            a["k"] += 1
+            if role == "PD":
+                pd_shots.append(y.astype(np.float32))
+    if t is None:
+        return None
+    return {"t": t, "acc": acc,
+            "pd": np.array(pd_shots) if pd_shots else None}
+
+
+def _mean_sem(a):
+    k = a["k"]
+    mean = a["sum"] / k
+    if k < 2:
+        return mean, np.full(len(mean), np.nan)
+    var = np.maximum(a["sq"] - k * mean * mean, 0) / (k - 1)
+    return mean, np.sqrt(var / k)
+
+
+def load_scan(path, load_capture, trim=10, lock_tol=0.0, cache=None):
     """Read a scan's manifest and captures. `path` is the manifest or its
     folder. Each step gets 'v' {role: mean over its files (blocks or shots)},
     'sem' {role: standard error from their scatter}, 'nb' files used,
@@ -64,12 +127,20 @@ def load_scan(path, load_capture, trim=10, lock_tol=0.0):
     outside the screen in any file}. The first `trim` samples are dropped (the
     MSO-X puts a fixed ~1.2 V artefact on sample 0).
 
+    Steps are loaded as far as they got: a 'partial' step (stopped, or still
+    being measured) contributes the shots it has, and is marked
+    step['partial'] = True, so a scan can be shown while it runs or after it
+    was stopped. `cache` (a dict kept by the caller) holds each
+    step's reduced data keyed by its files' sizes and times, so reloading a
+    growing scan reads only the new steps.
+
     lock_tol > 0 drops shots the intensity lock missed: a file whose PD level
     before the trigger (t < 0, else the first 4 % of the record) is off its
     step's median by more than lock_tol x the brightest such level in the
     scan. Relative to the brightest level, because at angles near crossed the
     level is ~0 and a relative test there would reject on noise. Steps with
-    fewer than 4 files are left alone (no median to trust)."""
+    fewer than 4 files are left alone (no median to trust). Only the PD is
+    re-averaged without them; the other channels keep every shot."""
     if os.path.isdir(path):
         cands = [f for f in os.listdir(path) if f.endswith("_scan.json")]
         if not cands:
@@ -81,50 +152,42 @@ def load_scan(path, load_capture, trim=10, lock_tol=0.0):
     d = ScanData(man, folder)
     chans = man["channels"]
     d.roles = {v["role"]: int(k) for k, v in chans.items() if v["role"] != "off"}
-    t_ref = None
-    loaded = []                                   # (manifest step, {role: (nb, n)})
+    cache = {} if cache is None else cache
+    loaded = []
     for s in man["steps"]:
-        if s.get("status") != "done" or not s.get("files"):
+        if s.get("status") not in ("done", "partial") or not s.get("files"):
             continue
-        blocks, t = [], None
-        cols_map = None
-        for f in s["files"]:
-            fp = os.path.join(folder, f)
-            if not os.path.exists(fp):
-                d.notes.append(f"missing {f}")
+        key = _step_key(folder, s, trim)
+        red = cache.get(key)
+        if red is None:
+            red = _reduce_step(s, folder, chans, load_capture, trim, d.notes)
+            if red is None:
                 continue
-            columns, data = load_capture(fp)
-            cols_map = _role_columns(columns, chans)
-            t = data[trim:, 0]
-            blocks.append(data[trim:, :])
-        if not blocks:
-            continue
-        n = min(b.shape[0] for b in blocks)
-        stack = np.stack([b[:n] for b in blocks])        # (nb, n, cols)
-        t = t[:n]
-        if t_ref is None:
-            t_ref = t
-        ys = {}
-        for role, j in cols_map.items():
-            y = stack[:, :, j]
-            if len(t) != len(t_ref) or not np.allclose(t[[0, -1]], t_ref[[0, -1]]):
-                y = np.array([np.interp(t_ref, t, yy) for yy in y])
-            ys[role] = y
-        loaded.append((s, ys))
-    if t_ref is None:
-        raise ValueError("no completed steps with data in this scan")
+            cache[key] = red
+        loaded.append((s, red))
+    if not loaded:
+        raise ValueError("no completed steps with data in this scan yet")
+    t_ref = loaded[0][1]["t"]
     d.t = t_ref
     pre = rest_index(t_ref)
+
+    def on_ref(red, y):
+        t = red["t"]
+        if len(t) == len(t_ref) and np.allclose(t[[0, -1]], t_ref[[0, -1]]):
+            return y
+        return np.interp(t_ref, t, y)
+
     keep = {}
     if lock_tol > 0:
-        levels = [np.median(ys["PD"][:, pre].mean(axis=1))
-                  for s, ys in loaded if "PD" in ys and s["kind"] != "dark"]
+        levels = [np.median(red["pd"][:, pre[:red["pd"].shape[1]]].mean(axis=1))
+                  for s, red in loaded if red["pd"] is not None and s["kind"] != "dark"]
         top = max([abs(x) for x in levels] or [0.0])
         dropped = 0
-        for i, (s, ys) in enumerate(loaded):
-            if "PD" not in ys or s["kind"] == "dark" or len(ys["PD"]) < 4 or top <= 0:
+        for i, (s, red) in enumerate(loaded):
+            sh = red["pd"]
+            if sh is None or s["kind"] == "dark" or len(sh) < 4 or top <= 0:
                 continue
-            base = ys["PD"][:, pre].mean(axis=1)
+            base = sh[:, pre[:sh.shape[1]]].mean(axis=1)
             ok = np.abs(base - np.median(base)) <= lock_tol * top
             if not ok.all() and ok.sum() >= 2:
                 keep[i] = ok
@@ -133,27 +196,36 @@ def load_scan(path, load_capture, trim=10, lock_tol=0.0):
             d.notes.append(f"dropped {dropped} shot(s) whose pre-trigger level was "
                            f"off their step's median by > {lock_tol:.1%} of the "
                            f"brightest level (intensity lock missed?)")
-    for i, (s, ys) in enumerate(loaded):
+    for i, (s, red) in enumerate(loaded):
         step = dict(s)
+        step["partial"] = s.get("status") == "partial"
         ok = keep.get(i)
         step["rejected"] = 0 if ok is None else int((~ok).sum())
         step["v"], step["sem"], step["offscreen"] = {}, {}, {}
-        for role, y in ys.items():
-            if ok is not None:
-                y = y[ok]
-            step["nb"] = len(y)
-            step["v"][role] = y.mean(axis=0)
-            step["sem"][role] = (y.std(axis=0, ddof=1) / np.sqrt(len(y))
-                                 if len(y) > 1 else np.full(y.shape[1], np.nan))
+        for role, a in red["acc"].items():
+            if role == "PD" and ok is not None:
+                y = red["pd"][ok].astype(np.float64)
+                mean = y.mean(axis=0)
+                sem = y.std(axis=0, ddof=1) / np.sqrt(len(y))
+                lo, hi = y.min(axis=0), y.max(axis=0)
+                step["nb"] = len(y)
+            else:
+                mean, sem = _mean_sem(a)
+                lo, hi = a["lo"], a["hi"]
+                if role == "PD" or "nb" not in step:
+                    step["nb"] = a["k"]
+            step["v"][role] = on_ref(red, mean)
+            step["sem"][role] = on_ref(red, sem)
             sc = s.get("scales", {}).get(str(d.roles.get(role, "")))
             if sc and np.isfinite(sc[0]):
                 vdiv, off = sc
                 # 4 div either side of the offset is the screen; past it the
                 # trace is outside the calibrated range and may be clipped
                 lim = 4.0 * vdiv
-                step["offscreen"][role] = np.any(np.abs(y - off) > lim, axis=0)
+                mask = (np.abs(on_ref(red, hi) - off) > lim) | (np.abs(on_ref(red, lo) - off) > lim)
+                step["offscreen"][role] = mask
                 step["offscreen_frac"] = step.get("offscreen_frac", {})
-                step["offscreen_frac"][role] = float(np.mean(step["offscreen"][role]))
+                step["offscreen_frac"][role] = float(np.mean(mask))
         d.steps.append(step)
     return d
 

@@ -146,8 +146,18 @@ def main():
         app.sv[k].set(v)
 
     print("\nscan")
+    live_seen = []
+    real_live_done = app._live_done
+
+    def spy(res):
+        if res is not None:
+            live_seen.append(res["n_done"])
+        real_live_done(res)
+    app._live_done = spy
     app.do_start_scan()
     settle(root, app, timeout=300)
+    check("plots updated while the scan ran", len(live_seen) >= 3
+          and min(live_seen) < max(live_seen), live_seen)
     check("scan loaded after it ran", app.result is not None)
     if app.result is None:
         print(app.logbox.get("1.0", "end")[-3000:])
@@ -192,6 +202,38 @@ def main():
     app.nb.select(app.fig_ext._frame)
     root.update()
     app.fig_ext.savefig(os.path.join(out, "Extinction_refined.png"))
+
+    print("\nstopping part-way: what was measured is loaded and drawn")
+    app.scan_name.set("stopped part way")
+    app.with_dark.set(False)
+    app.check_first.set(False)
+    app._sim_parts[0].realtime = 0.05        # slow enough to stop mid-scan
+    app.nb.select(app.fig_traces._frame)      # draw the live traces as they come
+    live_seen.clear()
+    app.do_start_scan()
+    t0 = time.time()
+    root.update()
+    while (app.busy or not app.calls.empty()) and time.time() - t0 < 120:
+        root.update()
+        time.sleep(0.01)
+        if len(live_seen) >= 4 and not app.stop_flag.is_set():
+            app.do_stop()
+    settle(root, app)
+    res = app.result
+    log = app.logbox.get("1.0", "end")
+    check("the stopped scan is loaded", res is not None and res["d"].name == "stopped-part-way"
+          and 0 < res["n_done"] < res["n_total"],
+          res and (res["d"].name, res["n_done"], res["n_total"]))
+    check("the log says where it stopped and how to resume", "Stopped after" in log
+          and "resume" in log)
+    check("live traces drew from the first steps on", live_seen and min(live_seen) <= 2,
+          live_seen)
+    app.redraw(app.fig_traces)
+    lines = len(app.fig_traces.axes[0].lines) if app.fig_traces.axes else 0
+    check("Traces draws the shots even before there is a fit (fewer than 3 angles)",
+          res is not None and (res["pol"] is not None or lines > 0),
+          f"fit: {res and res['pol'] is not None}, lines drawn: {lines}")
+    app.fig_traces.savefig(os.path.join(out, "Traces_stopped.png"))
     print(f"\nfigures in {out}")
     app.on_close()
     check("settings saved to the sandbox", os.path.exists(cfgmod.CONFIG_PATH))

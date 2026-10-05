@@ -174,8 +174,38 @@ def spin_echo_checks(sg):
           "CmdX1" in d.roles and abs(np.max(d.steps[1]["v"]["CmdX1"]) - 1.65 * 180 / 35.07) < 0.1)
 
 
+def stopped_mid_step_checks(sg):
+    print("\nstopped in the middle of a step: its shots are kept and loaded")
+    tmp = tempfile.mkdtemp(prefix="rampol-stop-")
+    scope, ell, bench = sim.make(sg)
+    link, rot = hw.ScopeLink(scope, log=lambda *_: None), hw.Rotator(ell, log=lambda *_: None)
+    shots_seen = []
+    run = scan.ScanRun(tmp, "st", sg, link, rot, {1: ("PD", "PD")}, log=lambda *_: None,
+                       clock=lambda: bench.clock,
+                       cancelled=lambda: shots_seen.count("partial") >= 8 + 8 + 3)
+    plan = dict(config.DEFAULTS["scan"], mode="single", shots=8, points=5000)
+    run.new(plan, scan.build_steps(scan.angle_list(0, 90, 30), 0, 45))
+    try:
+        run.run(on_step=lambda s: shots_seen.append(s["status"]))
+        check("the stop was honoured", False)
+    except hw.Cancelled:
+        pass
+    steps = run.load()["steps"]
+    status = [(s["status"], len(s.get("files", []))) for s in steps]
+    check("two steps done, the third partial with the 3 shots it took",
+          status[:3] == [("done", 8), ("done", 8), ("partial", 3)], status)
+    d = an.load_scan(run.folder, sg.load_capture)
+    part = [s for s in d.steps if s.get("partial")]
+    check("the partial step is loaded, flagged, with its 3 shots",
+          len(d.steps) == 3 and len(part) == 1 and part[0]["nb"] == 3,
+          [(s["kind"], s["nb"], s.get("partial")) for s in d.steps])
+    check("on_step reported every shot, and each finished step",
+          shots_seen.count("partial") == 19 and shots_seen.count("done") == 2, shots_seen)
+
+
 def main():
     sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
+    stopped_mid_step_checks(sg)
     harmonic_checks()
     scan_checks(sg)
     no_light_checks(sg)
