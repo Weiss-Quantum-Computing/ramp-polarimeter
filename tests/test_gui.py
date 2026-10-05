@@ -82,6 +82,21 @@ def main():
     settle(root, app)
     pos = float(app.pos_label.cget("text").split()[1])
     check("go to lands within 0.05 deg", abs(pos - 123.4) < 0.05, f"{pos:.3f}")
+    app.step_var.set("0.25")
+    for _ in range(4):
+        app.do_step(+1)
+        settle(root, app)
+    pos = float(app.pos_label.cget("text").split()[1])
+    check("four +0.25 steps count from the target, not the landings",
+          abs(app.target - 124.4) < 1e-9 and abs(pos - 124.4) < 0.05,
+          f"target {app.target:.4f}, read {pos:.4f}")
+    app.do_jog(-10)
+    settle(root, app)
+    check("jog -10 from the target", abs(app.target - 114.4) < 1e-9)
+    app.step_var.set("0.001")
+    app.do_step(+1)
+    settle(root, app)
+    check("a step below one pulse is refused", abs(app.target - 114.4) < 1e-9)
 
     print("\nscope settings window")
     app.open_scope_settings()

@@ -51,6 +51,7 @@ class App:
         self.result = None          # analysis of the scan on show
         self.compare = None         # analysis of the compare scan
         self.cursor_t = None
+        self.target = None          # last analyzer angle asked for (Go to / step / jog)
         self.plot_tabs = {}
         self.plot_dirty = set()
         self.busy_widgets = []
@@ -207,6 +208,16 @@ class App:
         for d in (-10, -1, 1, 10):
             self._btn(r, f"{d:+d}", lambda d=d: self.do_jog(d), padx=(4 if d == -10 else 1, 0))
         r = ttk.Frame(f)
+        r.pack(fill="x", padx=6, pady=2)
+        ttk.Label(r, text="Step").pack(side="left")
+        self.step_var = tk.StringVar(value="0.1")
+        ttk.Entry(r, textvariable=self.step_var, width=8).pack(side="left", padx=4)
+        ttk.Label(r, text="deg").pack(side="left")
+        self._btn(r, "- step", lambda: self.do_step(-1), padx=(6, 0))
+        self._btn(r, "+ step", lambda: self.do_step(+1), padx=(2, 0))
+        ttk.Label(r, text="smallest 0.0025 (1 pulse)", foreground="#666").pack(
+            side="left", padx=(8, 0))
+        r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=(2, 4))
         ttk.Label(r, text="Zero = mount").pack(side="left")
         self.zero_var = tk.StringVar()
@@ -229,9 +240,8 @@ class App:
             self.ch_name[ch] = tk.StringVar()
             ttk.Entry(r, textvariable=self.ch_name[ch], width=24).pack(side="left")
         ttk.Label(f, foreground="#666", justify="left", wraplength=330,
-                  text="One PD is required. MonX1/MonX2 give the monitor "
-                       "prediction; Ref (a pick-off before the analyzer) "
-                       "normalises intensity per sample.").pack(anchor="w", padx=6, pady=(0, 4))
+                  text="One PD required. Mon = Trek monitor, Cmd = Trek command, "
+                       "Ref = pick-off before the analyzer.").pack(anchor="w", padx=6, pady=(0, 4))
 
     def build_scan(self, left):
         f = ttk.LabelFrame(left, text="Scan")
@@ -316,10 +326,8 @@ class App:
         self._btn(rr, "Plan", self.do_plan_refine)
         self._btn(rr, "Run refine on shown scan", self.do_run_refine, padx=6)
         ttk.Label(f, foreground="#666", justify="left", wraplength=330,
-                  text="'auto' = rest, hold and after-ramp windows. At a "
-                       "sensitive V/div the bright part of the ramp is off "
-                       "screen; a window right after it can carry the front "
-                       "end's overdrive recovery.").pack(anchor="w", padx=6, pady=(0, 4))
+                  text="auto = rest/hold/after. A window just after a bright "
+                       "excursion can carry overdrive recovery.").pack(anchor="w", padx=6, pady=(0, 4))
 
     # -- right side -----------------------------------------------------------
     def build_right(self, right):
@@ -631,7 +639,8 @@ class App:
         return True
 
     def show_pos(self, pos):
-        self.pos_label.configure(text=f"position: {pos:8.3f} deg")
+        # four decimals: one encoder pulse is 2.5 mdeg
+        self.pos_label.configure(text=f"position: {pos:9.4f} deg")
 
     def do_read_pos(self):
         if self.need(scope=False):
@@ -639,6 +648,7 @@ class App:
 
     def do_home(self):
         if self.need(scope=False):
+            self.target = None
             self.worker(lambda: (self.rot.home(), self.rot.position())[1], done=self.show_pos)
 
     def do_goto(self):
@@ -649,13 +659,48 @@ class App:
         except ValueError:
             self.log("Go to: not a number")
             return
+        self.move_to_target(a)
+
+    def move_to_target(self, a):
+        """Go to analyzer angle `a`, approached from below like a scan step,
+        and remember it as the target the step and jog buttons count from -
+        counting from the read-back position instead would add each landing
+        error (~8 mdeg rms on this mount, 5 Oct 2026) to the next."""
         back = float(self.cfg["scan"].get("backoff_deg", 3.0))
+        self.target = a
+        self.goto_var.set(f"{a:.4f}".rstrip("0").rstrip("."))
         self.worker(lambda: self.rot.approach(a, backoff=back), done=self.show_pos)
 
     def do_jog(self, d):
-        if self.need(scope=False):
-            self.worker(lambda: (self.rot.dev.move_by(d), self.rot.position())[1],
-                        done=self.show_pos)
+        if not self.need(scope=False):
+            return
+        if getattr(self, "target", None) is None:
+            # first relative move after connect or home: start from where it is
+            def go():
+                return self.rot.position()
+
+            def done(pos):
+                self.show_pos(pos)
+                self.target = pos
+                self.move_to_target(pos + d)
+            self.worker(go, done=done)
+            return
+        self.move_to_target(self.target + d)
+
+    def do_step(self, sign):
+        try:
+            step = abs(float(self.step_var.get()))
+        except ValueError:
+            self.log("Step: not a number")
+            return
+        pulse = 360.0 / getattr(self.rot.dev, "pulses_per_rev", 143360) if self.rot else 0.0025
+        if step < pulse:
+            self.log(f"Step: {step:g} deg is below one encoder pulse ({pulse:.4f} deg)")
+            return
+        if step < 0.02:
+            self.log(f"Step {step:g} deg: below the ~8 mdeg rms landing scatter measured "
+                     f"on this mount - read the position back to see where it went")
+        self.do_jog(sign * step)
 
     def do_apply_zero(self):
         try:
