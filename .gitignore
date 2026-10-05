@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.part
+# measured data lives in scope_data/polarimetry, never in the repo
+data/
+*.npz
