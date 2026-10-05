@@ -1188,7 +1188,7 @@ class App:
         res = self.result
         pol, d = res["pol"], res["d"]
         t = d.t * 1e3
-        has_mon = any(r in d.roles for r in ("MonX1", "MonX2"))
+        has_mon = any(r in d.roles for r in ("MonX1", "MonX2", "CmdX1", "CmdX2"))
         ax = fig.add_subplot(211 if has_mon else 111)
         cmap = matplotlib.colormaps[ANGLE_CMAP]
         for th, y in zip(pol["theta"], pol["I"]):
@@ -1203,11 +1203,14 @@ class App:
         if has_mon:
             ax.tick_params(labelbottom=False)
             ax2 = fig.add_subplot(212, sharex=ax)
-            for r, col in (("MonX1", "#1f77b4"), ("MonX2", "#2ca02c")):
+            names = cfgmod.ROLE_NAMES
+            for r, col, ls in (("MonX1", "#1f77b4", "-"), ("MonX2", "#2ca02c", "-"),
+                               ("CmdX1", "#1f77b4", "--"), ("CmdX2", "#2ca02c", "--")):
                 if r in d.roles:
                     v = np.mean([s["v"][r] for s in pol["steps"]], axis=0)
-                    ax2.plot(t, v, lw=0.8, color=col, label=f"{r} (mean of scan steps)")
-            ax2.set_ylabel("monitor (V)")
+                    ax2.plot(t, v, lw=0.8, color=col, ls=ls,
+                             label=f"CH{d.roles[r]} {names[r]}")
+            ax2.set_ylabel("monitor (V, 1 V/kV) and command (V)")
             ax2.legend(loc="upper right", fontsize=7)
             ax2.grid(alpha=0.3)
             ax2.set_xlabel("time (ms)")

@@ -97,8 +97,12 @@ class Bench:
         x2 = mon + self.rng.normal(0, 1e-3 / n, t.size)
         marker = np.where((t >= 0) & (t < 20e-6), 5.0, 0.0)
         ref = 2.0 * self.intensity_gain() + self.rng.normal(0, 2e-3 / n, t.size)
-        return {"PD": pd, "MonX1": x1, "MonX2": x2, "Marker": marker, "Ref": ref,
-                "Other": np.zeros_like(t)}
+        # the command into each Trek: ~8.5 V for 5.15 kV on the bench (2 Oct
+        # 2026), i.e. ~1.65 x the monitor
+        c1 = 1.65 * mon + self.rng.normal(0, 1e-3 / n, t.size)
+        c2 = 1.62 * mon + self.rng.normal(0, 1e-3 / n, t.size)
+        return {"PD": pd, "MonX1": x1, "MonX2": x2, "CmdX1": c1, "CmdX2": c2,
+                "Marker": marker, "Ref": ref, "Other": np.zeros_like(t)}
 
 
 class FakeELL14:
@@ -205,7 +209,10 @@ def make_scope_class(sg):
             })
             for ch in p.channels:
                 role = self.roles.get(ch, "Other")
+                # commands reach ~8.5 V: at 1 V/div they would clip at the
+                # converter's edge (~offset + 5 div), so 2 V/div like the bench
                 scale, off = {"PD": (1.0, 2.5), "Marker": (2.0, 2.0),
+                              "CmdX1": (2.0, 4.0), "CmdX2": (2.0, 4.0),
                               "Ref": (0.5, 2.0)}.get(role, (1.0, 2.5))
                 state[p.ch_scale.format(ch=ch)] = f"{scale:.6E}"
                 state[p.ch_offset.format(ch=ch)] = f"{off:.6E}"

@@ -129,13 +129,13 @@ def spin_echo_checks(sg):
     tmp = tempfile.mkdtemp(prefix="rampol-se-")
     bench = sim.Bench(seed=11, legs_ms=(0.0, 16.667), ramp_up_ms=4.5, hold_ms=0.5,
                       lock_miss=1 / 6)
-    scope, ell, bench = sim.make(sg, bench=bench)
+    scope, ell, bench = sim.make(sg, bench=bench,
+                                 roles={1: "CmdX1", 2: "PD", 3: "MonX1", 4: "MonX2"})
     for k, v in config.PRESETS["Spin echo 16.7 ms (2 legs)"]["scope"].items():
         scope.put(k, v)
     link, rot = hw.ScopeLink(scope, log=lambda *_: None), hw.Rotator(ell, log=lambda *_: None)
-    chans = {1: ("Marker", "Gate"), 2: ("PD", "Analyzer PD"), 3: ("MonX1", "X1"),
+    chans = {1: ("CmdX1", "Trek X1 command"), 2: ("PD", "Analyzer PD"), 3: ("MonX1", "X1"),
              4: ("MonX2", "X2")}
-    scope.roles = {1: "Marker", 2: "PD", 3: "MonX1", 4: "MonX2"}
     run = scan.ScanRun(tmp, "se", sg, link, rot, chans, log=lambda *_: None,
                        clock=lambda: bench.clock)
     plan = dict(config.DEFAULTS["scan"], mode="single", shots=8, points=20000)
@@ -148,8 +148,8 @@ def spin_echo_checks(sg):
     files = [f for f in os.listdir(run.folder) if f.endswith(".npz")]
     check("one file per shot (dark + 18 angles + 4 refs)", len(files) == 8 * 23, len(files))
     d = an.load_scan(run.folder, sg.load_capture, lock_tol=0.006)
-    check("record spans -2 to 48 ms (preset, LEFT reference)",
-          abs(d.t[0] + 2e-3) < 5e-5 and abs(d.t[-1] - 48e-3) < 5e-5,
+    check("record spans -12 to 38 ms (preset, LEFT reference)",
+          abs(d.t[0] + 12e-3) < 5e-5 and abs(d.t[-1] - 38e-3) < 5e-5,
           f"{d.t[0] * 1e3:.3f} .. {d.t[-1] * 1e3:.3f} ms")
     rej = sum(s["rejected"] for s in d.steps)
     check("missed-lock shots dropped (~1 in 6 of 184)", 15 <= rej <= 50, rej)
@@ -170,6 +170,8 @@ def spin_echo_checks(sg):
     check("dropping them brings rest Imin closer to the model", e_rej < e_all,
           f"{e_rej * 1e3:.2f} vs {e_all * 1e3:.2f} mV kept")
     check("dips found on all four ramps", len(an.dip_er(pol)) >= 60, len(an.dip_er(pol)))
+    check("command channel recorded and read back by role",
+          "CmdX1" in d.roles and abs(np.max(d.steps[1]["v"]["CmdX1"]) - 1.65 * 180 / 35.07) < 0.1)
 
 
 def main():

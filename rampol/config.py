@@ -16,12 +16,14 @@ PROJECTS = os.path.join(os.path.expanduser("~"), "Desktop", "Python Projects")
 
 # What a scope channel carries. The analysis looks channels up by role, never
 # by number, so the wiring can change without touching anything else.
-ROLES = ("off", "PD", "MonX1", "MonX2", "Ref", "Marker", "Other")
+ROLES = ("off", "PD", "MonX1", "MonX2", "CmdX1", "CmdX2", "Ref", "Marker", "Other")
 ROLE_NAMES = {
     "off": "not recorded",
     "PD": "analyzer photodiode",
     "MonX1": "Trek monitor X1",
     "MonX2": "Trek monitor X2",
+    "CmdX1": "Trek X1 command",       # the drive into the Trek input (AWG or NI card)
+    "CmdX2": "Trek X2 command",
     "Ref": "reference photodiode (before the analyzer)",
     "Marker": "trigger / sequence marker",
     "Other": "recorded, not analysed",
@@ -54,11 +56,15 @@ PRESETS = {
         "note": "Experiment-control sequence, both legs in one record: ramps "
                 "4.5 ms up / 0.5 ms hold / 4.5 ms down, legs 16.667 ms apart, "
                 "trigger before leg 1, ~10 s repetition. 5 ms/div = 50 ms "
-                "record from -2 ms, room for the after-ramp relaxation. Trigger "
-                "sweep NORMAL: AUTO would self-trigger in a 10 s gap.",
+                "record from -12 ms to +38 ms: 12 ms of locked light before "
+                "the trigger, both legs, and ~12 ms after leg 2 (the intensity "
+                "lock switches off at the end of leg 2, so later data is not "
+                "wanted). Trigger sweep NORMAL: AUTO would self-trigger in a "
+                "10 s gap.",
         "scope": {":ACQuire:TYPE": "HRESolution",
                   ":TIMebase:SCALe": "5.0E-03", ":TIMebase:REFerence": "LEFT",
-                  ":TIMebase:POSition": "3.0E-03",
+                  # LEFT starts the record one division before the position
+                  ":TIMebase:POSition": "-7.0E-03",
                   ":TRIGger:MODE": "EDGE", ":TRIGger:SWEep": "NORMal"},
         "scan": {"mode": "single", "shots": 8, "points": 100000,
                  "wait_s": 30.0, "rep_s": 10.0},
