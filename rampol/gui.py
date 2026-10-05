@@ -1470,8 +1470,8 @@ class App:
         res = self.result
         pol, d = res["pol"], res["d"]
         t = d.t * 1e3
-        order = np.argsort(pol["theta"] % 360)
-        th = pol["theta"][order] % 360
+        order = np.argsort(wrap_angle(pol["theta"]))
+        th = wrap_angle(pol["theta"][order])
         I = pol["I"][order] / np.maximum(pol["imax"], 1e-9)
         ax = fig.add_subplot(111)
         edges = np.concatenate([[th[0] - (th[1] - th[0]) / 2],
@@ -1498,8 +1498,8 @@ class App:
         th = pol["theta"]
         y = pol["I"][:, j]
         ax = fig.add_subplot(211)
-        ax.plot(th % 360, y * 1e3, "o", ms=4, color="#1f77b4", label="measured")
-        g = np.linspace(0, 360, 721)
+        ax.plot(wrap_angle(th), y * 1e3, "o", ms=4, color="#1f77b4", label="measured")
+        g = np.linspace(-5, 355, 721)
         gr = np.deg2rad(g)
         model = pol["a0"][j] + pol["c2"][j] * np.cos(2 * gr) + pol["s2"][j] * np.sin(2 * gr)
         full = model.copy()
@@ -1523,7 +1523,7 @@ class App:
         ax2 = fig.add_subplot(212, sharex=ax)
         thr = np.deg2rad(th)
         fit_at = pol["a0"][j] + pol["c2"][j] * np.cos(2 * thr) + pol["s2"][j] * np.sin(2 * thr)
-        ax2.plot(th % 360, (y - fit_at) * 1e3, "o", ms=3, color="#1f77b4")
+        ax2.plot(wrap_angle(th), (y - fit_at) * 1e3, "o", ms=3, color="#1f77b4")
         ax2.axhline(0, color="k", lw=0.6)
         ax2.set_xlabel("analyzer angle (deg)")
         ax2.set_ylabel("residual to 2-theta fit (mV)")
@@ -1642,7 +1642,10 @@ class App:
         ax.grid(alpha=0.3)
         ax = fig.add_subplot(223)
         sem_med = np.nanmedian([np.nanmedian(s["sem"]["PD"]) for s in pol["steps"]])
-        ax.plot(t, pol["rms"] * 1e3, lw=0.6, label="fit residual rms")
+        src = pol.get("err_source", "residual")
+        ax.plot(t, pol["rms"] * 1e3, lw=0.6,
+                label="fit residual rms" if src == "residual"
+                else f"error scale from {src}")
         if np.isfinite(sem_med):
             ax.axhline(sem_med * 1e3, color="k", ls="--", lw=0.8, label="median block SEM")
         ax.set_xlabel("time (ms)")
@@ -1694,7 +1697,7 @@ class App:
                 + ("; samples off screen" if r["offscreen"] else "")))
         for p in self.result["dips"]:
             self.tv.insert("", "end", values=(
-                "dip", f(p["t"] * 1e3, ".3f"), f(p["rotation"], ".2f"), f(p["theta"] % 360, ".2f"),
+                "dip", f(p["t"] * 1e3, ".3f"), f(p["rotation"], ".2f"), f(float(wrap_angle(p["theta"])), ".2f"),
                 f(p["rate"], ".4f"), ("> " if p["er_lower"] else "") + f(p["er"], ".0f"),
                 f(p["er_light"], ".0f"), f(p["imin"] * 1e3, ".3f"), f(p["sig_imin"] * 1e3, ".3f"),
                 "", "", f"{p['n']} samples"))
@@ -1732,6 +1735,13 @@ class App:
         except Exception:
             pass
         self.root.destroy()
+
+
+def wrap_angle(a):
+    """Analyzer angles onto [-5, 355) deg for plotting. Plain % 360 sent a
+    0 deg step that landed at -0.01 to 359.99 - the far end of the axis - and
+    the Map stretched one band across it (5 Oct 2026, test-2)."""
+    return (np.asarray(a, float) + 5.0) % 360.0 - 5.0
 
 
 def short_idn(idn):
