@@ -161,7 +161,10 @@ class App:
         self.scope_addr = tk.StringVar()
         ttk.Entry(r, textvariable=self.scope_addr, width=22).pack(side="left", padx=4)
         self._btn(r, "Connect", self.do_connect_scope)
-        self.scope_status = ttk.Label(f, text="scope: not connected", foreground="#666")
+        # Fixed width + wrap: an instrument's identity or a VISA address is long
+        # and a label sized to it widened the whole left column.
+        self.scope_status = ttk.Label(f, text="scope: not connected", foreground="#666",
+                                      width=48, wraplength=330)
         self.scope_status.pack(anchor="w", padx=6)
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=2)
@@ -172,7 +175,8 @@ class App:
         self.ell_addr = tk.StringVar()
         ttk.Entry(r, textvariable=self.ell_addr, width=3).pack(side="left", padx=4)
         self._btn(r, "Connect", self.do_connect_ell)
-        self.ell_status = ttk.Label(f, text="analyzer: not connected", foreground="#666")
+        self.ell_status = ttk.Label(f, text="analyzer: not connected", foreground="#666",
+                                    width=48, wraplength=330)
         self.ell_status.pack(anchor="w", padx=6)
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=(2, 4))
@@ -286,7 +290,8 @@ class App:
         self.est_label.pack(side="left")
         self.progress_bar = ttk.Progressbar(f, mode="determinate", maximum=1)
         self.progress_bar.pack(fill="x", padx=6, pady=(2, 1))
-        self.progress_text = ttk.Label(f, text="", foreground="#060")
+        self.progress_text = ttk.Label(f, text="", foreground="#060", width=48,
+                                       wraplength=330)
         self.progress_text.pack(anchor="w", padx=6, pady=(0, 4))
         for v in list(self.sv.values()) + [self.order, self.mode]:
             v.trace_add("write", lambda *_: self.update_estimate())
@@ -558,7 +563,8 @@ class App:
                 scope = sg.Scope(prof)
                 scope.connect(c["scope_addr"] or None)
             self.link = hw.ScopeLink(scope, log=self.log)
-            return f"scope: {scope.idn.strip()[:60]}  ({scope.addr})"
+            self.log(f"Scope: {scope.idn.strip()} at {scope.addr}")
+            return f"scope: {short_idn(scope.idn)}"
 
         self.worker(go, done=lambda txt: self.scope_status.configure(text=txt, foreground="#060"))
 
@@ -576,6 +582,8 @@ class App:
             self.rot = hw.Rotator(dev, log=self.log)
             info = dev.info()
             pos = dev.position()
+            self.log(f"Analyzer: ELL{info['type']} S/N {info['serial']} on {dev.port}, "
+                     f"{info['pulses_per_unit']} pulses/rev, firmware {info['firmware']}")
             return (f"analyzer: ELL{info['type']} S/N {info['serial']} on {dev.port}", pos)
 
         def done(out):
@@ -1305,6 +1313,15 @@ class App:
         except Exception:
             pass
         self.root.destroy()
+
+
+def short_idn(idn):
+    """'AGILENT TECHNOLOGIES,MSO-X 2014A,MY63080029,02.65...' -> 'MSO-X 2014A
+    S/N MY63080029'. The full reply goes to the log."""
+    parts = [p.strip() for p in str(idn).split(",")]
+    if len(parts) >= 3:
+        return f"{parts[1]}  S/N {parts[2]}"
+    return str(idn).strip()[:40]
 
 
 def _isnum(text):

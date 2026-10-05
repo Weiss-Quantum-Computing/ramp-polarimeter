@@ -40,27 +40,54 @@ import re
 def _serial_module():
     try:
         import serial
-    except ImportError:
-        # pyserial is installed --user on the bench PC, in the per-user
-        # site-packages both Pythons share. An activated conda env (or
-        # PYTHONNOUSERSITE, python -s) drops that folder from sys.path and the
-        # import fails although the package is there - put it back and retry.
-        import site
-        import sys
-        user = site.getusersitepackages()
-        if user not in sys.path:
-            sys.path.append(user)
+        return serial
+    except ImportError as exc:
+        first = exc            # the 'as' name is deleted when the block ends
+    # pyserial is installed --user on the bench PC, in the per-user
+    # site-packages both Pythons share. Started from VS Code (5 Oct 2026) the
+    # import failed although that folder existed - even after appending it to
+    # sys.path - while the same Python, environment and code imported it fine
+    # from a fresh process. So load it from the folder by path, bypassing
+    # sys.path and the import caches, and if even that fails say exactly what
+    # this process sees.
+    import importlib
+    import importlib.machinery
+    import importlib.util
+    import os
+    import site
+    import sys
+    importlib.invalidate_caches()
+    dirs = [site.getusersitepackages(),
+            os.path.join(os.environ.get("APPDATA", ""), "Python",
+                         f"Python{sys.version_info[0]}{sys.version_info[1]}",
+                         "site-packages")]
+    seen = []
+    for d in dict.fromkeys(dirs):
         try:
-            import serial
-        except ImportError as exc:
-            import os
-            raise ImportError(
-                f"ELL14 hardware access needs pyserial, and this Python could "
-                f"not import it: {exc!r}. Python: {sys.executable}; per-user "
-                f"site-packages: {user} "
-                f"({'present' if os.path.isdir(user) else 'MISSING'}). "
-                f"Install with: python -m pip install --user pyserial") from exc
-    return serial
+            listed = "serial" in os.listdir(d)
+        except OSError as exc:
+            seen.append(f"{d}: cannot list ({exc})")
+            continue
+        seen.append(f"{d}: {'has' if listed else 'no'} serial/")
+        spec = importlib.machinery.PathFinder.find_spec("serial", [d])
+        if spec is None:
+            continue
+        if d not in sys.path:
+            sys.path.append(d)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["serial"] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception as exc:
+            sys.modules.pop("serial", None)
+            seen.append(f"loading it failed: {exc!r}")
+            continue
+        return mod
+    raise ImportError(
+        "ELL14 hardware access needs pyserial, and this Python could not import "
+        f"it: {first!r}. Python {sys.executable}; user site enabled: "
+        f"{site.ENABLE_USER_SITE} (no_user_site flag {sys.flags.no_user_site}); "
+        + "; ".join(seen) + ". Install with: python -m pip install --user pyserial")
 
 
 def _address(value):
