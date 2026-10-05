@@ -40,8 +40,21 @@ import re
 def _serial_module():
     try:
         import serial
-    except ImportError as exc:
-        raise ImportError("ELL14 hardware access needs pyserial: pip install pyserial") from exc
+    except ImportError:
+        # pyserial is installed --user on the bench PC, in the per-user
+        # site-packages both Pythons share. An activated conda env (or
+        # PYTHONNOUSERSITE, python -s) drops that folder from sys.path and the
+        # import fails although the package is there - put it back and retry.
+        import site
+        import sys
+        user = site.getusersitepackages()
+        if user not in sys.path:
+            sys.path.append(user)
+        try:
+            import serial
+        except ImportError as exc:
+            raise ImportError("ELL14 hardware access needs pyserial: "
+                              "python -m pip install --user pyserial") from exc
     return serial
 
 

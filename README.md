@@ -6,13 +6,16 @@ and the MSO-X 2014A read through [Scope Grab](../scope-grab-multi). The
 window follows Scope Grab's layout: controls on the left, plot tabs with a
 plot bar on the right, log underneath.
 
-```
-Start Polarimeter.bat            (or: pythonw polarimeter.pyw / python -m rampol)
-```
+**From VS Code** (the `Python Projects` workspace): pick the
+**Ramp Polarimeter** configuration in Run and Debug and press F5, or open
+`polarimeter.py` and press the Run button. **Ramp Polarimeter tests** runs the
+test suite. Outside VS Code: `python polarimeter.py`, `python -m rampol`, or
+`Start Polarimeter.bat`.
 
-Needs the system Python 3.13 with numpy, matplotlib, pyvisa and pyserial (all
-installed on this PC; pyserial sits in the per-user site-packages that both
-Pythons share). Scope Grab is loaded by file path from `scope_grab_path` in
+Runs on either Python on this PC (Anaconda or the system 3.13): numpy,
+matplotlib, pyvisa and pyserial. pyserial sits in the per-user site-packages
+both share; if an activated conda env hides that folder, the driver puts it
+back on the path itself. Scope Grab is loaded by file path from `scope_grab_path` in
 the config (default `Python Projects/scope-grab-multi/scope_grab.py`, at
 dcf2c0b or later). Close Scope Grab's panel before connecting: the two cannot
 drive the scope at once.

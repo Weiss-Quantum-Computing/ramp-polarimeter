@@ -8,7 +8,7 @@ Threading: every instrument operation runs on one worker thread at a time.
 The worker never touches Tk; it hands results back through self.call(),
 which the pump runs on the Tk thread.
 
-    pythonw polarimeter.pyw          (or python -m rampol)
+    python polarimeter.py            (or python -m rampol, or Run in VS Code)
 """
 import os
 import queue
