@@ -32,7 +32,8 @@ class Bench:
                  er_rest=5000.0, er_mid=300.0, er_polarizer=1.0e4,
                  pd_noise=0.012, drift=3e-3, drift_period_s=600.0,
                  ramp_up_ms=4.61, hold_ms=1.24, swing_deg=180.0,
-                 memory_deg=0.15, memory_tau_ms=35.0, deg_per_mon_v=(17.550, 17.519)):
+                 memory_deg=0.15, memory_tau_ms=35.0, deg_per_mon_v=(17.550, 17.519),
+                 legs_ms=(0.0,), lock_miss=0.0):
         self.rng = np.random.default_rng(seed)
         self.mount_of_rest_pol = mount_of_rest_pol
         self.imax, self.dark = imax, dark
@@ -41,15 +42,20 @@ class Bench:
         self.up, self.hold, self.swing = ramp_up_ms * 1e-3, hold_ms * 1e-3, swing_deg
         self.mem, self.mem_tau = memory_deg, memory_tau_ms * 1e-3
         self.k1, self.k2 = deg_per_mon_v
+        self.legs = [x * 1e-3 for x in legs_ms]   # leg start times (s)
+        self.lock_miss = lock_miss                  # fraction of shots 2.5 % dim
         self.clock = 0.0               # virtual seconds since the bench started
         self.mount = 300.0             # mechanical angle of the analyzer (deg)
 
     # -- the ramp ---------------------------------------------------------
     def rotation(self, t):
         """Rotation from the rest polarization (deg) at time t (s) after the
-        trigger: raised-cosine up, hold, raised-cosine down, then a decaying
-        memory term."""
+        trigger: one transport per leg (raised-cosine up, hold, raised-cosine
+        down), each followed by a decaying memory term."""
         t = np.asarray(t, float)
+        return sum(self._leg(t - t0) for t0 in self.legs)
+
+    def _leg(self, t):
         up, hold, sw = self.up, self.hold, self.swing
         r = np.zeros_like(t)
         a = (t >= 0) & (t < up)
@@ -81,6 +87,8 @@ class Bench:
         d = np.deg2rad(self.mount - self.mount_of_rest_pol - rot)
         inv_er = 1 / self.er(rot) + 1 / self.er_pol
         imax = self.imax * self.intensity_gain()
+        if shots == 1 and self.lock_miss and self.rng.random() < self.lock_miss:
+            imax *= 0.975            # the lock did not catch on this shot
         pd = self.dark + imax * (np.cos(d) ** 2 + inv_er * np.sin(d) ** 2)
         n = np.sqrt(max(shots, 1))
         pd = pd + self.rng.normal(0, self.pd_noise / n, t.size)
@@ -217,10 +225,10 @@ def make_scope_class(sg):
 
         def _grid(self, n):
             g = self.inst.state
-            scale = float(g[":TIMebase:SCALe"])
-            pos = float(g[":TIMebase:POSition"])
-            dt = 10 * scale / n
-            return pos, dt
+            from .config import record_span
+            t0, t1 = record_span(g[":TIMebase:SCALe"], g[":TIMebase:POSition"],
+                                 g.get(":TIMebase:REFerence", "LEFT"))
+            return t0, (t1 - t0) / n
 
         def _arm(self, shots):
             """An acquisition of `shots` triggers. The record itself is made

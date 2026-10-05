@@ -184,6 +184,8 @@ class App:
         ttk.Checkbutton(r, text="Simulate both (no hardware)",
                         variable=self.simulate).pack(side="left")
         self._btn(r, "Disconnect all", self.do_disconnect, padx=(12, 0))
+        ttk.Button(r, text="Scope settings...", command=self.open_scope_settings).pack(
+            side="left", padx=(8, 0))
 
     def build_analyzer(self, left):
         f = ttk.LabelFrame(left, text="Analyzer (ELL14)")
@@ -238,9 +240,10 @@ class App:
         r.pack(fill="x", padx=6, pady=2)
         ttk.Label(r, text="Preset").pack(side="left")
         self.preset = tk.StringVar()
-        cb = ttk.Combobox(r, textvariable=self.preset, values=list(cfgmod.PRESETS),
-                          width=20, state="readonly")
+        cb = ttk.Combobox(r, textvariable=self.preset, values=list(cfgmod.all_presets(self.cfg)),
+                          width=24, state="readonly")
         cb.pack(side="left", padx=4)
+        self.preset_box = cb
         cb.bind("<<ComboboxSelected>>", lambda _e: self.preset_picked())
         self._btn(r, "Apply to scope", self.do_apply_preset)
         self.sv = {}
@@ -265,9 +268,9 @@ class App:
         self.mode = tk.StringVar()
         ttk.Combobox(rr, textvariable=self.mode, width=8, state="readonly",
                      values=("average", "single")).pack(side="left", padx=4)
-        row([("Shots/angle", "shots", 5), ("blocks", "blocks", 4), ("dither codes", "dither_codes", 4)])
+        row([("Shots/angle", "shots", 5), ("blocks (avg)", "blocks", 3), ("dither codes", "dither_codes", 3)])
         row([("Ref every", "ref_every", 4), ("angles, at", "ref_angle", 6), ("backoff", "backoff_deg", 4)])
-        row([("Points (single)", "points", 7), ("trigger wait s", "wait_s", 5)])
+        row([("Points (single)", "points", 7), ("trig wait s", "wait_s", 4), ("rep s", "rep_s", 5)])
         rr = ttk.Frame(f)
         rr.pack(fill="x", padx=6, pady=1)
         ttk.Label(rr, text="Folder").pack(side="left")
@@ -501,18 +504,31 @@ class App:
             angles = scanmod.angle_list(s["start"], s["stop"], s["step"])
             refs = (len(angles) // max(s["ref_every"], 1) + 2) if s["ref_every"] > 0 else 0
             n = len(angles) + refs
-            per = s["shots"] / 3.7 + (s["blocks"] * 0.8 if s["mode"] == "average"
-                                      else s["shots"] * 0.6) + 1.5
+            rep = max(float(s.get("rep_s", 0.27)), 0.01)
+            # a single shot cannot be re-armed faster than it is read out (~0.6 s)
+            per = (s["shots"] * rep + s["blocks"] * 0.8 if s["mode"] == "average"
+                   else s["shots"] * max(rep, 0.6)) + 1.5
+            mins = n * per / 60
             self.est_label.configure(
-                text=f"{len(angles)} angles + {refs} refs, ~{n * per / 60:.0f} min at 3.7 Hz")
+                text=f"{len(angles)} angles + {refs} refs, ~"
+                     + (f"{mins:.0f} min" if mins < 90 else f"{mins / 60:.1f} h")
+                     + f" at {rep:g} s/shot")
         except Exception:
             self.est_label.configure(text="")
 
     def preset_picked(self):
-        p = cfgmod.PRESETS.get(self.preset.get())
-        if p:
-            self.sv["shots"].set(str(p.get("shots", 64)))
-            self.log(f"Preset {self.preset.get()}: {p['note']}")
+        p = cfgmod.all_presets(self.cfg).get(self.preset.get())
+        if not p:
+            return
+        for k, v in (p.get("scan") or {}).items():
+            if k == "mode":
+                self.mode.set(v)
+            elif k in self.sv:
+                self.sv[k].set(str(v))
+        self.log(f"Preset {self.preset.get()}: {p.get('note', '')}")
+        if p.get("scope"):
+            self.log("  'Apply to scope' writes: " + ", ".join(
+                f"{k} {v}" for k, v in p["scope"].items()))
 
     def pick_outdir(self):
         d = filedialog.askdirectory(initialdir=self.outdir.get() or os.getcwd(),
@@ -674,11 +690,157 @@ class App:
     def do_apply_preset(self):
         if not self.need(ell=False):
             return
-        p = cfgmod.PRESETS.get(self.preset.get())
-        if not p:
+        p = cfgmod.all_presets(self.cfg).get(self.preset.get())
+        if not p or not p.get("scope"):
             return
         self.worker(lambda: self.link.apply(p["scope"]),
                     done=lambda _: self.log(f"Applied preset '{self.preset.get()}' to the scope."))
+
+    # -- scope settings window ---------------------------------------------------
+    def open_scope_settings(self):
+        """A window laid out from the scope profile's own settings tables:
+        timebase and acquisition, trigger, and every channel. Read fills it
+        from the scope, Apply writes only what was changed, Save as preset
+        keeps the lot (and the scan's shot settings) under a name."""
+        if getattr(self, "set_win", None) is not None and self.set_win.winfo_exists():
+            self.set_win.lift()
+            return
+        sg = self.load_sg()
+        if sg is None:
+            return
+        prof = (self.link.prof if self.link is not None
+                else sg.scope_profiles.get_profile(self.cfg["scope_model"]))
+        self.set_prof = prof
+        w = self.set_win = tk.Toplevel(self.root)
+        w.title(f"Scope settings - {prof.name}")
+        self.set_vars, self.set_read, self.set_kind = {}, {}, {}
+
+        def field(parent, scpi, kind, choices, row, col, width=10):
+            var = tk.StringVar()
+            if kind in ("num", "info"):
+                wdg = ttk.Entry(parent, textvariable=var, width=width,
+                                state="readonly" if kind == "info" else "normal")
+            elif kind == "bool":
+                wdg = ttk.Combobox(parent, textvariable=var, values=("ON", "OFF"),
+                                   width=5, state="readonly")
+            else:
+                wdg = ttk.Combobox(parent, textvariable=var, values=list(choices),
+                                   width=max(6, width - 2), state="readonly")
+            wdg.grid(row=row, column=col, sticky="w", padx=2, pady=1)
+            var.trace_add("write", lambda *_: self.show_span())
+            self.set_vars[scpi], self.set_kind[scpi] = var, kind
+
+        top = ttk.Frame(w)
+        top.pack(fill="x", padx=8, pady=6)
+        tb = ttk.LabelFrame(top, text="Timebase / acquisition")
+        tb.pack(side="left", fill="y")
+        self.span_label = None
+        rows = list(prof.timebase) + [(lbl, scpi, "info", None) for lbl, scpi in prof.info]
+        for i, (lbl, scpi, kind, ch) in enumerate(rows):
+            ttk.Label(tb, text=lbl + ":").grid(row=i, column=0, sticky="e", padx=4)
+            field(tb, scpi, kind, ch, i, 1, 12)
+        self.span_label = ttk.Label(tb, text="", foreground="#060")
+        self.span_label.grid(row=len(rows), column=0, columnspan=2, sticky="w",
+                             padx=4, pady=(4, 2))
+        tg = ttk.LabelFrame(top, text="Trigger")
+        tg.pack(side="left", fill="y", padx=(8, 0))
+        for i, (lbl, scpi, kind, ch) in enumerate(prof.trigger):
+            ttk.Label(tg, text=lbl + ":").grid(row=i, column=0, sticky="e", padx=4)
+            field(tg, scpi, kind, ch, i, 1, 10)
+        cf = ttk.LabelFrame(w, text="Channels")
+        cf.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(cf, text="role").grid(row=0, column=1)
+        for j, item in enumerate(prof.channel):
+            ttk.Label(cf, text=item[0]).grid(row=0, column=j + 2)
+        for i, chn in enumerate(prof.channels):
+            ttk.Label(cf, text=f"CH{chn}").grid(row=i + 1, column=0, padx=4)
+            role = self.ch_role[chn].get() if chn in self.ch_role else ""
+            ttk.Label(cf, text=role, foreground="#666").grid(row=i + 1, column=1, padx=4)
+            for j, (lbl, tmpl, kind, ch) in enumerate(prof.channel):
+                field(cf, tmpl.format(ch=chn), kind, ch, i + 1, j + 2, 8)
+        bar = ttk.Frame(w)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bar, text="Read from scope", command=self.do_read_scope).pack(side="left")
+        ttk.Button(bar, text="Apply changes", command=self.do_apply_scope).pack(side="left", padx=6)
+        ttk.Button(bar, text="Save as preset...", command=self.do_save_preset).pack(side="left")
+        self.set_status = ttk.Label(bar, text="not read yet", foreground="#666")
+        self.set_status.pack(side="left", padx=8)
+        if self.link is not None:
+            self.do_read_scope()
+
+    def _set_norm(self, scpi, raw):
+        """A scope reply as the field shows it: bools as ON/OFF; anything else
+        as the scope said it (choices come back short: NORM, HRES, ...)."""
+        raw = str(raw).strip()
+        if self.set_kind.get(scpi) == "bool":
+            return "ON" if raw.upper() in ("1", "ON") else "OFF"
+        return raw
+
+    def show_span(self):
+        if getattr(self, "span_label", None) is None:
+            return
+        g = {k: v.get() for k, v in self.set_vars.items()}
+        try:
+            t0, t1 = cfgmod.record_span(g[":TIMebase:SCALe"], g[":TIMebase:POSition"],
+                                        g.get(":TIMebase:REFerence", "LEFT"))
+            self.span_label.configure(
+                text=f"record: {t0 * 1e3:+.3f} to {t1 * 1e3:+.3f} ms from the trigger")
+        except (KeyError, ValueError):
+            self.span_label.configure(text="")
+
+    def do_read_scope(self):
+        if not self.need(ell=False):
+            return
+        roots = list(self.set_vars)
+
+        def go():
+            out = {}
+            for r in roots:
+                try:
+                    out[r] = self.link.scope.get(r)
+                except Exception as exc:
+                    self.log(f"  {r}? failed: {exc}")
+            return out
+
+        def done(vals):
+            for r, v in vals.items():
+                v = self._set_norm(r, v)
+                self.set_vars[r].set(v)
+                self.set_read[r] = v
+            self.set_status.configure(text=f"read {time.strftime('%H:%M:%S')}",
+                                      foreground="#060")
+        self.worker(go, done=done)
+
+    def do_apply_scope(self):
+        if not self.need(ell=False):
+            return
+        changes = {r: v.get().strip() for r, v in self.set_vars.items()
+                   if self.set_kind[r] != "info" and v.get().strip()
+                   and v.get().strip() != self.set_read.get(r)}
+        if not changes:
+            self.log("Scope settings: nothing changed.")
+            return
+        self.log("Scope settings: writing " + ", ".join(f"{k} {v}" for k, v in changes.items()))
+        self.worker(lambda: self.link.apply(changes), done=lambda _: self.do_read_scope())
+
+    def do_save_preset(self, name=None):
+        if name is None:
+            from tkinter import simpledialog
+            name = simpledialog.askstring("Save preset", "Preset name:", parent=self.set_win)
+        if not name:
+            return
+        scope_vals = {r: v.get().strip() for r, v in self.set_vars.items()
+                      if self.set_kind[r] != "info" and v.get().strip()}
+        s = self.gather()["scan"]
+        self.cfg.setdefault("user_presets", {})[name] = {
+            "note": f"saved {time.strftime('%Y-%m-%d %H:%M')} from the Scope settings window",
+            "scope": scope_vals,
+            "scan": {k: s[k] for k in ("mode", "shots", "points", "wait_s", "rep_s") if k in s},
+        }
+        self.save_settings()
+        self.preset_box["values"] = list(cfgmod.all_presets(self.cfg))
+        self.preset.set(name)
+        self.log(f"Preset '{name}' saved: {len(scope_vals)} scope settings + shot settings.")
 
     def do_stop(self):
         self.stop_flag.set()
@@ -863,7 +1025,8 @@ class App:
         if sg is None:
             raise RuntimeError("Scope Grab is not loaded, so captures cannot be read")
         a = self.cfg["analysis"]
-        d = an.load_scan(path, sg.load_capture, trim=int(a["trim"]))
+        d = an.load_scan(path, sg.load_capture, trim=int(a["trim"]),
+                         lock_tol=float(a.get("lock_tol", 0.0)))
         pol = an.polarization(d, correct_drift=correct_drift)
         dips = an.dip_er(pol, polarizer_er=a["polarizer_er"])
         refine = an.refine_result(d, pol, polarizer_er=a["polarizer_er"])

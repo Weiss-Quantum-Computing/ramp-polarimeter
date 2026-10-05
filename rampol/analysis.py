@@ -56,12 +56,20 @@ def _role_columns(columns, channels):
     return out
 
 
-def load_scan(path, load_capture, trim=10):
+def load_scan(path, load_capture, trim=10, lock_tol=0.0):
     """Read a scan's manifest and captures. `path` is the manifest or its
-    folder. Each step gets 'v' {role: block-mean trace}, 'sem' {role: standard
-    error from the block scatter}, 'nb' blocks and 'offscreen' {role: bool
-    mask of samples outside the screen in any block}. The first `trim`
-    samples are dropped (the MSO-X puts a fixed ~1.2 V artefact on sample 0)."""
+    folder. Each step gets 'v' {role: mean over its files (blocks or shots)},
+    'sem' {role: standard error from their scatter}, 'nb' files used,
+    'rejected' files dropped, and 'offscreen' {role: bool mask of samples
+    outside the screen in any file}. The first `trim` samples are dropped (the
+    MSO-X puts a fixed ~1.2 V artefact on sample 0).
+
+    lock_tol > 0 drops shots the intensity lock missed: a file whose PD level
+    before the trigger (t < 0, else the first 4 % of the record) is off its
+    step's median by more than lock_tol x the brightest such level in the
+    scan. Relative to the brightest level, because at angles near crossed the
+    level is ~0 and a relative test there would reject on noise. Steps with
+    fewer than 4 files are left alone (no median to trust)."""
     if os.path.isdir(path):
         cands = [f for f in os.listdir(path) if f.endswith("_scan.json")]
         if not cands:
@@ -74,6 +82,7 @@ def load_scan(path, load_capture, trim=10):
     chans = man["channels"]
     d.roles = {v["role"]: int(k) for k, v in chans.items() if v["role"] != "off"}
     t_ref = None
+    loaded = []                                   # (manifest step, {role: (nb, n)})
     for s in man["steps"]:
         if s.get("status") != "done" or not s.get("files"):
             continue
@@ -95,13 +104,44 @@ def load_scan(path, load_capture, trim=10):
         t = t[:n]
         if t_ref is None:
             t_ref = t
-        step = dict(s)
-        step["nb"] = len(blocks)
-        step["v"], step["sem"], step["offscreen"] = {}, {}, {}
+        ys = {}
         for role, j in cols_map.items():
             y = stack[:, :, j]
             if len(t) != len(t_ref) or not np.allclose(t[[0, -1]], t_ref[[0, -1]]):
                 y = np.array([np.interp(t_ref, t, yy) for yy in y])
+            ys[role] = y
+        loaded.append((s, ys))
+    if t_ref is None:
+        raise ValueError("no completed steps with data in this scan")
+    d.t = t_ref
+    pre = rest_index(t_ref)
+    keep = {}
+    if lock_tol > 0:
+        levels = [np.median(ys["PD"][:, pre].mean(axis=1))
+                  for s, ys in loaded if "PD" in ys and s["kind"] != "dark"]
+        top = max([abs(x) for x in levels] or [0.0])
+        dropped = 0
+        for i, (s, ys) in enumerate(loaded):
+            if "PD" not in ys or s["kind"] == "dark" or len(ys["PD"]) < 4 or top <= 0:
+                continue
+            base = ys["PD"][:, pre].mean(axis=1)
+            ok = np.abs(base - np.median(base)) <= lock_tol * top
+            if not ok.all() and ok.sum() >= 2:
+                keep[i] = ok
+                dropped += int((~ok).sum())
+        if dropped:
+            d.notes.append(f"dropped {dropped} shot(s) whose pre-trigger level was "
+                           f"off their step's median by > {lock_tol:.1%} of the "
+                           f"brightest level (intensity lock missed?)")
+    for i, (s, ys) in enumerate(loaded):
+        step = dict(s)
+        ok = keep.get(i)
+        step["rejected"] = 0 if ok is None else int((~ok).sum())
+        step["v"], step["sem"], step["offscreen"] = {}, {}, {}
+        for role, y in ys.items():
+            if ok is not None:
+                y = y[ok]
+            step["nb"] = len(y)
             step["v"][role] = y.mean(axis=0)
             step["sem"][role] = (y.std(axis=0, ddof=1) / np.sqrt(len(y))
                                  if len(y) > 1 else np.full(y.shape[1], np.nan))
@@ -115,9 +155,6 @@ def load_scan(path, load_capture, trim=10):
                 step["offscreen_frac"] = step.get("offscreen_frac", {})
                 step["offscreen_frac"][role] = float(np.mean(step["offscreen"][role]))
         d.steps.append(step)
-    d.t = t_ref
-    if t_ref is None:
-        raise ValueError("no completed steps with data in this scan")
     return d
 
 
@@ -421,26 +458,27 @@ def segments(t, rotation, static_deg_per_ms=2.0, min_ms=0.3):
     out = []
     edges = np.flatnonzero(np.diff(static.astype(int))) + 1
     bounds = [0, *edges, len(t)]
-    seen_motion = False
+    leg = 0
     for a, b in zip(bounds[:-1], bounds[1:]):
         if (t[b - 1] - t[a]) < min_ms * 1e-3:
             continue
         rmean = float(np.mean(rotation[a:b]))
         if static[a]:
-            if not seen_motion:
-                kind = "rest"
-            elif abs(rmean) > 45:
-                kind = "hold"
-            else:
-                kind = "after"
+            base = "hold" if abs(rmean) > 45 else ("rest" if leg == 0 else "after")
         else:
-            seen_motion = True
-            kind = "up" if rotation[b - 1] > rotation[a] else "down"
-        if out and out[-1]["kind"] == kind:
+            base = "up" if rotation[b - 1] > rotation[a] else "down"
+            if base == "up" and not (out and out[-1]["base"] == "up"):
+                leg += 1
+        if out and out[-1]["base"] == base:
             out[-1]["t1"] = float(t[b - 1])
             continue
-        out.append({"kind": kind, "t0": float(t[a]), "t1": float(t[b - 1]),
-                    "rotation": rmean})
+        out.append({"base": base, "leg": leg, "t0": float(t[a]),
+                    "t1": float(t[b - 1]), "rotation": rmean})
+    # "up 1", "hold 2", "after 1" ... - numbered only when a record holds more
+    # than one transport (both spin-echo legs); the last static part is
+    # "after", the ones between legs "after 1", ...
+    for s in out:
+        s["kind"] = s["base"] if leg <= 1 or s["base"] == "rest" else f"{s['base']} {s['leg']}"
     return out
 
 
@@ -450,7 +488,7 @@ def auto_windows(pol, margin_ms=0.2, max_ms=1.0):
     settled)."""
     wins = []
     for s in segments(pol["t"], pol["rotation"]):
-        if s["kind"] in ("rest", "hold", "after"):
+        if s["base"] in ("rest", "hold", "after"):
             t1 = s["t1"] - margin_ms * 1e-3
             t0 = max(s["t0"] + margin_ms * 1e-3, t1 - max_ms * 1e-3)
             if t1 > t0:

@@ -64,7 +64,7 @@ def sim_scan(tmp, sg, **bench_kw):
     chans = {1: ("PD", "Analyzer PD"), 3: ("MonX1", "X1"), 4: ("MonX2", "X2")}
     run = scan.ScanRun(tmp, "t", sg, link, rot, chans, log=lambda *_: None,
                        clock=lambda: bench.clock)
-    plan = dict(config.DEFAULTS["scan"])
+    plan = dict(config.DEFAULTS["scan"], mode="average", shots=64, blocks=4)
     angles = scan.ordered(scan.angle_list(0, 355, 5), "shuffled", seed=2)
     run.new(plan, [{"kind": "dark", "target": 0}] + scan.build_steps(angles, 8, 45))
     imax, bench.imax = bench.imax, 0.0
@@ -123,11 +123,61 @@ def no_light_checks(sg):
     check("no dips found in noise", len(an.dip_er(pol)) == 0, len(an.dip_er(pol)))
 
 
+def spin_echo_checks(sg):
+    print("\nspin echo: two legs 16.667 ms apart in one record, HRES single shots,"
+          " 1 in 6 shots with the lock missed")
+    tmp = tempfile.mkdtemp(prefix="rampol-se-")
+    bench = sim.Bench(seed=11, legs_ms=(0.0, 16.667), ramp_up_ms=4.5, hold_ms=0.5,
+                      lock_miss=1 / 6)
+    scope, ell, bench = sim.make(sg, bench=bench)
+    for k, v in config.PRESETS["Spin echo 16.7 ms (2 legs)"]["scope"].items():
+        scope.put(k, v)
+    link, rot = hw.ScopeLink(scope, log=lambda *_: None), hw.Rotator(ell, log=lambda *_: None)
+    chans = {1: ("Marker", "Gate"), 2: ("PD", "Analyzer PD"), 3: ("MonX1", "X1"),
+             4: ("MonX2", "X2")}
+    scope.roles = {1: "Marker", 2: "PD", 3: "MonX1", 4: "MonX2"}
+    run = scan.ScanRun(tmp, "se", sg, link, rot, chans, log=lambda *_: None,
+                       clock=lambda: bench.clock)
+    plan = dict(config.DEFAULTS["scan"], mode="single", shots=8, points=20000)
+    run.new(plan, [{"kind": "dark", "target": 0}]
+            + scan.build_steps(scan.angle_list(0, 170, 10), 6, 45))
+    imax, bench.imax = bench.imax, 0.0
+    run.run(kinds={"dark"})
+    bench.imax = imax
+    run.run()
+    files = [f for f in os.listdir(run.folder) if f.endswith(".npz")]
+    check("one file per shot (dark + 18 angles + 4 refs)", len(files) == 8 * 23, len(files))
+    d = an.load_scan(run.folder, sg.load_capture, lock_tol=0.006)
+    check("record spans -2 to 48 ms (preset, LEFT reference)",
+          abs(d.t[0] + 2e-3) < 5e-5 and abs(d.t[-1] - 48e-3) < 5e-5,
+          f"{d.t[0] * 1e3:.3f} .. {d.t[-1] * 1e3:.3f} ms")
+    rej = sum(s["rejected"] for s in d.steps)
+    check("missed-lock shots dropped (~1 in 6 of 184)", 15 <= rej <= 50, rej)
+    pol = an.polarization(d)
+    err = pol["rotation"] - bench.rotation(d.t)
+    check("rotation through both legs within 0.05 deg rms", np.std(err) < 0.05,
+          f"{np.std(err) * 1e3:.1f} mdeg")
+    kinds = [s["kind"] for s in an.segments(d.t, pol["rotation"])]
+    check("segments numbered by leg",
+          kinds == ["rest", "up 1", "hold 1", "down 1", "after 1", "up 2", "hold 2",
+                    "down 2", "after 2"], kinds)
+    d_all = an.load_scan(run.folder, sg.load_capture, lock_tol=0.0)
+    p_all = an.polarization(d_all)
+    rest = an.rest_index(d.t)
+    imin_true = bench.imax / (1 / (1 / bench.er(0) + 1 / bench.er_pol))
+    e_rej = abs(np.mean(pol["imin"][rest]) - imin_true)
+    e_all = abs(np.mean(p_all["imin"][rest]) - imin_true)
+    check("dropping them brings rest Imin closer to the model", e_rej < e_all,
+          f"{e_rej * 1e3:.2f} vs {e_all * 1e3:.2f} mV kept")
+    check("dips found on all four ramps", len(an.dip_er(pol)) >= 60, len(an.dip_er(pol)))
+
+
 def main():
     sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
     harmonic_checks()
     scan_checks(sg)
     no_light_checks(sg)
+    spin_echo_checks(sg)
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED: {', '.join(FAILS)}")

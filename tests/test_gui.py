@@ -62,8 +62,9 @@ def main():
     app.simulate.set(True)
     app.outdir.set(os.path.join(SANDBOX, "data"))
     for k, v in {"start": "0", "stop": "330", "step": "30", "ref_every": "4",
-                 "shots": "64", "blocks": "4"}.items():
+                 "shots": "64", "blocks": "4", "rep_s": "0.27"}.items():
         app.sv[k].set(v)
+    app.mode.set("average")
     app.scan_name.set("gui test")
     print("\nconnect")
     app.do_connect_scope()
@@ -81,6 +82,33 @@ def main():
     settle(root, app)
     pos = float(app.pos_label.cget("text").split()[1])
     check("go to lands within 0.05 deg", abs(pos - 123.4) < 0.05, f"{pos:.3f}")
+
+    print("\nscope settings window")
+    app.open_scope_settings()
+    settle(root, app)
+    check("window read the scope", app.set_vars[":TIMebase:SCALe"].get() != "",
+          app.set_vars[":TIMebase:SCALe"].get())
+    check("record span shown", "record:" in app.span_label.cget("text"),
+          app.span_label.cget("text"))
+    app.set_vars[":TIMebase:SCALe"].set("2.0E-03")
+    app.do_apply_scope()
+    settle(root, app)
+    check("an edited field is written to the scope",
+          app.link.scope.inst.state[":TIMebase:SCALe"] == "2.0E-03")
+    check("span follows the setting", "-4.000 to +16.000 ms" in app.span_label.cget("text"),
+          app.span_label.cget("text"))
+    app.do_save_preset("test preset")
+    check("preset saved and selectable", "test preset" in app.preset_box["values"]
+          and app.cfg["user_presets"]["test preset"]["scope"][":TIMebase:SCALe"] == "2.0E-03")
+    app.preset.set("Spin echo 16.7 ms (2 legs)")
+    app.preset_picked()
+    check("picking a preset fills the shot settings",
+          app.mode.get() == "single" and app.sv["rep_s"].get() == "10.0")
+    app.mode.set("average")
+    for k, v in {"shots": "64", "rep_s": "0.27"}.items():
+        app.sv[k].set(v)
+    app.link.scope.inst.state[":TIMebase:SCALe"] = "1.5E-03"
+    app.set_win.destroy()
 
     print("\nscan")
     app.do_start_scan()

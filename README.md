@@ -69,21 +69,38 @@ table reports `ER light` with it divided out.
    matched to the light). `Ref` (a pick-off before the analyzer, not yet
    installed) would normalise intensity per sample. `Marker`/`Other` are
    recorded but not analysed.
-3. **Preset**: `AWG bench ramp` or `Spin-echo sequence`. `Apply to scope`
-   writes the preset's timebase and trigger source; otherwise the scan runs on
-   whatever the scope is set to. Set V/div so the PD stays on screen at every
-   angle (the Diagnostics tab and the log flag off-screen samples).
-4. **Scan**: angles, order (`bidirectional` or `shuffled` keep slow drift from
-   lining up with angle), mode, shots, blocks, dither, ref returns.
+3. **Preset** and **Scope settings...**: picking a preset fills the shot
+   settings (mode, shots, points, trigger wait, repetition period); `Apply to
+   scope` writes its scope settings. `Spin echo 16.7 ms (2 legs)` is 5 ms/div
+   from -2 ms (50 ms record, both legs and the after-ramp relaxation), HRES,
+   trigger sweep NORMAL (AUTO would self-trigger in a 10 s gap), 8 shots at
+   10 s. The **Scope settings** window is laid out from the profile's own
+   tables (timebase, acquisition, trigger, every channel): Read, edit, Apply
+   changes (only edited fields are written), and **Save as preset** keeps them
+   with the shot settings under a name. It shows the time span the record
+   covers - on the MSO-X a LEFT reference sits one division in from the edge,
+   so the record starts at position - 1 div (measured). Set V/div so the PD
+   stays on screen at every angle; the log and Diagnostics flag off-screen
+   samples.
+4. **Scan**: angles (Malus repeats every 180 deg, so 0-170 is a full set;
+   0-355 adds the 1- and 4-theta diagnostics), order, mode, shots, dither,
+   ref returns, and `rep s`, the trigger period, which only feeds the time
+   estimate.
+   - `single` (default): one HRES shot per file, read at `Points (single)`,
+     averaged here like the ILC. At a 10 s repetition this costs nothing over
+     scope averaging and keeps every shot: the scatter gives the error bars,
+     and a shot the intensity lock missed is dropped (`lock_tol`, 0.6 % of the
+     brightest pre-trigger level; the log says how many).
    - `average`: the scope averages `shots / blocks` triggers per block
-     (:DIGitize). An averaged MSO-X record reads out at **7680 points**.
-   - `single`: one HRES shot per file, read at `Points (single)`; slower,
-     but per-shot statistics and longer records.
-   - The channel offsets step across `dither codes` ADC codes over the blocks,
-     so the MSO-X per-code error pattern averages out instead of surviving
-     every block identically.
+     (:DIGitize); an averaged MSO-X record reads out at **7680 points**. Worth
+     it only at a fast repetition rate (the AWG ramp at 3.7 Hz).
+   - The channel offsets step across `dither codes` ADC codes over the shots
+     (or blocks), so the MSO-X per-code error pattern averages out.
    - Every angle is approached from below (`backoff` deg), so backlash always
-     lands on the same side.
+     lands on the same side. A scan leaves the scope's acquisition type,
+     average count and offsets as it found them.
+   - Records holding both spin-echo legs are segmented per leg: rest, up 1,
+     hold 1, down 1, after 1, up 2, ... after 2.
    `dark first` asks you to block the beam before the analyzer, takes the
    dark, then asks you to unblock it.
 5. **Set zero from rest**: by the campaign convention analyzer 0 is aligned
