@@ -125,6 +125,26 @@ def main():
     app.link.scope.inst.state[":TIMebase:SCALe"] = "1.5E-03"
     app.set_win.destroy()
 
+    print("\npreset applied with read-back, and the check before a scan")
+    app.link.scope.put(":TIMebase:SCALe", "1.0E-03")
+    app.link.scope.put(":CHANnel1:SCALe", "5.0")
+    app.preset.set("AWG bench ramp")
+    app.do_apply_preset()
+    settle(root, app)
+    log = app.logbox.get("1.0", "end")
+    check("preset written and confirmed", "every one read back as written" in log)
+    check("hand-changed V/div put back by role",
+          float(app.link.scope.inst.state[":CHANnel1:SCALe"]) == 1.0)
+    check("settings check logged", "Settings check:" in log)
+    app.do_check_scope()
+    settle(root, app)
+    check("scope check with a test shot ran", "Scope check:" in app.logbox.get("1.0", "end")
+          and app.last_check and any("ramp activity" in m for _, m in app.last_check),
+          app.last_check and [m for lv, m in app.last_check if lv != "INFO"][:3])
+    app.mode.set("average")
+    for k, v in {"shots": "64", "rep_s": "0.27", "wait_s": "10"}.items():
+        app.sv[k].set(v)
+
     print("\nscan")
     app.do_start_scan()
     settle(root, app, timeout=300)
@@ -134,6 +154,8 @@ def main():
         return report()
     pol = app.result["pol"]
     check("12 angles fitted", pol["n_angles"] == 12, pol["n_angles"])
+    check("the pre-run check is kept in the manifest",
+          bool(app.result["d"].manifest.get("precheck")))
     check("rest azimuth recovered", abs(pol["psi_rest"] - 23.7) < 0.1,
           f"{pol['psi_rest']:.3f}")
     check("dip ER points found", len(app.result["dips"]) >= 20, len(app.result["dips"]))

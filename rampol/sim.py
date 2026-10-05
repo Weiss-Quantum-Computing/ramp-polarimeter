@@ -169,6 +169,8 @@ class FakeInst:
         text = text.strip()
         if text in ("*OPC?", ":TER?"):
             return "1\n"
+        if text == ":SYSTem:ERRor?":
+            return '+0,"No error"\n'
         root = text[:-1] if text.endswith("?") else text
         return str(self.state.get(root, "0")) + "\n"
 

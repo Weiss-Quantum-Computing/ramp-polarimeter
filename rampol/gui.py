@@ -27,7 +27,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from . import __version__
 from . import analysis as an
 from . import config as cfgmod
-from . import hw, scan as scanmod, sim
+from . import checks, hw, scan as scanmod, sim
 
 ANGLE_CMAP = "hsv"                 # cyclic: 0 and 360 deg share a colour, none near white
 CMP_COLOUR = "#ff7f0e"
@@ -294,9 +294,12 @@ class App:
         ttk.Entry(rr, textvariable=self.scan_name, width=24).pack(side="left", padx=4)
         self.with_dark = tk.BooleanVar(value=True)
         ttk.Checkbutton(rr, text="dark first", variable=self.with_dark).pack(side="left")
+        self.check_first = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rr, text="check first", variable=self.check_first).pack(side="left")
         rr = ttk.Frame(f)
         rr.pack(fill="x", padx=6, pady=(4, 2))
-        self._btn(rr, "Start scan", self.do_start_scan)
+        self._btn(rr, "Check scope", self.do_check_scope)
+        self._btn(rr, "Start scan", self.do_start_scan, padx=(4, 0))
         self.stop_btn = ttk.Button(rr, text="Stop", command=self.do_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=6)
         self.est_label = ttk.Label(rr, text="", foreground="#666")
@@ -735,11 +738,31 @@ class App:
     def do_apply_preset(self):
         if not self.need(ell=False):
             return
-        p = cfgmod.all_presets(self.cfg).get(self.preset.get())
-        if not p or not p.get("scope"):
+        name = self.preset.get()
+        p = cfgmod.all_presets(self.cfg).get(name)
+        if not p:
             return
-        self.worker(lambda: self.link.apply(p["scope"]),
-                    done=lambda _: self.log(f"Applied preset '{self.preset.get()}' to the scope."))
+        roles = self.roles()
+        writes = self.link.preset_writes(p, roles)
+        plan = dict(self.gather()["scan"])
+
+        def go():
+            bad, errs = self.link.apply_checked(writes)
+            st = self.link.scope.read_settings()
+            return bad, errs, checks.settings_checks(st, self.link.prof, roles, plan)
+
+        def done(out):
+            bad, errs, found = out
+            self.log(f"Preset '{name}': wrote {len(writes)} settings"
+                     + ("" if bad or errs else ", every one read back as written."))
+            for root, (want, got) in bad.items():
+                self.log(f"  ! {root}: wrote {want}, scope reads {got}")
+            for e in errs:
+                self.log(f"  ! scope error: {e}")
+            self.report_checks(found, "Settings check", popup=bool(bad or errs))
+            if getattr(self, "set_win", None) is not None and self.set_win.winfo_exists():
+                self.do_read_scope()
+        self.worker(go, done=done)
 
     # -- scope settings window ---------------------------------------------------
     def open_scope_settings(self):
@@ -907,6 +930,53 @@ class App:
                                chans, log=self.log, progress=self._progress,
                                cancelled=self.stop_flag.is_set, clock=clock)
 
+    def report_checks(self, found, title, popup=True):
+        """Log every finding; pop up the WARN/FAIL ones. Returns the worst level."""
+        worst = checks.summary(found)
+        self.log(f"{title}: {worst}")
+        for lv, msg in found:
+            self.log(f"  {lv:4s} {msg}")
+        bad = [f"{lv}: {msg}" for lv, msg in found if lv in ("WARN", "FAIL")]
+        if popup and bad:
+            messagebox.showwarning(title, "\n\n".join(bad), parent=self.root)
+        return worst
+
+    def do_check_scope(self, then=None):
+        """Judge the scope settings, then take one shot the way the scan will
+        and judge that: clipping, screen use, light, ramps inside the record,
+        trigger. `then(worst, findings)` runs afterwards on the Tk thread."""
+        if not self.need(ell=False):
+            return
+        c = self.gather()
+        roles = self.roles()
+        if not roles:
+            self.log("No channel is recorded.")
+            return
+        plan = dict(c["scan"])
+        self.log("Checking the scope: settings, then one shot "
+                 f"(waits up to {plan.get('wait_s', 10):g} s for a trigger)...")
+
+        def go():
+            st = self.link.scope.read_settings()
+            found = checks.settings_checks(st, self.link.prof, roles, plan)
+            try:
+                t, tr, st2 = self.link.test_shot(
+                    list(roles), plan.get("mode", "single"), plan.get("points"),
+                    wait_s=float(plan.get("wait_s", 10)), cancelled=self.stop_flag.is_set)
+                found += checks.shot_checks(t, tr, st2, self.link.prof, roles, plan)
+            except hw.Cancelled:
+                raise
+            except Exception as exc:
+                found.append(("FAIL", f"test shot: {exc}"))
+            return found
+
+        def done(found):
+            self.last_check = [list(x) for x in found]
+            worst = self.report_checks(found, "Scope check", popup=then is None)
+            if then is not None:
+                then(worst, found)
+        self.worker(go, done=done)
+
     def do_start_scan(self):
         if not self.need():
             return
@@ -915,6 +985,30 @@ class App:
         if "PD" not in [r for r, _ in cfgmod.channel_roles(c).values()]:
             self.log("No channel has the PD role.")
             return
+        self.last_check = None
+        if not self.check_first.get():
+            self._start_scan_now()
+            return
+
+        def after(worst, found):
+            bad = [f"{lv}: {msg}" for lv, msg in found if lv in ("WARN", "FAIL")]
+            if worst == "FAIL":
+                if not messagebox.askyesno(
+                        "Scope check failed", "\n\n".join(bad)
+                        + "\n\nStart the scan anyway?", parent=self.root):
+                    self.log("Scan not started.")
+                    return
+            elif worst == "WARN":
+                if not messagebox.askokcancel(
+                        "Scope check", "\n\n".join(bad) + "\n\nOK to start the scan.",
+                        parent=self.root):
+                    self.log("Scan not started.")
+                    return
+            self._start_scan_now()
+        self.do_check_scope(then=after)
+
+    def _start_scan_now(self):
+        c = self.cfg
         run = self._new_run(c["scan_name"])
         if run.exists():
             ans = messagebox.askyesnocancel(
@@ -934,7 +1028,8 @@ class App:
         if self.with_dark.get():
             steps = [{"kind": "dark", "target": 0.0}] + steps
         plan = dict(s, preset=c["preset"], software=f"rampol {__version__}")
-        run.new(plan, steps, extra={"zero_deg": float(c["ell_zero_deg"])})
+        run.new(plan, steps, extra={"zero_deg": float(c["ell_zero_deg"]),
+                                    "precheck": getattr(self, "last_check", None)})
         self.run = run
         self.log(f"Scan {run.name}: {len(angles)} angles, {len(steps)} steps -> {run.folder}")
         if self.with_dark.get():

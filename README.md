@@ -71,10 +71,15 @@ table reports `ER light` with it divided out.
    recorded but not analysed.
 3. **Preset** and **Scope settings...**: picking a preset fills the shot
    settings (mode, shots, points, trigger wait, repetition period); `Apply to
-   scope` writes its scope settings. `Spin echo 16.7 ms (2 legs)` is 5 ms/div
-   from -2 ms (50 ms record, both legs and the after-ramp relaxation), HRES,
-   trigger sweep NORMAL (AUTO would self-trigger in a 10 s gap), 8 shots at
-   10 s. The **Scope settings** window is laid out from the profile's own
+   scope` writes its scope settings AND each recorded channel's V/div and
+   offset by role (PD 1 V/div +2.7 V, monitors 1 V/div +2.5 V, commands
+   2 V/div +4 V, marker 2 V/div +2 V; DC, displayed), reads every value back
+   and drains the scope's error queue - the scope takes a command it does not
+   like without a word, so the log says which settings did not land.
+   `Spin echo 16.7 ms (2 legs)` is 5 ms/div from -12 to +38 ms (12 ms of
+   locked light before the trigger, both legs, ~12 ms after leg 2, where the
+   intensity lock switches off), HRES, trigger sweep NORMAL (AUTO would
+   self-trigger in a 10 s gap), 8 shots at 10 s. The **Scope settings** window is laid out from the profile's own
    tables (timebase, acquisition, trigger, every channel): Read, edit, Apply
    changes (only edited fields are written), and **Save as preset** keeps them
    with the shot settings under a name. It shows the time span the record
@@ -103,6 +108,16 @@ table reports `ER light` with it divided out.
      hold 1, down 1, after 1, up 2, ... after 2.
    `dark first` asks you to block the beam before the analyzer, takes the
    dark, then asks you to unblock it.
+   **Check scope** (and `check first`, on by default, before every scan)
+   judges the settings - trigger sweep, channels displayed, DC coupling, a
+   pre-trigger stretch, trigger wait longer than the repetition - then takes
+   ONE shot the way the scan will and judges that: each channel's range
+   against its screen and the converter's edge (dither included), screen use
+   of the PD, whether there is light, whether the monitors/commands ramp and
+   the ramps sit inside the record. One shot is enough for the PD: the ramp
+   sweeps the polarization through 180 deg, so at any analyzer angle it
+   passes maximum transmission somewhere in the record. A FAIL asks before
+   the scan starts; the findings are kept in the manifest (`precheck`).
 5. **Set zero from rest**: by the campaign convention analyzer 0 is aligned
    with the polarization at the EO zero. After a scan, this sets the zero
    (the mount angle of analyzer 0) to the scan's fitted rest azimuth. Never
@@ -173,6 +188,7 @@ python tests/run_tests.py
 |---|---|
 | `test_ell14.py` | the driver against a fake serial port (the real mount's IN reply), the approach-from-below wrapper |
 | `test_analysis.py` | the harmonic fit exact on noise-free data, its uncertainties checked by pulls (unit spread), lower bounds; a 72-angle simulated scan written and read back: rotation, rest azimuth, drift correction, 142 dip ERs against the model, segments, monitor prediction |
+| `test_checks.py` | the pre-run check against the simulator: a hand-changed scope put back by a preset and confirmed, a silently refused setting reported, and each failure it should catch (AUTO sweep, channel off, wait <= repetition, AC coupling, clipping, off screen, small signal, ramp cut off, no light, no pre-trigger) |
 | `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER; config sandboxed, window off screen |
 
 ## What has and has not run on hardware

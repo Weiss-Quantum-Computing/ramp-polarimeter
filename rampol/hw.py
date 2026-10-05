@@ -36,6 +36,27 @@ class Cancelled(Exception):
     pass
 
 
+def same_setting(want, got):
+    """Does a read-back value match what was written? Numbers to 0.1 %
+    (the scope rounds: 5.0E-03 reads +5.000E-03), mnemonics by their short
+    form (HRESolution reads HRES, NORMal NORM), switches by state (ON reads
+    1)."""
+    w, g = str(want).strip().strip('"'), str(got).strip().strip('"')
+    try:
+        a, b = float(w), float(g)
+        return abs(a - b) <= 1e-3 * max(abs(a), abs(b), 1e-12)
+    except ValueError:
+        pass
+    sw = {"ON": "1", "OFF": "0"}
+    w2, g2 = sw.get(w.upper(), w.upper()), sw.get(g.upper(), g.upper())
+    if w2 == g2:
+        return True
+    # SCPI long vs short form: the short form is the leading capitals, and
+    # the scope answers with it; compare on the shorter one's length
+    n = min(len(w2), len(g2), 4)
+    return n >= 3 and w2[:n] == g2[:n]
+
+
 class ScopeLink:
     """Acquisition on top of a scope_grab.Scope (or the simulator's stand-in,
     which has the same methods).
@@ -82,11 +103,81 @@ class ScopeLink:
             self.scope.put(p.ch_offset.format(ch=ch), f"{offset:.6g}")
 
     def apply(self, settings):
-        """Write a preset's {scpi root: value}. The profile's write_first roots
-        go first (an average count is ignored unless the type is AVERage)."""
+        """Write {scpi root: value}. The profile's write_first roots go first
+        (an average count is ignored unless the type is AVERage), and a
+        channel's V/div before its offset (an offset can be illegal at the old
+        scale: MSO-X about +-2 V below 0.5 V/div)."""
         first = getattr(self.prof, "write_first", ())
-        for scpi in sorted(settings, key=lambda s: s not in first):
+        scales = [k for k in settings if k.endswith(":SCALe") and k.startswith(":CHAN")]
+
+        def order(k):
+            if k in first:
+                return 0
+            if k in scales:
+                return 1
+            return 2
+        for scpi in sorted(settings, key=order):
+            if scpi.startswith(":CHAN") and scpi.endswith(":OFFSet"):
+                continue
             self.scope.put(scpi, settings[scpi])
+        for scpi in settings:
+            if scpi.startswith(":CHAN") and scpi.endswith(":OFFSet"):
+                self.scope.put(scpi, settings[scpi])
+
+    def preset_writes(self, preset, roles):
+        """{scpi root: value} a preset means for the current wiring: its scope
+        settings, plus for every recorded channel display on, DC coupling and
+        the V/div and offset its role's entry gives. `roles` is {ch: role}."""
+        p = self.prof
+        out = dict(preset.get("scope") or {})
+        by_role = preset.get("roles") or {}
+        for ch, role in roles.items():
+            out[p.ch_display.format(ch=ch)] = "ON"
+            out[f":CHANnel{ch}:COUPling"] = "DC"
+            r = by_role.get(role)
+            if r:
+                out[p.ch_scale.format(ch=ch)] = f"{float(r['scale']):.6g}"
+                out[p.ch_offset.format(ch=ch)] = f"{float(r['offset']):.6g}"
+        return out
+
+    def apply_checked(self, settings):
+        """Write `settings`, read every one back, and drain the error queue.
+        Returns (mismatches {root: (wanted, got)}, scope error strings). The
+        scope takes a command it does not like without a word, so this is
+        the only way to know a preset actually landed."""
+        try:
+            self.scope.errors()                 # start from an empty queue
+        except Exception:
+            pass
+        self.apply(settings)
+        bad = {}
+        for scpi, want in settings.items():
+            try:
+                got = self.scope.get(scpi)
+            except Exception as exc:
+                bad[scpi] = (want, f"no reply ({exc})")
+                continue
+            if not same_setting(want, got):
+                bad[scpi] = (want, got)
+        try:
+            errs = self.scope.errors()
+        except Exception:
+            errs = []
+        return bad, errs
+
+    def test_shot(self, chans, mode="single", points=None, wait_s=10.0, cancelled=None):
+        """One acquisition of `chans` the way the scan will take it, for the
+        pre-run check: (t, {ch: volts}, settings snapshot). The acquisition
+        type is put back afterwards, as after a scan."""
+        got = {}
+
+        def keep(k, recs, hits):
+            got.update(recs)
+        self.acquire_blocks(chans, mode, 1, 1, dither_codes=0, points=points,
+                            wait_s=wait_s, cancelled=cancelled, on_block=keep)
+        settings = self.scope.read_settings()
+        first = next(iter(got.values()))
+        return first.t(), {ch: r.v() for ch, r in got.items()}, settings
 
     def acquire_blocks(self, chans, mode, blocks, shots, dither_codes=0,
                        points=None, wait_s=10.0, cancelled=None, on_block=None):

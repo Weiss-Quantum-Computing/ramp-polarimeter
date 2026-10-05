@@ -48,9 +48,26 @@ def record_span(scale, position, reference, divs=10.0):
     return t0, t0 + divs * float(scale)
 
 
+# Channel settings by ROLE, so a preset follows the wiring: written to
+# whichever channel carries that role when the preset is applied. Offsets put
+# 0 V about 2.7 div below centre for signals that run 0 to ~5 V (PD, monitors)
+# and the ~8.5 V commands on 2 V/div.
+ROLE_CHANNELS = {
+    "PD": {"scale": 1.0, "offset": 2.7},
+    "MonX1": {"scale": 1.0, "offset": 2.5},
+    "MonX2": {"scale": 1.0, "offset": 2.5},
+    "CmdX1": {"scale": 2.0, "offset": 4.0},
+    "CmdX2": {"scale": 2.0, "offset": 4.0},
+    "Marker": {"scale": 2.0, "offset": 2.0},
+    "Ref": {"scale": 1.0, "offset": 2.5},
+}
+
 # Presets: scope settings to write (Apply to scope) and scan settings to fill
-# in (on picking one). Built-ins here; ones saved from the Scope settings
-# window go to the config under "user_presets" and override these by name.
+# in (on picking one). "scope" is {SCPI root: value}; "roles" is channel
+# settings by role (V/div, offset; DC coupling and display on are always
+# written for every recorded channel). Built-ins here; ones saved from the
+# Scope settings window go to the config under "user_presets" and override
+# these by name.
 PRESETS = {
     "Spin echo 16.7 ms (2 legs)": {
         "note": "Experiment-control sequence, both legs in one record: ramps "
@@ -66,6 +83,7 @@ PRESETS = {
                   # LEFT starts the record one division before the position
                   ":TIMebase:POSition": "-7.0E-03",
                   ":TRIGger:MODE": "EDGE", ":TRIGger:SWEep": "NORMal"},
+        "roles": ROLE_CHANNELS,
         "scan": {"mode": "single", "shots": 8, "points": 100000,
                  "wait_s": 30.0, "rep_s": 10.0},
     },
@@ -77,6 +95,7 @@ PRESETS = {
                   ":TIMebase:POSition": "-2.0E-03",
                   ":TRIGger:MODE": "EDGE", ":TRIGger:SWEep": "NORMal",
                   ":TRIGger:EDGE:SOURce": "EXT"},
+        "roles": ROLE_CHANNELS,
         "scan": {"mode": "single", "shots": 32, "points": 20000,
                  "wait_s": 10.0, "rep_s": 0.27},
     },
