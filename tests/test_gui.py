@@ -234,6 +234,16 @@ def main():
           res is not None and (res["pol"] is not None or lines > 0),
           f"fit: {res and res['pol'] is not None}, lines drawn: {lines}")
     app.fig_traces.savefig(os.path.join(out, "Traces_stopped.png"))
+    # the same, deterministically: a result with no fit yet
+    app.result = dict(res, pol=None, dips=[], refine=[], mon=None)
+    app.redraw(app.fig_traces)
+    check("no fit yet: Traces still draws every shot",
+          len(app.fig_traces.axes[0].lines) >= len(res["raw"][0]) > 0,
+          len(app.fig_traces.axes[0].lines))
+    app.redraw(app.fig_angle)
+    check("no fit yet: the fit tabs say they need 3 angles",
+          any("needs 3" in t.get_text() for ax in app.fig_angle.axes for t in ax.texts))
+    app.result = res
     print(f"\nfigures in {out}")
     app.on_close()
     check("settings saved to the sandbox", os.path.exists(cfgmod.CONFIG_PATH))
