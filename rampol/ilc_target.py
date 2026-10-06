@@ -516,7 +516,7 @@ def figures(out, name, t, ref_y, tt, src_y, S, legs_E, timing, ref_name, tl, phi
                      + (", line ripple removed" if line_src else ""))
     ax[0].plot(ms, corr * 1e3, color="k", lw=1.0, label=f"correction, low-passed at {f_cut:g} Hz")
     ax[0].set_ylabel("rotation (mdeg)")
-    ax[0].set_title("Correction to the target rotation: what the monitors cannot see")
+    ax[0].set_title("Correction to the target rotation: -(light - monitors)")
     ax[0].legend(fontsize=8)
     ax[0].grid(alpha=0.3)
     ax[1].plot(ms, corr / 2 / 90 * v90[1] * 1e3, label="EO1 target change")
@@ -541,12 +541,13 @@ def figures(out, name, t, ref_y, tt, src_y, S, legs_E, timing, ref_name, tl, phi
         a_.plot(t * 1e3, np.where(any_seg, y, np.nan), color="0.4", lw=0.5, label=f"{lab}, undriven")
         f_ = line.get(key)
         if f_ is not None:
-            # the fit has its own offset/slope per stretch; draw the harmonics
-            # around each stretch's mean so the shape is comparable
+            # the whole model: the harmonics plus each stretch's own offset and
+            # slope (given the harmonics, those are the line fit of what is left)
             w = mains.line_wave(t, f_)
             for sgm in segs:
-                base = np.mean(y[sgm] - w[sgm])
-                a_.plot(t[sgm] * 1e3, w[sgm] + base, color="#d62728", lw=1.0)
+                tl_ = t[sgm]
+                base = np.polyval(np.polyfit(tl_, (y - w)[sgm], 1), tl_)
+                a_.plot(tl_ * 1e3, w[sgm] + base, color="#d62728", lw=1.0)
             a_.set_title(f"{lab}: " + mains.describe(f_, unit=unit), fontsize=8)
         a_.set_ylabel(unit)
         a_.grid(alpha=0.3)
