@@ -1134,11 +1134,30 @@ class App:
                      f"lengthen the hold")
             return
         roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
-        plan = {"shots": int(a.get("shots") or 8)}
+        chroles = self.roles()
+        use_preset = bool(self.find_preset.get())
+        sc_plan = c["scan"]
+        plan = {"shots": int(a.get("shots") or 8),
+                "wait_s": float(sc_plan.get("wait_s") or 10.0),
+                "dither_codes": int(sc_plan.get("dither_codes", 3))}
         rotation = s.wave.rotation
+        wave = s.wave
 
         def go():
             from . import bias as biasmod
+            st = (self._scope_like_scan(c, chroles, f"AWG find {kind}", keep_timebase=True)
+                  if use_preset else self.link.scope.read_settings())
+            src = str(st.get(":TRIGger:EDGE:SOURce", "")).upper()
+            if src.startswith("LINE"):
+                raise RuntimeError("the scope triggers on LINE: the AWG bursts on the bench "
+                                   "trigger - set the trigger source to it (EXT)")
+            # the AWG's record on screen, whatever the preset's timebase is
+            div, pos = awgmod.timebase_for(wave)
+            sc = self.link.scope
+            sc.put(":TIMebase:REFerence", "LEFT")
+            sc.put(":TIMebase:SCALe", f"{div:.6g}")
+            sc.put(":TIMebase:POSition", f"{pos:.6g}")
+            self._window_in_record(sc.read_settings(), (t0, t1), "hold window")
             out = biasmod.find_extremum(self.link, self.rot, roles, kind, window_s=(t0, t1),
                                         plan=plan, log=self.log,
                                         cancelled=self.stop_flag.is_set, ask=self.ask_main)
@@ -2314,16 +2333,22 @@ class App:
         self.find_zero_btn.pack(side="left", padx=4)
         self.find_lbl = CopyLabel(f, text="", foreground="#060", width=47)
         self.find_lbl.pack(anchor="w", padx=6)
+        self.find_preset = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="set the scope from the preset first, as a ramp scan",
+                        variable=self.find_preset).pack(anchor="w", padx=6)
         ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
-            "Static light: the light as it is, nothing ramping - LINE trigger, the PD "
-            "mean over one line period. Record window: a time in the experiment's record "
-            "(rest -10:-0.5, a hold) on its trigger. Malus scan: the whole curve, coarse; "
-            "Find refines it (+-deg at the most sensitive V/div). Under an AWG hold: the "
-            "AWG tab.")).pack(anchor="w", padx=6, pady=(2, 4))
+            "Static light: nothing ramping - LINE trigger, PD mean over one line "
+            "period. Record window: a time in the experiment's record (rest "
+            "-10:-0.5, a hold). Malus scan: the whole curve; Find refines it.")).pack(
+            anchor="w", padx=6, pady=(2, 4))
 
     def _find_setup(self, c):
-        """(static, window s, line Hz, plan) from the Find settings."""
+        """(static, window s, line Hz, plan) from the Find settings. The
+        acquisition is the ramp scan's - its trigger wait, readout points
+        and offset dither - with the Find tab's shots: Find used to wait
+        10 s for a trigger, and the spin-echo sequence comes every ~10 s."""
         fcfg = c["find"]
+        sc = c["scan"]
         static = fcfg.get("light") == FIND_LIGHT[1]
         win = None
         line_hz = float(fcfg.get("line_hz") or 60.0)
@@ -2332,12 +2357,66 @@ class App:
             if txt:
                 a, b = (float(x) * 1e-3 for x in txt.split(":"))
                 win = (min(a, b), max(a, b))
-        plan = {"shots": int(fcfg.get("shots") or 8)}
+        plan = {"shots": int(fcfg.get("shots") or 8),
+                "points": int(sc.get("points") or 20000),
+                "wait_s": float(sc.get("wait_s") or 10.0),
+                "dither_codes": int(sc.get("dither_codes", 3))}
         if static:
             # a line trigger every 16.7 ms: no long wait, and the mean of a
             # 20 ms record needs few points
             plan.update(points=2000, wait_s=2.0)
         return static, win, line_hz, plan
+
+    TIMEBASE = (":TIMebase:SCALe", ":TIMebase:POSition", ":TIMebase:REFerence")
+
+    def _scope_like_scan(self, c, chroles, label, keep_timebase=False):
+        """Worker: the scope as a ramp scan takes it - the selected preset
+        written and read back (what 'Apply to scope' does), then the scan's
+        pre-run settings check; a FAIL asks before going on. keep_timebase:
+        leave the timebase (the AWG tab sets it to its own record). Returns
+        the settings as they then are."""
+        name = c.get("preset")
+        pre = cfgmod.all_presets(c).get(name)
+        if pre is None:
+            self.log(f"{label}: no preset {name!r} - the scope is used as it is")
+        else:
+            writes = self.link.preset_writes(pre, chroles)
+            if keep_timebase:
+                writes = {k: v for k, v in writes.items() if k not in self.TIMEBASE}
+            bad, errs = self.link.apply_checked(writes)
+            self.log(f"{label}: scope set from the preset '{name}' ({len(writes)} settings"
+                     + (", every one read back)" if not bad and not errs else ")"))
+            for root, (want, got) in bad.items():
+                self.log(f"  ! {root}: wrote {want}, scope reads {got}")
+            for e in errs:
+                self.log(f"  ! scope error: {e}")
+        st = self.link.scope.read_settings()
+        found = checks.settings_checks(st, self.link.prof, chroles, dict(c["scan"]))
+        bad = [f"{lv}: {msg}" for lv, msg in found if lv in ("WARN", "FAIL")]
+        for b in bad:
+            self.log(f"  {b}")
+        if checks.summary(found) == "FAIL" and not self.ask_main(
+                "Scope check", f"The scope check before the {label} found:\n\n"
+                + "\n\n".join(bad) + "\n\nGo on anyway?"):
+            raise hw.Cancelled()
+        return st
+
+    def _window_in_record(self, st, win, what="window"):
+        """Refuse a window the record does not cover (the timebase decides)."""
+        if win is None:
+            return
+        from .config import record_span
+        sc = self.link.scope
+
+        def get(k):
+            v = st.get(k)
+            return v if v not in (None, "") else sc.get(k)
+        t0, t1 = record_span(get(":TIMebase:SCALe"), get(":TIMebase:POSition"),
+                             get(":TIMebase:REFerence") or "LEFT")
+        if win[0] < t0 - 1e-9 or win[1] > t1 + 1e-9:
+            raise RuntimeError(f"the {what} {win[0]*1e3:.2f}..{win[1]*1e3:.2f} ms is not inside "
+                               f"the record the scope takes ({t0*1e3:.2f}..{t1*1e3:.2f} ms) - "
+                               f"pick a window in it, or a preset whose timebase shows it")
 
     def do_find_angle(self):
         if not self.need():
@@ -2346,6 +2425,8 @@ class App:
         self.save_settings()
         fcfg = c["find"]
         roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
+        chroles = self.roles()
+        use_preset = bool(self.find_preset.get())
         kind = self.find_kind.get()
         try:
             static, win, line_hz, plan = self._find_setup(c)
@@ -2357,6 +2438,8 @@ class App:
 
         def go():
             from . import bias as biasmod
+            st = (self._scope_like_scan(c, chroles, f"Find {kind}") if use_preset
+                  else self.link.scope.read_settings())
 
             def run(w):
                 return biasmod.find_extremum(
@@ -2368,6 +2451,7 @@ class App:
                     out = run(w)
                 out["static"] = True
                 return out
+            self._window_in_record(st, win)
             return run(win)
 
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
@@ -2379,6 +2463,8 @@ class App:
         self.save_settings()
         fcfg = c["find"]
         roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
+        chroles = self.roles()
+        use_preset = bool(self.find_preset.get())
         try:
             static, win, line_hz, plan = self._find_setup(c)
             step = float(fcfg.get("step") or 10.0)
@@ -2391,6 +2477,8 @@ class App:
 
         def go():
             from . import bias as biasmod
+            st = (self._scope_like_scan(c, chroles, "Malus scan") if use_preset
+                  else self.link.scope.read_settings())
 
             def run(w):
                 return biasmod.malus_scan(self.link, self.rot, roles, angles, window_s=w,
@@ -2401,6 +2489,7 @@ class App:
                     out = run(w)
                 out["static"] = True
                 return out
+            self._window_in_record(st, win)
             return run(win)
 
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
@@ -2573,6 +2662,7 @@ class App:
             v.set(str(c["find"].get(k, "")))
         self.find_kind.set(c["find"].get("kind", "min"))
         self.find_light.set(c["find"].get("light", FIND_LIGHT[0]))
+        self.find_preset.set(bool(c["find"].get("use_preset", True)))
         self.order.set(s["order"])
         self.mode.set(s["mode"])
         self.preset.set(c["preset"])
@@ -2622,6 +2712,7 @@ class App:
         for k, v in self.fv.items():
             fd[k] = v.get().strip()
         fd["kind"], fd["light"] = self.find_kind.get(), self.find_light.get()
+        fd["use_preset"] = bool(self.find_preset.get())
         c["preset"] = self.preset.get()
         c["outdir"] = self.outdir.get().strip()
         c["scan_name"] = self.scan_name.get().strip()

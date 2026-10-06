@@ -191,6 +191,18 @@ sign (not built in yet).
    *Make it analyzer 0* sets the zero so crossed reads 0. Under an
    AWG-held rotation: the AWG tab's Find.
 
+   The scope is set as for a ramp scan (*set the scope from the preset
+   first*, on by default): the selected preset is written and read back -
+   what *Apply to scope* does - and the scan's pre-run settings check runs
+   (a FAIL asks before going on). The acquisition is the scan's: its
+   trigger wait, readout points and offset dither, with the Find tab's
+   shots (a fixed 10 s wait used to time out on the ~10 s spin-echo
+   sequence). A record window the timebase does not cover is refused
+   before the analyzer moves. Static light then switches to the LINE
+   trigger and its own timebase, and puts the preset's back; the AWG tab's
+   Find keeps the preset's channels and acquisition but puts its own
+   record's timebase on screen, and refuses a LINE trigger.
+
 A scan that stops can be resumed: start a scan with the same name and answer
 Yes.
 

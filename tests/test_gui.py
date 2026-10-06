@@ -465,8 +465,14 @@ def main():
     print("\nfind the min / max transmission angle")
     t0 = app.result["d"].t[0] * 1e3
     app.find_light.set(gui.FIND_LIGHT[0])
-    app.fv["window"].set(f"{t0 + 0.2:.2f}:-0.1")
     app.fv["shots"].set("4")
+    app.fv["window"].set("-50:-40")
+    app.do_find_angle()
+    settle(root, app)
+    check("a window outside the record is refused before anything moves",
+          "is not inside the record" in app.logbox.get("1.0", "end"))
+    app.link.scope.put(":TIMebase:SCALe", "5.0E-03")   # hand-changed since the preset
+    app.fv["window"].set(f"{t0 + 0.2:.2f}:-0.1")
     for kind, truth in (("min", (23.7 + 90) % 180), ("max", 23.7)):
         app.find_kind.set(kind)
         app.do_find_angle()
@@ -475,6 +481,11 @@ def main():
         err = abs((fr.get("angle", 999) - truth + 90) % 180 - 90)
         check(f"{kind} found at rest", err < 0.1, f"{fr.get('angle')} vs {truth}")
     app.fig_find.savefig(os.path.join(out, "Find_angle.png"))
+    pre = gui.cfgmod.all_presets(app.cfg)[app.preset.get()]["scope"]
+    check("Find set the scope from the preset first, as a ramp scan",
+          float(app.link.scope.get(":TIMebase:SCALe")) == float(pre[":TIMebase:SCALe"])
+          and "scope set from the preset" in app.logbox.get("1.0", "end"),
+          app.link.scope.get(":TIMebase:SCALe"))
 
     print("\nstatic light: line trigger, the PD mean, no ramp")
     sc = app.link.scope
