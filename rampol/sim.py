@@ -241,6 +241,14 @@ class FakeAWG:
     def list_waveforms(self, user_only=False):
         return list(self.stored)
 
+    def write(self, command):
+        """Only what the session sends raw: C<ch>:ARWV NAME,<name>."""
+        head, _, arg = command.partition(" ")
+        if head.endswith(":ARWV") and arg.startswith("NAME,"):
+            ch, name = int(head[1]), arg[5:]
+            self.selected[ch] = name
+            self.bench.awg_drive[ch] = (1.0 / self.frq[ch], self.stored[name] * self.amp[ch] / 2)
+
 
 class FakeInst:
     """The VISA session under the fake scope: settings as a dict."""

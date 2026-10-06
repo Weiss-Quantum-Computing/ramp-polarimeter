@@ -22,6 +22,7 @@ from rampol import config as cfgmod  # noqa: E402
 SANDBOX = tempfile.mkdtemp(prefix="rampol-gui-")
 cfgmod.CONFIG_PATH = os.path.join(SANDBOX, "config.json")
 
+cfgmod.DEFAULTS["autoconnect"] = False      # never reach for the real scope from a test
 from rampol import gui  # noqa: E402
 from rampol import analysis as an  # noqa: E402
 
@@ -69,13 +70,14 @@ def main():
         app.sv[k].set(v)
     app.mode.set("average")
     app.scan_name.set("gui test")
-    print("\nconnect")
-    app.do_connect_scope()
+    # the simulated bench has no chain offsets for an idle trim to cancel
+    app.av["idle1"].set("0")
+    app.av["idle2"].set("0")
+    print("\nconnect (as on open)")
+    app.auto_connect()
     settle(root, app)
     app.bench.rng = __import__("numpy").random.default_rng(5)
     app._sim_parts[0].realtime = 0.0
-    app.do_connect_ell()
-    settle(root, app)
     check("scope connected (simulated)", app.link is not None,
           app.scope_status.cget("text"))
     check("analyzer connected (simulated)", app.rot is not None,
@@ -85,6 +87,9 @@ def main():
     settle(root, app)
     pos = float(app.pos_label.cget("text").split()[1])
     check("go to lands within 0.05 deg", abs(pos - 123.4) < 0.05, f"{pos:.3f}")
+    app.pos_label._copy()
+    check("the position can be copied", root.clipboard_get() == app.pos_label.cget("text"),
+          root.clipboard_get())
     app.step_var.set("0.25")
     for _ in range(4):
         app.do_step(+1)
@@ -264,7 +269,7 @@ def main():
     print("\nbias points: AWG plateaus into the simulated bench")
     tabs = [app.modes.tab(f, "text") for f in app.modes.tabs()]
     check("measurement modes are tabs (find and refine share Analyzer)",
-          tabs == ["Ramp scan", "Analyzer", "Bias points", "ILC target"], tabs)
+          tabs == ["Ramp scan", "Analyzer", "AWG", "Bias points", "ILC target"], tabs)
     app.bv["biases"].set("0:90:45")
     app.bv["shots"].set("4")
     app.bv["name"].set("gui-bias")
@@ -351,6 +356,22 @@ def main():
           any(getattr(a, "name", "") == "3d" for a in app.fig_poin.axes)
           and len(app.fig_poin.axes) >= 3)
     app.fig_poin.savefig(os.path.join(out, "Poincare.png"))
+
+    print("\ncursor moves in place; right-click copies a plot position")
+    app.nb.select(app.fig_malus._frame)
+    root.update()
+    ax0 = app.fig_malus.axes[0]
+    app.cursor_var.set("3.0")
+    app.set_cursor_text()
+    root.update()
+    check("Malus follows the cursor without a rebuild",
+          app.fig_malus.axes[0] is ax0 and "t = 3.0" in ax0.get_title(), ax0.get_title())
+
+    class Ev:
+        button, inaxes, xdata, ydata = 3, ax0, 12.5, 3.25
+    app.copy_coords(Ev())
+    check("right-click copies x and y", root.clipboard_get() == "12.5\t3.25",
+          repr(root.clipboard_get()))
 
     print("\ncompare scans")
     i = list(app.cmp_lb.get(0, "end")).index("gui-test")
@@ -441,10 +462,44 @@ def main():
     check("min found with the AWG holding 60 deg", err < 0.1 and not any(app.bench.awg_on.values()),
           f"{fr['angle']:.3f}")
     app.fig_find.savefig(os.path.join(out, "Find_angle.png"))
+    print("\nAWG mode: ramp to a rotation, find the null in the hold")
+    app.a_choice["source"].set("ramp")
+    app.av["rotation"].set("60")
+    app.do_awg_preview()
+    root.update()
+    check("preview drew the waveform", len(app.fig_awg.axes) >= 2
+          and "ramp to 60" in app.fig_awg.axes[0].get_title(), app.fig_awg.axes[0].get_title())
+    app.do_awg_load()
+    settle(root, app)
+    check("loaded, outputs still off", app.awg_sess is not None and app.awg_sess.wave is not None
+          and not any(app.bench.awg_on.values()))
+    app.do_awg_on()
+    settle(root, app)
+    check("outputs on (asked first)", all(app.bench.awg_on.values()) and
+          "ON" in app.awg_lbl.cget("text"), app.awg_lbl.cget("text"))
+    app.av["shots"].set("4")
+    app.do_awg_find("min")
+    settle(root, app, timeout=300)
+    fr = app.find_result
+    err = abs((fr["angle"] - (23.7 + 90 + 60) % 180 + 90) % 180 - 90)
+    check("null in the hold of a 60 deg ramp", err < 0.1 and all(app.bench.awg_on.values()),
+          f"{fr['angle']:.3f}")
+    app.do_awg_off()
+    t0 = time.time()
+    while any(app.bench.awg_on.values()) and time.time() - t0 < 5:
+        root.update()
+        time.sleep(0.02)
+    root.update()
+    check("Outputs OFF", not any(app.bench.awg_on.values()) and "OFF" in app.awg_lbl.cget("text"))
+    app.do_awg_on()
+    settle(root, app)
     check("found angles go to the lab log",
           sum(r["kind"].startswith("find") for r in lablog.read(app.outdir.get())) >= 3)
     print(f"\nfigures in {out}")
+    bench = app.bench
+    live = all(bench.awg_on.values())
     app.on_close()
+    check("closing the window switches the AWG off", live and not any(bench.awg_on.values()))
     check("settings saved to the sandbox", os.path.exists(cfgmod.CONFIG_PATH))
     return report()
 

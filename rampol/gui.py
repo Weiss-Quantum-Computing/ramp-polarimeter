@@ -30,8 +30,25 @@ from . import __version__
 from . import analysis as an
 from . import config as cfgmod
 from . import checks, hw, lablog, provenance, scan as scanmod, sim
+from .widgets import CopyLabel
+from . import awg as awgmod
 
 ANGLE_CMAP = "hsv"                 # cyclic: 0 and 360 deg share a colour, none near white
+AWG_HELP = (
+    "AWG mode: the 4063B plays the waveform on the bench trigger (EXT burst), CH1 -> "
+    "Trek X1 -> EO1, CH2 -> Trek X2 -> EO2. 'ramp': idle -> the rotation (split between "
+    "the crystals) -> idle, both ends exactly at idle; idle blank = the ILC state files' "
+    "first sample (the learned trim; file zero parks the EOMs at -9 / -41 V). The "
+    "default record is the ILC's (11 ms at 2 us), so switching between ILC drives and "
+    "ramps needs no channel set-up. 'ILC drives': two drive_<stem>_iNN.csv files, checked "
+    "against their own state's target. Preview draws it and runs the checks (Trek "
+    "limits, length, trigger period, duty, idle cap); Load puts it on the AWG (connecting "
+    "on first use, never on open) with the outputs OFF; Outputs ON asks first; Outputs "
+    "OFF works at any time. Find min/max sweeps the analyzer in the hold, after the "
+    "settle. A ramp scan with this playing: the Ramp scan tab. At the end (close, "
+    "Disconnect, bias run): 'off', or 'park' = an idle waveform with the outputs left ON, "
+    "for driving through the X2 FPGA/buffer stage, whose output goes high on a floating "
+    "input.")
 MAP_MODES = ("transmission", "fit residual (mV)", "residual / standard error")
 PLOT_HINT = ("Click a time on the Map, Angle or Extinction tab to move the "
              "cursor the Malus tab shows.")
@@ -60,6 +77,11 @@ class App:
         self.live_pending = None
         self.plot_tabs = {}
         self.plot_dirty = set()
+        self.cursor_dirty = set()     # tabs whose only change is the cursor time
+        self.awg_sess = None          # awg.Session once the AWG is connected
+        self.awg_eom = None           # EOM-ILC's eomilc, loaded with the AWG
+        self.awg_wave = None          # the AWG tab's previewed waveform
+        self._worker_thread = None
         self.busy_widgets = []
 
         root.title(f"Ramp Polarimeter {__version__}")
@@ -77,15 +99,18 @@ class App:
         self.build_hardware(left)
         self.build_analyzer(left)
         self.build_channels(left)
+        # Stop and progress are packed first, at the bottom: a tall mode tab
+        # once squeezed them out of the window (AWG tab, 6 Oct 2026)
+        self.build_runbar(left)
         # the measurement modes share the column below the hardware as tabs
-        # (selected by frame); Stop and progress sit under them, for all
+        # (selected by frame)
         self.modes = ttk.Notebook(left)
         self.modes.pack(fill="x", padx=8, pady=3)
         self.build_scan(self._mode_tab("Ramp scan"))
         self.build_analyzer_mode(self._mode_tab("Analyzer"))
+        self.build_awg(self._mode_tab("AWG"))
         self.build_bias(self._mode_tab("Bias points"))
         self.build_ilc(self._mode_tab("ILC target"))
-        self.build_runbar(left)
         self.bias_result = None
         self.ilc_summary = None
         self.build_right(right)
@@ -95,6 +120,8 @@ class App:
         self.pump()
         self.log(f"Ramp Polarimeter {__version__}. Config: {cfgmod.CONFIG_PATH}")
         self.load_sg(quiet=True)
+        if self.autoconnect.get() and not self.simulate.get():
+            root.after(300, self.auto_connect)
 
     # -- plumbing -----------------------------------------------------------
     def log(self, text):
@@ -141,7 +168,8 @@ class App:
                 # the next operation (dark -> unblock prompt -> scan)
                 self.call(self._finish, ok, out, done)
 
-        threading.Thread(target=body, daemon=True).start()
+        self._worker_thread = threading.Thread(target=body, daemon=True)
+        self._worker_thread.start()
         return True
 
     def _finish(self, ok, out, done):
@@ -179,8 +207,8 @@ class App:
         self._btn(r, "Connect", self.do_connect_scope)
         # Fixed width + wrap: an instrument's identity or a VISA address is long
         # and a label sized to it widened the whole left column.
-        self.scope_status = ttk.Label(f, text="scope: not connected", foreground="#666",
-                                      width=48, wraplength=330)
+        self.scope_status = CopyLabel(f, text="scope: not connected", foreground="#666",
+                                      width=48)
         self.scope_status.pack(anchor="w", padx=6)
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=2)
@@ -191,14 +219,17 @@ class App:
         self.ell_addr = tk.StringVar()
         ttk.Entry(r, textvariable=self.ell_addr, width=3).pack(side="left", padx=4)
         self._btn(r, "Connect", self.do_connect_ell)
-        self.ell_status = ttk.Label(f, text="analyzer: not connected", foreground="#666",
-                                    width=48, wraplength=330)
+        self.ell_status = CopyLabel(f, text="analyzer: not connected", foreground="#666",
+                                    width=48)
         self.ell_status.pack(anchor="w", padx=6)
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=(2, 4))
         self.simulate = tk.BooleanVar()
         ttk.Checkbutton(r, text="Simulate both (no hardware)",
                         variable=self.simulate).pack(side="left")
+        self.autoconnect = tk.BooleanVar(value=bool(self.cfg.get("autoconnect", True)))
+        ttk.Checkbutton(r, text="Connect on open", variable=self.autoconnect).pack(
+            side="left", padx=(8, 0))
         self._btn(r, "Disconnect all", self.do_disconnect, padx=(12, 0))
         ttk.Button(r, text="Scope settings...", command=self.open_scope_settings).pack(
             side="left", padx=(8, 0))
@@ -208,7 +239,7 @@ class App:
         f.pack(fill="x", padx=8, pady=3)
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=2)
-        self.pos_label = ttk.Label(r, text="position: -", width=24)
+        self.pos_label = CopyLabel(r, text="position: -", width=24)
         self.pos_label.pack(side="left")
         self._btn(r, "Read", self.do_read_pos)
         self._btn(r, "Home", self.do_home, padx=4)
@@ -324,7 +355,7 @@ class App:
         rr.pack(fill="x", padx=6, pady=(4, 2))
         self._btn(rr, "Check scope", self.do_check_scope)
         self._btn(rr, "Start scan", self.do_start_scan, padx=(4, 0))
-        self.est_label = ttk.Label(rr, text="", foreground="#666")
+        self.est_label = CopyLabel(rr, text="", foreground="#666", width=44)
         self.est_label.pack(side="left", padx=6)
         for v in list(self.sv.values()) + [self.order, self.mode]:
             v.trace_add("write", lambda *_: self.update_estimate())
@@ -392,8 +423,8 @@ class App:
         self.drift_on = tk.BooleanVar(value=True)
         ttk.Checkbutton(r, text="drift-correct from refs", variable=self.drift_on,
                         command=self.reanalyse).pack(side="left", padx=(10, 0))
-        self.plot_status = ttk.Label(r, text=PLOT_HINT, foreground="#666")
-        self.plot_status.pack(side="left", padx=(12, 0))
+        self.plot_status = CopyLabel(r, text=PLOT_HINT, foreground="#666", width=100)
+        self.plot_status.pack(side="left", padx=(12, 0), fill="x", expand=True)
         r = ttk.Frame(bar)
         r.pack(fill="x", padx=6, pady=(0, 4))
         ttk.Label(r, text="Apply:").pack(side="left")
@@ -405,8 +436,7 @@ class App:
                           ("drop missed-lock shots", self.lock_on)):
             ttk.Checkbutton(r, text=text, variable=var, command=self.reanalyse).pack(
                 side="left", padx=(6, 0))
-        self.corr_label = ttk.Label(bar, text="", foreground="#8a4b00", wraplength=900,
-                                    justify="left")
+        self.corr_label = CopyLabel(bar, text="", foreground="#8a4b00", width=130)
         self.corr_label.pack(fill="x", padx=6, pady=(0, 4))
 
         pane = ttk.PanedWindow(right, orient="vertical")
@@ -467,8 +497,9 @@ class App:
         self.fig_bias = self._fig_tab("Bias points", self.draw_bias)
         self.fig_ilc = self._fig_tab("ILC target", self.draw_ilc)
         self.fig_find = self._fig_tab("Find angle", self.draw_find)
+        self.fig_awg = self._fig_tab("AWG", self.draw_awg)
         self.free_tabs = {self.fig_bias._frame, self.fig_ilc._frame, self.fig_find._frame,
-                          self.fig_cmp._frame}
+                          self.fig_cmp._frame, self.fig_awg._frame}
         ttk.Label(self.fig_ilc._ctl, text="figure:").pack(side="left")
         self.ilc_fig = tk.StringVar(value="fig2_rotation_vs_target.png")
         cb = ttk.Combobox(self.fig_ilc._ctl, textvariable=self.ilc_fig, width=28,
@@ -492,6 +523,7 @@ class App:
         fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, ctl, frame
         self.plot_tabs[frame] = (fig, draw)
         self.plot_dirty.add(frame)
+        canvas.mpl_connect("button_press_event", self.copy_coords)
         if click:
             canvas.mpl_connect("button_press_event",
                                lambda ev, fig=fig: self.on_click(ev, fig))
@@ -529,15 +561,14 @@ class App:
     def build_runbar(self, left):
         """Stop and progress, under the mode tabs: every mode uses them."""
         f = ttk.Frame(left)
-        f.pack(fill="x", padx=8, pady=(0, 4))
+        f.pack(side="bottom", fill="x", padx=8, pady=(0, 4))
         r = ttk.Frame(f)
         r.pack(fill="x")
         self.stop_btn = ttk.Button(r, text="Stop", command=self.do_stop, state="disabled")
         self.stop_btn.pack(side="left")
         self.progress_bar = ttk.Progressbar(r, mode="determinate", maximum=1)
         self.progress_bar.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self.progress_text = ttk.Label(f, text="", foreground="#060", width=48,
-                                       wraplength=330)
+        self.progress_text = CopyLabel(f, text="", foreground="#060", width=48)
         self.progress_text.pack(anchor="w", pady=(0, 2))
 
     def build_bias(self, f):
@@ -608,6 +639,326 @@ class App:
             "correction. PD delay: the photodiode chain's own (an RC filter: 3.1 "
             "us).")).pack(anchor="w", padx=6, pady=(2, 4))
 
+    # -- AWG mode -----------------------------------------------------------------------------
+    def build_awg(self, f):
+        """The 4063B playing a waveform into the Treks (CH1 -> X1, CH2 -> X2):
+        a ramp to a rotation and back, or two ILC drive files; preview and
+        check, load, outputs on/off, then measure in the hold."""
+        self.av, self.a_choice = {}, {}
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=(4, 1))
+        ttk.Label(rr, text="Waveform").pack(side="left")
+        self.a_choice["source"] = tk.StringVar(value="ramp")
+        ttk.Combobox(rr, textvariable=self.a_choice["source"], values=("ramp", "ILC drives"),
+                     width=10, state="readonly").pack(side="left", padx=4)
+        ttk.Label(rr, text="rotation").pack(side="left")
+        self.av["rotation"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.av["rotation"], width=6).pack(side="left", padx=2)
+        ttk.Label(rr, text="deg, split X1").pack(side="left")
+        self.av["split"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.av["split"], width=4).pack(side="left", padx=2)
+        self.a_choice["edge"] = tk.StringVar(value="cosine")
+        ttk.Combobox(rr, textvariable=self.a_choice["edge"], values=("cosine", "linear"),
+                     width=7, state="readonly").pack(side="left", padx=4)
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        for label, key, w in (("lead", "lead_ms", 4), ("rise", "rise_ms", 4),
+                              ("hold", "hold_ms", 4), ("fall", "fall_ms", 4),
+                              ("record", "record_ms", 5)):
+            ttk.Label(rr, text=label).pack(side="left", padx=(0, 1))
+            self.av[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.av[key], width=w).pack(side="left", padx=(0, 4))
+        ttk.Label(rr, text="ms, dt").pack(side="left")
+        self.av["dt_us"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.av["dt_us"], width=4).pack(side="left", padx=2)
+        ttk.Label(rr, text="us").pack(side="left")
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        ttk.Label(rr, text="Idle X1").pack(side="left")
+        for key in ("idle1", "idle2"):
+            self.av[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.av[key], width=7).pack(side="left", padx=2)
+            if key == "idle1":
+                ttk.Label(rr, text="X2").pack(side="left")
+        ttk.Label(rr, text="V (blank: the ILC states' trim)", foreground="#666").pack(
+            side="left", padx=4)
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        ttk.Label(rr, text="ILC drives").pack(side="left")
+        for label, key in (("X1", "file1"), ("X2", "file2")):
+            ttk.Label(rr, text=label).pack(side="left", padx=(4, 1))
+            self.av[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.av[key], width=13).pack(side="left")
+            ttk.Button(rr, text="...", width=3,
+                       command=lambda k=key: self.pick_awg_file(k)).pack(side="left")
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        ttk.Label(rr, text="Trigger").pack(side="left")
+        self.av["trig_hz"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.av["trig_hz"], width=5).pack(side="left", padx=2)
+        ttk.Label(rr, text="Hz  at the end").pack(side="left")
+        self.a_choice["end"] = tk.StringVar(value="off")
+        ttk.Combobox(rr, textvariable=self.a_choice["end"], values=("off", "park"), width=5,
+                     state="readonly").pack(side="left", padx=4)
+        self.a_fit_tb = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rr, text="scope timebase to the record",
+                        variable=self.a_fit_tb).pack(side="left", padx=(4, 0))
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=(3, 1))
+        ttk.Button(rr, text="Preview", command=self.do_awg_preview).pack(side="left")
+        self._btn(rr, "Load to AWG", self.do_awg_load, padx=(4, 0))
+        self._btn(rr, "Outputs ON", self.do_awg_on, padx=(4, 0))
+        # never greyed out: it must work while anything else runs
+        ttk.Button(rr, text="Outputs OFF", command=self.do_awg_off).pack(side="left", padx=(4, 0))
+        ttk.Button(rr, text="?", width=2, command=lambda: self.log(AWG_HELP)).pack(
+            side="left", padx=(4, 0))
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        ttk.Label(rr, text="In the hold, after").pack(side="left")
+        self.av["settle_ms"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.av["settle_ms"], width=4).pack(side="left", padx=2)
+        ttk.Label(rr, text="ms settle, shots").pack(side="left")
+        self.av["shots"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.av["shots"], width=3).pack(side="left", padx=2)
+        self._btn(rr, "Find min", lambda: self.do_awg_find("min"), padx=(6, 0))
+        self._btn(rr, "Find max", lambda: self.do_awg_find("max"), padx=(4, 0))
+        self.awg_lbl = CopyLabel(f, text="AWG: not connected (connects on Load)",
+                                 foreground="#666", width=47)
+        self.awg_lbl.pack(anchor="w", padx=6, pady=(2, 4))
+
+    def pick_awg_file(self, key):
+        start = os.path.dirname(self.av[key].get()) or os.path.join(
+            self.cfg.get("eomilc_path", ""), "run")
+        p = filedialog.askopenfilename(title="EOM-ILC drive (AWG volts)", parent=self.root,
+                                       initialdir=start if os.path.isdir(start) else None,
+                                       filetypes=[("drive CSV", "drive_*.csv"), ("CSV", "*.csv")])
+        if p:
+            self.av[key].set(p)
+
+    def _awg_idle(self, c):
+        """{EO1, EO2: idle V}: typed, or the ILC state files' first sample."""
+        a = c["awg"]
+        auto = awgmod.idle_from_states([c["ilc"].get("x1"), c["ilc"].get("x2")])
+        out = {}
+        for name, key in (("EO1", "idle1"), ("EO2", "idle2")):
+            txt = str(a.get(key, "")).strip()
+            v = float(txt) if txt else auto[name]
+            if abs(v) > awgmod.IDLE_CAP:
+                raise ValueError(f"{name} idle {v*1e3:+.0f} mV is past the "
+                                 f"{awgmod.IDLE_CAP*1e3:.0f} mV cap")
+            out[name] = v
+        return out
+
+    def _awg_build(self, c):
+        """The waveform and its checks from the AWG tab (Tk thread)."""
+        a = c["awg"]
+        if a.get("source") == "ILC drives":
+            wave = awgmod.from_files(a.get("file1"), a.get("file2"))
+        else:
+            wave = awgmod.ramp_hold(float(a["rotation"]), a, idle=self._awg_idle(c))
+        eom = None
+        try:
+            eom = hw.load_eomilc(c["eomilc_path"])
+        except Exception as exc:
+            self.log(f"  EOM-ILC not loaded ({exc}): no Trek limit check")
+        found = awgmod.check(wave, eom, trig_hz=float(a.get("trig_hz") or 0) or None)
+        return wave, found
+
+    def do_awg_preview(self):
+        c = self.gather()
+        try:
+            wave, found = self._awg_build(c)
+        except (ValueError, OSError) as exc:
+            self.log(f"AWG preview: {exc}")
+            return
+        self.awg_wave, self.awg_found = wave, found
+        self.report_checks(found, f"AWG waveform: {wave.label}", popup=False)
+        idle = wave.idle()
+        self.log(f"  {wave.n} points at {wave.dt*1e6:g} us = {wave.period*1e3:.3f} ms "
+                 f"(FRQ {1/wave.period:.4f} Hz); idle X1 {idle['EO1']*1e3:+.1f} mV, "
+                 f"X2 {idle['EO2']*1e3:+.1f} mV")
+        self.plot_dirty.add(self.fig_awg._frame)
+        self.nb.select(self.fig_awg._frame)
+        self.draw_visible()
+
+    def _awg_session(self, c):
+        """Worker thread: the AWG session, connecting on first use. Never on
+        open: CH1 is often live from another program."""
+        if self.bench is not None:
+            if self.awg_sess is None or getattr(self.awg_sess.awg, "bench", None) is not self.bench:
+                self.awg_sess = awgmod.Session(sim.FakeAWG(self.bench), None, log=self.log)
+            return self.awg_sess
+        if self.awg_sess is None:
+            self.awg_eom = hw.load_eomilc(c["eomilc_path"])
+            mod = hw.load_module(c["awg_path"], "bk4063b")
+            import ilc_bench as ib
+            ib._AWGMOD = mod
+            awg = mod.BK4063B(connect=False, resource_manager=hw.shared_rm(mod.pyvisa))
+            self.log(f"AWG: {awg.connect()}")
+            self.awg_sess = awgmod.Session(awg, ib, log=self.log)
+        return self.awg_sess
+
+    def _awg_close(self, policy):
+        """End the AWG as the policy says (off, or parked) and let it go."""
+        s = self.awg_sess
+        if s is None:
+            return
+        try:
+            if s.owned or policy == "park":
+                s.end(policy)
+            if self.bench is None:
+                s.awg.close()
+        except Exception as exc:
+            self.log(f"AWG close: {exc}")
+        self.awg_sess = None
+
+    def _awg_status(self):
+        s = self.awg_sess
+        if s is None:
+            self.awg_lbl.configure(text="AWG: not connected", foreground="#666")
+            return
+        on = bool(s.owned)
+        what = s.wave.label if s.wave is not None else "nothing of this window's loaded"
+        self.awg_lbl.configure(text=f"AWG: {what}; outputs {'ON' if on else 'OFF'}",
+                               foreground="#c00000" if on else "#060")
+
+    def do_awg_load(self):
+        if not self.need(ell=False):
+            return
+        c = self.gather()
+        self.save_settings()
+        try:
+            wave, found = self._awg_build(c)
+        except (ValueError, OSError) as exc:
+            self.log(f"AWG: {exc}")
+            return
+        self.awg_wave, self.awg_found = wave, found
+        if self.report_checks(found, f"AWG waveform: {wave.label}") == "FAIL":
+            self.log("Not loaded.")
+            return
+        keep = c["awg"].get("end") == "park"
+        fit_tb = bool(c["awg"].get("fit_timebase"))
+
+        def go():
+            sess = self._awg_session(c)
+            names = sess.load(wave, keep_on=keep)
+            if fit_tb and self.link is not None:
+                div, pos = awgmod.timebase_for(wave)
+                sc = self.link.scope
+                sc.put(":TIMebase:REFerence", "LEFT")
+                sc.put(":TIMebase:SCALe", f"{div:.6g}")
+                sc.put(":TIMebase:POSition", f"{pos:.6g}")
+                self.log(f"  scope timebase {div*1e3:g} ms/div from -0.2 ms (the record)")
+            return names
+
+        def done(names):
+            self.log(f"AWG loaded: {wave.label} ({', '.join(names.values())})")
+            self._awg_status()
+            self.plot_dirty.add(self.fig_awg._frame)
+            self.draw_visible()
+        self.worker(go, done=done)
+
+    def do_awg_on(self):
+        s = self.awg_sess
+        if s is None or s.wave is None:
+            self.log("AWG: load a waveform first (Load to AWG).")
+            return
+        _, rot = awgmod.predict(s.wave)
+        if not messagebox.askokcancel(
+                "AWG outputs ON",
+                f"Switch both AWG outputs ON?\n\nCH1 -> X1 and CH2 -> X2 play\n"
+                f"{s.wave.label}\non every bench trigger (up to "
+                f"{float(np.max(np.abs(rot))):.1f} deg of rotation).\n\nOutputs OFF "
+                f"switches them off at any time.", parent=self.root):
+            return
+        self.worker(s.on, done=lambda _o: self._awg_status())
+
+    def do_awg_off(self):
+        """Runs beside the worker (its own thread, the session's lock)."""
+        s = self.awg_sess
+        if s is None:
+            self.log("AWG not connected - nothing to switch off from here.")
+            return
+
+        def bg():
+            try:
+                s.off()
+            except Exception as exc:
+                self.log(f"AWG OFF failed: {exc}")
+            self.call(self._awg_status)
+        threading.Thread(target=bg, daemon=True).start()
+
+    def do_awg_find(self, kind):
+        s = self.awg_sess
+        if not self.need():
+            return
+        if s is None or s.wave is None or s.wave.hold is None:
+            self.log("AWG: load a ramp waveform (it has a hold) first.")
+            return
+        if s.owned != set(awgmod.CHANNELS.values()):
+            self.log("AWG: switch the outputs ON first (Outputs ON).")
+            return
+        c = self.gather()
+        a = c["awg"]
+        settle = float(a.get("settle_ms", 4.0)) * 1e-3
+        t0, t1 = s.wave.hold[0] + settle, s.wave.hold[1] - 0.2e-3
+        if t1 - t0 < 0.3e-3:
+            self.log(f"AWG: the hold leaves {max(t1 - t0, 0)*1e3:.2f} ms after the settle - "
+                     f"lengthen the hold")
+            return
+        roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
+        plan = {"shots": int(a.get("shots") or 8)}
+        rotation = s.wave.rotation
+
+        def go():
+            from . import bias as biasmod
+            out = biasmod.find_extremum(self.link, self.rot, roles, kind, window_s=(t0, t1),
+                                        plan=plan, log=self.log,
+                                        cancelled=self.stop_flag.is_set, ask=self.ask_main)
+            out["bias"] = rotation
+            return out
+        self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
+
+    def draw_awg(self, fig):
+        w = self.awg_wave
+        if w is None and self.awg_sess is not None:
+            w = self.awg_sess.wave
+        if w is None:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "No waveform yet - AWG tab: Preview", ha="center",
+                    va="center", transform=ax.transAxes, color="#888")
+            ax.set_axis_off()
+            return
+        mon, rot = awgmod.predict(w)
+        t = w.t * 1e3
+        ax = fig.add_subplot(211)
+        for name, col in (("EO1", "#1f77b4"), ("EO2", "#2ca02c")):
+            ax.plot(t, w.u[name], color=col, lw=0.9,
+                    label=f"CH{awgmod.CHANNELS[name]} -> {name} (idle {w.u[name][0]*1e3:+.1f} mV)")
+        ax.set_ylabel("AWG output (V)")
+        ax.set_title(f"{w.label}: {w.n} points, {w.period*1e3:.3f} ms", fontsize=9)
+        ax.legend(fontsize=7, loc="upper right")
+        ax.grid(alpha=0.3)
+        ax.tick_params(labelbottom=False)
+        ax2 = fig.add_subplot(212, sharex=ax)
+        ax2.plot(t, rot, color="k", lw=0.9, label="rotation from the monitors' model")
+        for name, col in (("EO1", "#1f77b4"), ("EO2", "#2ca02c")):
+            ax2.plot(t, 90 * mon[name] / awgmod.biasmod.CHAN[name]["v90"], color=col,
+                     lw=0.6, ls="--", label=f"{name} share")
+        if w.hold:
+            ax2.axvspan(w.hold[0] * 1e3, w.hold[1] * 1e3, color="0.9", lw=0, label="hold")
+            try:
+                settle = float(self.av["settle_ms"].get())
+            except ValueError:
+                settle = 4.0
+            if w.hold[1] - w.hold[0] > settle * 1e-3 + 0.5e-3:
+                ax2.axvspan(w.hold[0] * 1e3 + settle, w.hold[1] * 1e3 - 0.2,
+                            color="#9ecae1", alpha=0.5, lw=0, label="Find window")
+        ax2.set_xlabel("time from the trigger (ms)")
+        ax2.set_ylabel("rotation (deg)")
+        ax2.legend(fontsize=7, loc="upper right")
+        ax2.grid(alpha=0.3)
+
     def pick_ilc_file(self, key, kind):
         if kind == "state":
             p = filedialog.askopenfilename(
@@ -661,33 +1012,29 @@ class App:
             self.bv["name"].set(new)
             c["bias"]["name"] = new
             name = new
-        sim_mode = self.bench is not None
         prov = self._provenance(c)
+
+        try:
+            plan["idle"] = self._awg_idle(c)
+        except ValueError as exc:
+            self.log(f"Bias points: {exc}")
+            return
+        plan["end"] = c["awg"].get("end", "off")
 
         def go():
             from . import bias as biasmod
-            eom = ib = None
-            if sim_mode:
-                awg = sim.FakeAWG(self.bench)
-            else:
-                eom = hw.load_eomilc(c["eomilc_path"])
-                mod = hw.load_module(c["awg_path"], "bk4063b")
-                import ilc_bench as ib
-                ib._AWGMOD = mod
-                awg = mod.BK4063B(connect=False,
-                                  resource_manager=getattr(self.link.scope, "rm", None))
-                self.log(f"AWG: {awg.connect()}")
+            sess = self._awg_session(c)
             self.bias_live = {"points": [], "name": name, "plan": plan}
-            run = biasmod.BiasRun(c["outdir"], name, self.link, self.rot, awg, roles,
+            run = biasmod.BiasRun(c["outdir"], name, self.link, self.rot, sess.awg, roles,
                                   plan=plan, log=self.log, cancelled=self.stop_flag.is_set,
                                   ask=self.ask_main, progress=self._progress,
                                   on_point=lambda p: self.call(self._bias_point, p),
-                                  eomilc=eom, ilc_bench=ib, provenance=prov)
+                                  eomilc=self.awg_eom, ilc_bench=sess.ib, provenance=prov,
+                                  session=sess)
             try:
                 run.run()
             finally:
-                if not sim_mode:
-                    awg.close()
+                self.call(self._awg_status)
             return run.folder
 
         def done(folder):
@@ -1043,8 +1390,7 @@ class App:
         ttk.Button(r, text="Crossed at cursor", command=self.shots_crossed).pack(
             side="left", padx=4)
         ttk.Button(r, text="Whole record", command=self.shots_whole).pack(side="left")
-        self.shots_info = ttk.Label(side, text="", foreground="#666", wraplength=230,
-                                    justify="left")
+        self.shots_info = CopyLabel(side, text="", foreground="#666", width=34)
         self.shots_info.pack(anchor="w", pady=(4, 0))
         fig = Figure(figsize=(7.0, 5.0), dpi=100, constrained_layout=True)
         canvas = FigureCanvasTkAgg(fig, master=right)
@@ -1052,6 +1398,7 @@ class App:
         canvas.get_tk_widget().pack(fill="both", expand=True)
         fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, side, frame
         canvas.mpl_connect("button_press_event", lambda ev: self._shots_click(ev))
+        canvas.mpl_connect("button_press_event", self.copy_coords)
         self.plot_tabs[frame] = (fig, self.draw_shots)
         self.plot_dirty.add(frame)
         self.fig_shots = fig
@@ -1146,6 +1493,17 @@ class App:
         yy = np.empty(2 * len(lo))
         yy[0::2], yy[1::2] = lo, hi
         return tt, yy
+
+    @staticmethod
+    def _band(t, lo, hi, n=4000):
+        """A band thinned to ~n bins, keeping its envelope (min of lo, max
+        of hi per bin): fill_between polygons are not simplified when drawn."""
+        if len(t) <= 2 * n:
+            return t, lo, hi
+        k = len(t) // n
+        m = (len(t) // k) * k
+        return (t[:m].reshape(-1, k).mean(axis=1), lo[:m].reshape(-1, k).min(axis=1),
+                hi[:m].reshape(-1, k).max(axis=1))
 
     def _shots_range(self, d):
         try:
@@ -1493,7 +1851,7 @@ class App:
         self.find_zero_btn = ttk.Button(rr, text="Make it analyzer 0", state="disabled",
                                         command=self.do_find_zero)
         self.find_zero_btn.pack(side="left", padx=6)
-        self.find_lbl = ttk.Label(f, text="", foreground="#060", wraplength=330)
+        self.find_lbl = CopyLabel(f, text="", foreground="#060", width=47)
         self.find_lbl.pack(anchor="w", padx=6)
         ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
             "Window: the rest before the ramp (-10:-0.5) or a hold; ticked, the AWG "
@@ -1519,48 +1877,43 @@ class App:
         except ValueError:
             self.log("Find: window as from:to in ms (e.g. -10:-0.5), bias in deg")
             return
-        plan = {"shots": int(fcfg.get("shots") or 8)}
-        sim_mode = self.bench is not None
+        plan = {"shots": int(fcfg.get("shots") or 8), "end": c["awg"].get("end", "off")}
+        if bias_deg is not None:
+            try:
+                plan["idle"] = self._awg_idle(c)
+            except ValueError as exc:
+                self.log(f"Find: {exc}")
+                return
 
         def go():
             from . import bias as biasmod
-            awg = eom = ib = None
-            if bias_deg is not None:
-                if sim_mode:
-                    awg = sim.FakeAWG(self.bench)
-                else:
-                    eom = hw.load_eomilc(c["eomilc_path"])
-                    mod = hw.load_module(c["awg_path"], "bk4063b")
-                    import ilc_bench as ib
-                    ib._AWGMOD = mod
-                    awg = mod.BK4063B(connect=False,
-                                      resource_manager=getattr(self.link.scope, "rm", None))
-                    self.log(f"AWG: {awg.connect()}")
+            sess = self._awg_session(c) if bias_deg is not None else None
             try:
                 return biasmod.find_extremum(
                     self.link, self.rot, roles, kind, window_s=win, bias_deg=bias_deg,
-                    awg=awg, plan=plan,
+                    awg=sess and sess.awg, plan=plan,
                     half_deg=float(fcfg["half"]) if str(fcfg.get("half", "")).strip() else None,
                     points=int(fcfg["points"]) if str(fcfg.get("points", "")).strip() else None,
                     log=self.log, cancelled=self.stop_flag.is_set, ask=self.ask_main,
-                    eomilc=eom, ilc_bench=ib)
+                    eomilc=self.awg_eom, ilc_bench=sess and sess.ib, session=sess)
             finally:
-                if awg is not None and not sim_mode:
-                    awg.close()
+                if sess is not None:
+                    self.call(self._awg_status)
 
-        def done(out):
-            self.find_result = out
-            self._lab_upsert(c["outdir"], lablog.find_row(out))
-            self.find_lbl.configure(
-                text=f"{out['kind']} at analyzer {out['angle']:.3f} +- "
-                     f"{out['sig']*1e3:.0f} mdeg ({out['level']*1e3:.2f} mV raw); "
-                     f"the analyzer is there now")
-            self.find_zero_btn.configure(state="normal" if out["kind"] == "min" else "disabled")
-            self.show_pos(out["angle"])
-            self.plot_dirty.add(self.fig_find._frame)
-            self.nb.select(self.fig_find._frame)
-            self.draw_visible()
-        self.worker(go, done=done)
+        self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
+
+    def _find_done(self, out, outdir):
+        self.find_result = out
+        self._lab_upsert(outdir, lablog.find_row(out))
+        self.find_lbl.configure(
+            text=f"{out['kind']} at analyzer {out['angle']:.3f} +- "
+                 f"{out['sig']*1e3:.0f} mdeg ({out['level']*1e3:.2f} mV raw); "
+                 f"the analyzer is there now")
+        self.find_zero_btn.configure(state="normal" if out["kind"] == "min" else "disabled")
+        self.show_pos(out["angle"])
+        self.plot_dirty.add(self.fig_find._frame)
+        self.nb.select(self.fig_find._frame)
+        self.draw_visible()
 
     def do_find_zero(self):
         out = getattr(self, "find_result", None)
@@ -1701,6 +2054,12 @@ class App:
         self.bias_order.set(c["bias"].get("order", "up"))
         for k, v in self.iv.items():
             v.set(str(c["ilc"].get(k, "")))
+        a = c["awg"]
+        for k, v in self.av.items():
+            v.set(str(a.get(k, "")))
+        for k in ("source", "edge", "end"):
+            self.a_choice[k].set(a.get(k, awgmod.DEFAULTS[k]))
+        self.a_fit_tb.set(bool(a.get("fit_timebase", True)))
 
     def gather(self):
         """The window's values into self.cfg (validated where it matters)."""
@@ -1709,6 +2068,7 @@ class App:
         c["ell_port"] = self.ell_port.get().strip()
         c["ell_address"] = self.ell_addr.get().strip() or "0"
         c["simulate"] = bool(self.simulate.get())
+        c["autoconnect"] = bool(self.autoconnect.get())
         try:
             c["ell_zero_deg"] = float(self.zero_var.get())
         except ValueError:
@@ -1742,6 +2102,16 @@ class App:
             elif _isnum(txt):
                 b[k] = int(float(txt)) if k in ("shots", "null_points") else float(txt)
         b["order"] = self.bias_order.get() or "up"
+        a = c["awg"]
+        for k, v in self.av.items():
+            txt = v.get().strip()
+            if k in ("idle1", "idle2", "file1", "file2"):
+                a[k] = txt
+            elif _isnum(txt):
+                a[k] = int(float(txt)) if k == "shots" else float(txt)
+        for k in ("source", "edge", "end"):
+            a[k] = self.a_choice[k].get()
+        a["fit_timebase"] = bool(self.a_fit_tb.get())
         i = c["ilc"]
         for k, v in self.iv.items():
             txt = v.get().strip()
@@ -1828,51 +2198,86 @@ class App:
             self._sim_parts = (scope, ell)
         return self._sim_parts
 
+    def _open_scope(self, c, roles):
+        """Worker thread: connect the scope; returns the status text."""
+        sg = self.load_sg()
+        if sg is None:
+            raise RuntimeError("Scope Grab is not loaded")
+        if c["simulate"]:
+            scope, _ = self.ensure_sim(roles)
+        else:
+            prof = sg.scope_profiles.get_profile(c["scope_model"])
+            scope = hw.share_rm(sg.Scope(prof), sg.pyvisa)
+            scope.connect(c["scope_addr"] or None)
+        self.link = hw.ScopeLink(scope, log=self.log)
+        self.log(f"Scope: {scope.idn.strip()} at {scope.addr}")
+        return f"scope: {short_idn(scope.idn)}"
+
+    def _open_ell(self, c, roles):
+        """Worker thread: connect the analyzer mount; (status text, position)."""
+        if c["simulate"]:
+            _, dev = self.ensure_sim(roles)
+        else:
+            from .ell14 import ELL14
+            dev = ELL14(c["ell_port"] or None, address=c["ell_address"],
+                        zero_offset_deg=float(c["ell_zero_deg"]))
+        self.rot = hw.Rotator(dev, log=self.log)
+        info = dev.info()
+        pos = dev.position()
+        self.log(f"Analyzer: ELL{info['type']} S/N {info['serial']} on {dev.port}, "
+                 f"{info['pulses_per_unit']} pulses/rev, firmware {info['firmware']}")
+        return (f"analyzer: ELL{info['type']} S/N {info['serial']} on {dev.port}", pos)
+
     def do_connect_scope(self):
         c = self.gather()
         roles = self.roles()
-
-        def go():
-            sg = self.load_sg()
-            if sg is None:
-                raise RuntimeError("Scope Grab is not loaded")
-            if c["simulate"]:
-                scope, _ = self.ensure_sim(roles)
-            else:
-                prof = sg.scope_profiles.get_profile(c["scope_model"])
-                scope = sg.Scope(prof)
-                scope.connect(c["scope_addr"] or None)
-            self.link = hw.ScopeLink(scope, log=self.log)
-            self.log(f"Scope: {scope.idn.strip()} at {scope.addr}")
-            return f"scope: {short_idn(scope.idn)}"
-
-        self.worker(go, done=lambda txt: self.scope_status.configure(text=txt, foreground="#060"))
+        self.worker(lambda: self._open_scope(c, roles),
+                    done=lambda txt: self.scope_status.configure(text=txt, foreground="#060"))
 
     def do_connect_ell(self):
         c = self.gather()
         roles = self.roles()
 
-        def go():
-            if c["simulate"]:
-                _, dev = self.ensure_sim(roles)
-            else:
-                from .ell14 import ELL14
-                dev = ELL14(c["ell_port"] or None, address=c["ell_address"],
-                            zero_offset_deg=float(c["ell_zero_deg"]))
-            self.rot = hw.Rotator(dev, log=self.log)
-            info = dev.info()
-            pos = dev.position()
-            self.log(f"Analyzer: ELL{info['type']} S/N {info['serial']} on {dev.port}, "
-                     f"{info['pulses_per_unit']} pulses/rev, firmware {info['firmware']}")
-            return (f"analyzer: ELL{info['type']} S/N {info['serial']} on {dev.port}", pos)
-
         def done(out):
             self.ell_status.configure(text=out[0], foreground="#060")
             self.show_pos(out[1])
+        self.worker(lambda: self._open_ell(c, roles), done=done)
+
+    def auto_connect(self):
+        """On open: the scope and the analyzer, each on its own - one that is
+        off or held by another program is logged and the other still comes
+        up. 'Connect on open' turns it off."""
+        if self.busy or self.link is not None or self.rot is not None:
+            return
+        c = self.gather()
+        roles = self.roles()
+        self.log("Connecting on open (untick 'Connect on open' to stop this)...")
+
+        def go():
+            out = {}
+            try:
+                out["scope"] = self._open_scope(c, roles)
+            except Exception as exc:
+                self.log(f"  scope not connected: {exc}")
+            try:
+                out["ell"] = self._open_ell(c, roles)
+            except Exception as exc:
+                self.log(f"  analyzer not connected: {exc}")
+            return out
+
+        def done(out):
+            if "scope" in out:
+                self.scope_status.configure(text=out["scope"], foreground="#060")
+            if "ell" in out:
+                self.ell_status.configure(text=out["ell"][0], foreground="#060")
+                self.show_pos(out["ell"][1])
         self.worker(go, done=done)
 
     def do_disconnect(self):
+        policy = self.a_choice["end"].get()
+
         def go():
+            self._awg_close(policy)
             if self.link is not None and self.bench is None:
                 self.link.scope.close()
             if self.rot is not None and self.bench is None:
@@ -1883,6 +2288,7 @@ class App:
         def done(_):
             self.scope_status.configure(text="scope: not connected", foreground="#666")
             self.ell_status.configure(text="analyzer: not connected", foreground="#666")
+            self._awg_status()
         self.worker(go, done=done)
 
     def need(self, scope=True, ell=True):
@@ -2736,6 +3142,7 @@ class App:
         toolbar = NavigationToolbar2Tk(canvas, right)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, side, frame
+        canvas.mpl_connect("button_press_event", self.copy_coords)
         self.plot_tabs[frame] = (fig, self.draw_compare)
         self.plot_dirty.add(frame)
         self.fig_cmp = fig
@@ -2888,7 +3295,7 @@ class App:
         u, v = np.mgrid[0:2 * np.pi:37j, 0:np.pi / 2:7j]
         ax3.plot_wireframe(np.cos(u) * np.sin(v), np.sin(u) * np.sin(v), np.cos(v),
                            color="0.85", lw=0.4)
-        idx = np.linspace(0, len(t) - 1, min(len(t), 4000)).astype(int)
+        idx = np.linspace(0, len(t) - 1, min(len(t), 2500)).astype(int)
         sc = ax3.scatter(st["s1"][idx], st["s2"][idx], st["s3"][idx], c=t[idx] * 1e3,
                          cmap="viridis", s=2, depthshade=False)
         rest = np.flatnonzero(an.rest_index(t))
@@ -2899,10 +3306,8 @@ class App:
             jw = int(np.flatnonzero(ok)[np.argmax(chi[ok])])
         else:
             jw = int(np.argmax(chi))
-        j = (int(np.argmin(np.abs(t - self.cursor_t))) if self.cursor_t is not None else jw)
-        ax3.scatter([st["s1"][j]], [st["s2"][j]], [st["s3"][j]], color="#d62728", s=40,
-                    label=f"{'cursor' if self.cursor_t is not None else 'largest chi'}, "
-                          f"{t[j]*1e3:.3f} ms")
+        cur, = ax3.plot([0], [0], [0], "o", color="#d62728", ms=7,
+                        label="cursor (largest chi until one is set)")
         ax3.set_xlim(-1, 1)
         ax3.set_ylim(-1, 1)
         ax3.set_zlim(0, 1)
@@ -2920,9 +3325,13 @@ class App:
                      label="time (ms)")
         ax = fig.add_subplot(gs[0, 1])
         tt = t * 1e3
-        ax.plot(tt, np.where(ok, chi, np.nan), lw=0.7, color="#1f77b4",
+        # chi is already a running mean over the Smooth span: every k-th sample
+        # draws the same line for a fraction of the cost
+        k = max(1, len(tt) // 6000)
+        tt, chi_d, ok_d = tt[::k], chi[::k], ok[::k]
+        ax.plot(tt, np.where(ok_d, chi_d, np.nan), lw=0.7, color="#1f77b4",
                 label=f"chi ({us:g} us mean)" if us else "chi (per sample)")
-        ax.plot(tt, np.where(~ok, chi, np.nan), lw=0.5, alpha=0.35, color="#1f77b4",
+        ax.plot(tt, np.where(~ok_d, chi_d, np.nan), lw=0.5, alpha=0.35, color="#1f77b4",
                 label="upper bound (Imin < 2 sigma)")
         ax.set_xlabel("time (ms)")
         ax.set_ylabel("ellipticity angle chi (deg)")
@@ -2933,27 +3342,40 @@ class App:
         self._poin_tax = ax
         axe = fig.add_subplot(gs[1, 1])
         ph = np.linspace(0, 2 * np.pi, 200)
-        for jj, col, ls, lab in ((j0, "0.5", "--", "rest"),
-                                 (j, "#d62728", "-", f"{t[j]*1e3:.3f} ms")):
+
+        def ellipse(jj):
             c_ = np.deg2rad(chi[jj])
             az = np.deg2rad(st["azimuth_deg"][jj] - st["azimuth_deg"][j0])
             x = np.cos(c_) * np.cos(ph)
             y = np.sin(c_) * np.sin(ph)
-            axe.plot(x * np.cos(az) - y * np.sin(az), x * np.sin(az) + y * np.cos(az),
-                     color=col, ls=ls, lw=1.0, label=lab)
-            axe.plot([-np.cos(az), np.cos(az)], [-np.sin(az), np.sin(az)], color=col,
-                     lw=0.5, ls=":")
+            return ((x * np.cos(az) - y * np.sin(az), x * np.sin(az) + y * np.cos(az)),
+                    ([-np.cos(az), np.cos(az)], [-np.sin(az), np.sin(az)]))
+        (ex, ey), (axx, axy) = ellipse(j0)
+        axe.plot(ex, ey, color="0.5", ls="--", lw=1.0, label="rest")
+        axe.plot(axx, axy, color="0.5", lw=0.5, ls=":")
+        el, = axe.plot(ex, ey, color="#d62728", lw=1.0, label="cursor")
+        ea, = axe.plot(axx, axy, color="#d62728", lw=0.5, ls=":")
         axe.set_aspect("equal")
         axe.set_xlim(-1.1, 1.1)
         axe.set_ylim(-1.1, 1.1)
         axe.axhline(0, color="k", lw=0.4)
         axe.axvline(0, color="k", lw=0.4)
-        az_j = st["azimuth_deg"][j] - st["azimuth_deg"][j0]
-        axe.set_title(f"{t[j]*1e3:.3f} ms: azimuth {az_j:+.2f} deg\n"
-                      f"chi {'<' if not ok[j] else ''}{chi[j]:.2f} deg, ER_fit "
-                      f"{'>' if not ok[j] else ''}{er[j]:.0f}", fontsize=8)
+        etitle = axe.set_title("", fontsize=8)
         axe.set_xlabel("rest polarization direction")
         axe.legend(fontsize=6, loc="lower right")
+
+        def update():
+            j = (int(np.argmin(np.abs(t - self.cursor_t))) if self.cursor_t is not None else jw)
+            cur.set_data_3d([st["s1"][j]], [st["s2"][j]], [st["s3"][j]])
+            (ex_, ey_), (axx_, axy_) = ellipse(j)
+            el.set_data(ex_, ey_)
+            ea.set_data(axx_, axy_)
+            az_j = st["azimuth_deg"][j] - st["azimuth_deg"][j0]
+            etitle.set_text(f"{t[j]*1e3:.3f} ms: azimuth {az_j:+.2f} deg\n"
+                            f"chi {'<' if not ok[j] else ''}{chi[j]:.2f} deg, ER_fit "
+                            f"{'>' if not ok[j] else ''}{er[j]:.0f}")
+        fig._cursor_update = update
+        update()
 
     # -- drawing -------------------------------------------------------------------
     def mark_dirty(self):
@@ -2967,15 +3389,73 @@ class App:
             return
         if frame in self.plot_dirty:
             self.plot_dirty.discard(frame)
+            self.cursor_dirty.discard(frame)
             fig, draw = self.plot_tabs[frame]
             if fig is None:
                 draw()
             else:
                 self.redraw(fig, draw)
+        elif frame in self.cursor_dirty:
+            self.cursor_dirty.discard(frame)
+            fig = self.plot_tabs[frame][0]
+            if fig is not None:
+                self.cursor_refresh(fig)
+
+    def cursor_refresh(self, fig):
+        """Move the cursor on a drawn figure without rebuilding it: the
+        cursor lines move, a tab's own update (Malus, Poincare) refreshes its
+        cursor-dependent artists, and the figure is drawn once with its
+        layout held (constrained layout re-measures every label otherwise)."""
+        x = None if self.cursor_t is None else self.cursor_t * 1e3
+        for ax in getattr(fig, "_cursor_axes", []):
+            ln = getattr(ax, "_cline", None)
+            if x is None:
+                if ln is not None:
+                    ln.set_visible(False)
+                continue
+            if ln is None:
+                xl = ax.get_xlim()
+                ax._cline = ax.axvline(x, color="#d62728", lw=0.8, ls=":")
+                ax.set_xlim(xl)
+            else:
+                ln.set_xdata([x, x])
+                ln.set_visible(True)
+        upd = getattr(fig, "_cursor_update", None)
+        if upd is not None:
+            try:
+                upd()
+            except Exception as exc:
+                self.log(f"cursor: {exc}")
+        self.fast_draw(fig)
+
+    @staticmethod
+    def fast_draw(fig):
+        eng = fig.get_layout_engine()
+        try:
+            fig.set_layout_engine("none")
+            fig._canvas.draw()
+        finally:
+            try:
+                fig.set_layout_engine(eng)
+            except Exception:
+                pass
+
+    def copy_coords(self, ev):
+        """Right-click on a plot: its x, y at the mouse to the clipboard."""
+        if getattr(ev, "button", None) != 3 or ev.inaxes is None or ev.xdata is None \
+                or getattr(ev.inaxes, "name", "") == "3d":
+            return
+        txt = f"{ev.xdata:.6g}\t{ev.ydata:.6g}"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        lx, ly = ev.inaxes.get_xlabel() or "x", ev.inaxes.get_ylabel() or "y"
+        self.plot_status.configure(text=f"copied {lx} = {ev.xdata:.6g}, {ly} = {ev.ydata:.6g}",
+                                   foreground="#060")
 
     def redraw(self, fig, draw=None):
         draw = draw or self.plot_tabs[fig._frame][1]
         fig.clear()
+        fig._cursor_axes, fig._cursor_update = [], None
         if fig._frame in getattr(self, "free_tabs", ()):
             try:
                 draw(fig)
@@ -3009,6 +3489,8 @@ class App:
         fig._canvas.draw_idle()
 
     def on_click(self, ev, fig):
+        if getattr(ev, "button", 1) != 1:
+            return
         if ev.inaxes is None or ev.xdata is None or fig._toolbar.mode:
             return
         if fig is self.fig_ext and self.ext_x.get() != "time":
@@ -3017,9 +3499,13 @@ class App:
             return
         self.cursor_t = ev.xdata * 1e-3
         self.cursor_var.set(f"{ev.xdata:.3f}")
-        self.plot_dirty |= {self.fig_malus._frame, self.fig_map._frame,
-                            self.fig_angle._frame, self.fig_ext._frame,
-                            self.fig_poin._frame}
+        self.cursor_moved()
+
+    def cursor_moved(self):
+        frames = {self.fig_malus._frame, self.fig_map._frame, self.fig_angle._frame,
+                  self.fig_ext._frame, self.fig_poin._frame, self.fig_traces._frame}
+        self.cursor_dirty |= frames - self.plot_dirty
+        self.plot_dirty.add(self.fig_build._frame)
         self.draw_visible()
 
     def set_cursor_text(self):
@@ -3027,7 +3513,7 @@ class App:
             self.cursor_t = float(self.cursor_var.get()) * 1e-3
         except ValueError:
             return
-        self.mark_dirty()
+        self.cursor_moved()
 
     def smooth_samples(self, t):
         try:
@@ -3038,12 +3524,19 @@ class App:
         return us, max(1, int(round(us * 1e-6 / dt)))
 
     def smooth(self, y, t):
-        """Running mean over the Smooth box's span (edges padded)."""
+        """Running mean over the Smooth box's span (edges padded): the same
+        window as np.convolve(..., 'same'), from a cumulative sum - O(N)
+        whatever the span."""
         _, n = self.smooth_samples(t)
         if n <= 1:
             return y
+        y = np.asarray(y, float)
         yp = np.concatenate([np.full(n, y[0]), y, np.full(n, y[-1])])
-        return np.convolve(yp, np.ones(n) / n, mode="same")[n:-n]
+        if not np.all(np.isfinite(yp)):
+            return np.convolve(yp, np.ones(n) / n, mode="same")[n:-n]
+        c = np.concatenate([[0.0], np.cumsum(yp)])
+        i = np.arange(n, n + len(y))
+        return (c[i + (n - 1) // 2 + 1] - c[i - n // 2]) / n
 
     def smoothed_er(self, pol, t):
         """ER from running means of Imax and Imin (not a mean of ratios),
@@ -3058,8 +3551,15 @@ class App:
         return er, ok, us
 
     def _cursor(self, ax):
+        """The cursor line on a time axis, registered so a cursor move
+        updates it in place (cursor_refresh) instead of redrawing."""
+        ax._cline = None
         if self.cursor_t is not None:
-            ax.axvline(self.cursor_t * 1e3, color="#d62728", lw=0.8, ls=":")
+            ax._cline = ax.axvline(self.cursor_t * 1e3, color="#d62728", lw=0.8, ls=":")
+        fig = ax.figure
+        if not hasattr(fig, "_cursor_axes"):
+            fig._cursor_axes = []
+        fig._cursor_axes.append(ax)
 
     def draw_traces(self, fig):
         res = self.result
@@ -3115,7 +3615,16 @@ class App:
         if mode == MAP_MODES[0]:
             ax = fig.add_subplot(111)
             I = pol["I"][order] / np.maximum(pol["imax"], 1e-9)
-            tm = np.concatenate([[t[0]], (t[1:] + t[:-1]) / 2, [t[-1]]])
+            # block means over ~4000 columns: a 19 x 100k mesh took 2.4 s to
+            # draw on test-4 and the screen has ~1000 pixels across anyway
+            n = max(1, len(t) // 4000)
+            m = (len(t) // n) * n
+            if n > 1:
+                I = I[:, :m].reshape(len(th), -1, n).mean(axis=2)
+                tb = t[:m].reshape(-1, n)
+                tm = np.r_[tb[:, 0], tb[-1, -1]]
+            else:
+                tm = np.concatenate([[t[0]], (t[1:] + t[:-1]) / 2, [t[-1]]])
             mesh = ax.pcolormesh(tm, edges, I, cmap="magma", shading="flat", rasterized=True,
                                  vmin=0, vmax=1)
             fig.colorbar(mesh, ax=ax, label="I / Imax(t)")
@@ -3168,40 +3677,58 @@ class App:
         res = self.result
         pol, d = res["pol"], res["d"]
         t = d.t
-        j = int(np.argmin(np.abs(t - (self.cursor_t if self.cursor_t is not None else t[len(t) // 2]))))
         th = pol["theta"]
-        y = pol["I"][:, j]
-        ax = fig.add_subplot(211)
-        ax.plot(wrap_angle(th), y * 1e3, "o", ms=4, color="#1f77b4", label="measured")
+        thw = wrap_angle(th)
+        thr = np.deg2rad(th)
         g = np.linspace(-5, 355, 721)
         gr = np.deg2rad(g)
-        model = pol["a0"][j] + pol["c2"][j] * np.cos(2 * gr) + pol["s2"][j] * np.sin(2 * gr)
-        full = model.copy()
-        for k, f in (("c1", np.cos(gr)), ("s1", np.sin(gr)), ("c4", np.cos(4 * gr)), ("s4", np.sin(4 * gr))):
-            if k in pol:
-                full = full + pol[k][j] * f
-        ax.plot(g, model * 1e3, color="k", lw=0.9, label="a0 + 2-theta terms")
+        zero_k, zero_g = np.zeros(len(th)), np.zeros(len(g))
+        ax = fig.add_subplot(211)
+        pts, = ax.plot(thw, zero_k, "o", ms=4, color="#1f77b4", label="measured")
+        mod, = ax.plot(g, zero_g, color="k", lw=0.9, label="a0 + 2-theta terms")
+        full = None
         if "c1" in pol:
-            ax.plot(g, full * 1e3, color="#ff7f0e", lw=0.7, ls="--", label="with 1- and 4-theta terms")
+            full, = ax.plot(g, zero_g, color="#ff7f0e", lw=0.7, ls="--",
+                            label="with 1- and 4-theta terms")
         ax.set_ylabel("PD - dark (mV)")
-        ax.set_title(f"Transmission vs analyzer angle at t = {t[j] * 1e3:.3f} ms ({d.name})")
-        ax.text(0.01, 0.97,
-                f"psi = {pol['psi'][j]:+.3f} +- {pol['sig_psi'][j] * 1e3:.1f} mdeg\n"
-                f"Imax = {pol['imax'][j] * 1e3:.1f} mV, Imin = {pol['imin'][j] * 1e3:.2f} "
-                f"+- {pol['sig_imin'][j] * 1e3:.2f} mV\nER_fit = "
-                f"{'>' if pol['er_lower'][j] else ''}{pol['er'][j]:.0f}, visibility "
-                f"{pol['vis'][j]:.5f}", transform=ax.transAxes, va="top", fontsize=7,
-                family="monospace")
+        title = ax.set_title("")
+        txt = ax.text(0.01, 0.97, "", transform=ax.transAxes, va="top", fontsize=7,
+                      family="monospace")
         ax.legend(loc="upper right", fontsize=7)
         ax.grid(alpha=0.3)
         ax2 = fig.add_subplot(212, sharex=ax)
-        thr = np.deg2rad(th)
-        fit_at = pol["a0"][j] + pol["c2"][j] * np.cos(2 * thr) + pol["s2"][j] * np.sin(2 * thr)
-        ax2.plot(wrap_angle(th), (y - fit_at) * 1e3, "o", ms=3, color="#1f77b4")
+        rpts, = ax2.plot(thw, zero_k, "o", ms=3, color="#1f77b4")
         ax2.axhline(0, color="k", lw=0.6)
         ax2.set_xlabel("analyzer angle (deg)")
         ax2.set_ylabel("residual to 2-theta fit (mV)")
         ax2.grid(alpha=0.3)
+
+        def update():
+            tc = self.cursor_t if self.cursor_t is not None else t[len(t) // 2]
+            j = int(np.argmin(np.abs(t - tc)))
+            y = pol["I"][:, j]
+            a0, c2, s2 = pol["a0"][j], pol["c2"][j], pol["s2"][j]
+            model = a0 + c2 * np.cos(2 * gr) + s2 * np.sin(2 * gr)
+            pts.set_ydata(y * 1e3)
+            mod.set_ydata(model * 1e3)
+            if full is not None:
+                extra = sum(pol[k][j] * f for k, f in
+                            (("c1", np.cos(gr)), ("s1", np.sin(gr)),
+                             ("c4", np.cos(4 * gr)), ("s4", np.sin(4 * gr))))
+                full.set_ydata((model + extra) * 1e3)
+            fit_at = a0 + c2 * np.cos(2 * thr) + s2 * np.sin(2 * thr)
+            rpts.set_ydata((y - fit_at) * 1e3)
+            title.set_text(f"Transmission vs analyzer angle at t = {t[j] * 1e3:.3f} ms ({d.name})")
+            txt.set_text(f"psi = {pol['psi'][j]:+.3f} +- {pol['sig_psi'][j] * 1e3:.1f} mdeg\n"
+                         f"Imax = {pol['imax'][j] * 1e3:.1f} mV, Imin = {pol['imin'][j] * 1e3:.2f} "
+                         f"+- {pol['sig_imin'][j] * 1e3:.2f} mV\nER_fit = "
+                         f"{'>' if pol['er_lower'][j] else ''}{pol['er'][j]:.0f}, visibility "
+                         f"{pol['vis'][j]:.5f}")
+            for a in (ax, ax2):
+                a.relim()
+                a.autoscale_view()
+        fig._cursor_update = update
+        update()
 
     def draw_angle(self, fig):
         res = self.result
@@ -3209,7 +3736,8 @@ class App:
         t = d.t * 1e3
         ax = fig.add_subplot(211)
         rot, sig = pol["rotation"], pol["sig_psi"]
-        ax.fill_between(t, rot - sig, rot + sig, color="#1f77b4", alpha=0.3, lw=0)
+        ax.fill_between(*self._band(t, rot - sig, rot + sig), color="#1f77b4", alpha=0.3,
+                        lw=0)
         ax.plot(t, rot, color="#1f77b4", lw=0.9, label=f"measured ({d.name})")
         if res["mon"] is not None:
             ax.plot(t, res["mon"][0], color="#2ca02c", lw=0.8, ls="--",
@@ -3432,6 +3960,12 @@ class App:
             return
         self.stop_flag.set()
         self.save_settings()
+        # the worker's own cleanup (a bias run switching the AWG off) runs
+        # before anything is closed under it
+        th = self._worker_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=20.0)
+        self._awg_close(self.a_choice["end"].get())
         try:
             if self.bench is None:
                 if self.rot is not None:

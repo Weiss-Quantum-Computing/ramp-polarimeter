@@ -635,8 +635,11 @@ def angle_gains(theta_deg, I, iters=30):
     r = np.deg2rad(np.asarray(theta_deg, float))
     A = np.column_stack([np.ones_like(r), np.cos(2 * r), np.sin(2 * r)])
     g = np.ones(len(r))
+    # the same 3-column design every pass: its pseudo-inverse once (lstsq on
+    # 100k right-hand sides x 30 passes was 2.8 s of a 3.9 s reanalysis)
+    P = np.linalg.pinv(A)
     for _ in range(iters):
-        coef, *_ = np.linalg.lstsq(A, I / g[:, None], rcond=None)
+        coef = P @ (I / g[:, None])
         M = A @ coef
         g_new = np.sum(I * M, axis=1) / np.maximum(np.sum(M * M, axis=1), 1e-30)
         g_new /= g_new.mean()

@@ -85,8 +85,21 @@ sign (not built in yet).
 ## Using it
 
 1. **Connect** the scope (VISA address blank = first MSO-X found) and the
-   ELL14 (COM3 on this PC). `Simulate both` runs the whole window against a
-   software bench instead, which is also what the tests use.
+   ELL14 (COM3 on this PC). With *Connect on open* ticked (the default) the
+   window connects both when it opens, each on its own: one that is off or
+   held by another program is logged and the other still connects. The AWG
+   is never connected on open (CH1 is often live from the ILC panel); it
+   connects on first use. The scope and the AWG share one VISA resource
+   manager on the default (NI) VISA that neither closes - EOM-ILC's fix for
+   the 26 Aug traps (one close killing the other's session; Keysight's
+   ktvisa32 half-loading once NI's is in the process). `Simulate both` runs
+   the whole window against a software bench instead, which is also what
+   the tests use.
+
+   **Copying.** Status lines (position, connections, the corrections line,
+   results) are selectable text: drag or double-click, Ctrl+C; right-click
+   copies the whole line. Right-click on any plot copies its x and y at the
+   mouse (tab-separated, pastes into two spreadsheet cells).
 2. **Channels**: give each scope channel a role. One `PD` is required.
    `MonX1`/`MonX2` add the rotation predicted from the Trek monitors (17.55 /
    17.52 deg per monitor volt from the measured V_pi; sign and offset are
@@ -268,6 +281,47 @@ measurement, not light. Give it, and the light is read that much later
 before it is compared; otherwise the 7 us light-monitor lag seen on test-4 is
 partly the filter, and correcting it would put a real error on the light.
 
+## AWG mode (AWG tab)
+
+The 4063B plays a waveform into the Treks on the bench trigger (EXT burst),
+CH1 -> X1 -> EO1, CH2 -> X2 -> EO2, through EOM-ILC's upload path and checks
+(`rampol/awg.py`).
+
+- **ramp**: idle -> the rotation -> idle, split between the crystals
+  (`split` on X1), cosine or linear edges, lead / rise / hold / fall in a
+  `record`-ms record on a `dt` grid. The default record is the ILC's (11 ms
+  at 2 us, 5501 points, 90.893 Hz), so switching between an ILC drive and a
+  ramp never needs the channel set up again. **Idle** blank = the ILC state
+  files' first sample (the learned trim, X1 ~+20-26 mV, X2 ~+78-81 mV): the
+  AWG holds the first sample between bursts, and file zero parks the EOMs at
+  -9 / -41 V. Both ends are exactly idle.
+- **ILC drives**: two `run/drive_<stem>_iNN.csv` files (AWG volts; a target
+  file in EOM volts is refused), checked against their own state's target as
+  the ILC does - a keeper checked as u x gain fails the 2 mA current limit.
+- **Preview** draws it with the rotation the monitors' model gives and runs
+  the checks: Trek limits, the 9.6 V cap, the 100 mV idle cap, <= 16384
+  points (5501 proven), the record under 80 % of the trigger period, and a
+  warning for long holds at kV (duty).
+- **Load to AWG** sets a channel up only where it is not already right for
+  the record length (FRQ = 1/(N dt), 20 Vpp, DDS, burst on EXT - a setting
+  that does not take stops it), then puts the waveform on: a waveform's name
+  is a hash of its samples, so the same one is selected again rather than
+  stored again (the 4063B cannot delete over SCPI). The outputs go OFF for a
+  change.
+- **Outputs ON** asks first; both are switched one at a time and read back,
+  and if either fails both go off. **Outputs OFF** works at any time, even
+  while a measurement runs. A channel that is ON but was not switched on by
+  this window (the ILC panel) is refused.
+- **Find min / max** sweeps the analyzer in the hold, `settle` ms after it
+  starts (scope overdrive recovery; the Trek's last 0.1 % takes 10-20 ms).
+  A ramp scan with the waveform playing is the Ramp scan tab.
+- **At the end** (window closed, Disconnect, a bias run or AWG-held Find):
+  `off`, or `park` = an idle-level waveform with the outputs left ON - for
+  when the drive goes through the X2 FPGA/buffer stage, whose output goes
+  high on a floating input (the pull-down is not fitted). Closing the window
+  first lets a running measurement finish its own cleanup, then ends the
+  AWG, then closes the scope.
+
 ## Bias points (Bias points tab)
 
 A ramp scan reads every angle at the V/div the brightest needs, so near a
@@ -277,7 +331,10 @@ were one step at 1 V/div - ER ~1800 there is the scope's floor. Mid-ramp
 
 Bias points hold the EOMs at fixed rotations with the AWG (4063B; close its
 GUI; CH1 -> X1, CH2 -> X2; plateaus on the bench trigger, EXT, each checked
-with EOM-ILC's limit check before upload) and, per bias:
+with EOM-ILC's limit check before upload). They use the AWG tab's session,
+idle levels and end policy; the plateaus are the ILC's record length (5501
+points), so the ILC's FRQ check passes afterwards, and the outputs go off
+for each change of bias. Per bias:
 
 1. 4 analyzer angles at the normal V/div: the azimuth and Imax;
 2. the analyzer stepped +-`null` deg around the crossed position at the most
@@ -341,11 +398,15 @@ box opens any angle: key `<name>_a045.00`, runs `1-4`.
 | Corrections | what is subtracted (dark / background traces and levels, borrowed ones dashed), the reference drift, the per-angle transmission, shots kept and dropped per step |
 | Compare | the shown scan against up to 6 others picked in a list: rotation, the difference from the shown scan (smoothed, with the shown scan's +-1 SD), ER_fit and the direct points; each with the window's Apply switches |
 | Find angle | the last Find angle scan and its fit |
+| AWG | the AWG tab's waveform per channel, the rotation it gives, the hold and the Find window |
 | Bias points | static ER vs rotation (Imax/Imin and from the null curvature), light - monitors static (and the shown scan's ramp), Imin with the V/div it was read at, the last null scan |
 | ILC target | the ILC comparison's figures for the shown scan |
 
 Click a time on Map, Angle, Extinction or the Poincaré tab's time plot to move
-the cursor (Malus, Build and Poincaré follow it).
+the cursor (Malus, Build and Poincaré follow it). A cursor move updates the
+tabs in place - the lines, the Malus points, the ellipse - without rebuilding
+or re-laying-out the figure (0.1-0.2 s instead of 0.3-0.6 s on test-4); the
+Map draws block means over ~4000 columns (a 19 x 100k mesh took 2.4 s).
 
 ## Traps this is built around
 
@@ -377,6 +438,7 @@ python tests/run_tests.py
 | `test_ell14.py` | the driver against a fake serial port (the real mount's IN reply), the approach-from-below wrapper |
 | `test_analysis.py` | the harmonic fit exact on noise-free data, its uncertainties checked by pulls (unit spread), lower bounds; a 72-angle simulated scan written and read back: rotation, rest azimuth, drift correction, 142 dip ERs against the model, direct ERs against the model and their Imax against the fit, the residual map at unit noise, the Stokes identities, segments, monitor prediction; provenance (this repository's commit, an ILC state's fingerprint) and the lab log's update-in-place |
 | `test_checks.py` | the pre-run check against the simulator: a hand-changed scope put back by a preset and confirmed, a silently refused setting reported, and each failure it should catch (AUTO sweep, channel off, wait <= repetition, AC coupling, clipping, off screen, small signal, ramp cut off, no light, no pre-trigger) |
+| `test_awg.py` | ramps (the ILC's record, ends at idle, the hold at the rotation), every check (length, trigger period, duty, idle and AWG caps), ILC drive files (header, a target refused, keepers against their targets pass and as u x gain fail), the session against the simulated AWG (names reused, a foreign ON refused, OFF for a change, park, a live FRQ change refused, CH2 refusing ON leaves nothing on) |
 | `test_bias.py` | the plan (AWG volts, plateaus, the Trek limit check), the null fit and ER, and a whole bias run on the simulated bench (AWG plateaus into the bench model): ER at 0-90 deg against the model, a 2 deg static rotator error recovered, outputs off and scope restored at the end |
 | `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER, a bias run from the Bias points tab, the direct points, residual map, Poincaré, Compare, Export brief, provenance and lab-log rows; config sandboxed, window off screen |
 
@@ -387,7 +449,7 @@ python tests/run_tests.py
   OK.
 - **Run on hardware 5 Oct 2026:** ELL14 motion and full ramp scans
   (16-ms-spin-echo-test-1..5).
-- **Not yet run on hardware:** bias points (AWG control from this program),
+- **Not yet run on hardware:** the AWG mode and bias points (AWG control from this program),
   the null refine at a sensitive V/div, and an optical correction applied
   through the ILC. These are tested against the simulator only. A first bias
   session: a short list (`0, 90`), 4 shots, watching the first plateau on

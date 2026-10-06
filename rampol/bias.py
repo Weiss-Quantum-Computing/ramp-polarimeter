@@ -64,6 +64,10 @@ PLAN = {
     "awg_max": 9.6,             # V at the AWG, per channel
     "full_scale": 10.0,         # the fixed upload mapping (AMP = 2 x this)
     "upload_settle_s": 1.0,
+    # the AWG level between bursts per channel (V): EOM-ILC's learned idle
+    # trim parks the chain at 0 V (file zero parks it at -9 / -41 V)
+    "idle": {"EO1": 0.0, "EO2": 0.0},
+    "end": "off",               # off | park (idle waveform, outputs left ON)
 }
 
 
@@ -96,19 +100,21 @@ def awg_volts(bias_deg, split, chan=CHAN):
     return out
 
 
-def plateau(amp, p):
-    """(t, u): 0 V lead, raised-cosine rise to amp, hold, raised-cosine fall,
-    0 V tail, on p['dt_us']. Both ends exactly 0 (the AWG holds the first
-    sample between bursts)."""
+def plateau(amp, p, idle=0.0):
+    """(t, u): idle lead, raised-cosine rise to idle + amp, hold, raised-
+    cosine fall, idle tail, on p['dt_us'] - one sample longer than the
+    segments, EOM-ILC's convention (11 ms at 2 us = 5501 points, FRQ
+    90.893 Hz), so the ILC's FRQ check passes after a bias run. Both ends
+    exactly idle (the AWG holds the first sample between bursts)."""
     dt = p["dt_us"] * 1e-6
     seg = [p["lead_ms"], p["rise_ms"], p["hold_ms"], p["rise_ms"], p["tail_ms"]]
     n = [int(round(x * 1e-3 / dt)) for x in seg]
     lead, rise, hold, fall, tail = n
     up = 0.5 - 0.5 * np.cos(np.pi * np.arange(rise) / rise)
     u = np.r_[np.zeros(lead), amp * up, np.full(hold, amp), amp * up[::-1],
-              np.zeros(tail)]
+              np.zeros(tail + 1)]
     u[[0, -1]] = 0.0
-    return np.arange(len(u)) * dt, u
+    return np.arange(len(u)) * dt, u + float(idle)
 
 
 def windows(p):
@@ -127,6 +133,9 @@ def check_plateaus(biases, p, eomilc=None):
     that fails the AWG cap or (with eomilc) the Trek chain's limit check."""
     out = []
     dt = p["dt_us"] * 1e-6
+    if not 0.0 <= float(p["split"]) <= 1.0:
+        raise ValueError(f"split {p['split']} must be between 0 and 1")
+    idle = p.get("idle") or {}
     for b in sorted(set(biases)):
         if b < 0:
             raise ValueError(f"bias {b:g} deg: negative biases are not driven "
@@ -134,15 +143,18 @@ def check_plateaus(biases, p, eomilc=None):
         v = awg_volts(b, p["split"])
         msgs = []
         for name, amp in v.items():
-            if amp > p["awg_max"]:
+            i0 = float(idle.get(name, 0.0))
+            if abs(i0) > 0.1:
+                raise ValueError(f"{name} idle {i0*1e3:+.0f} mV: past the 100 mV idle cap")
+            if abs(amp + i0) > p["awg_max"]:
                 raise ValueError(
-                    f"bias {b:g} deg needs {amp:.2f} V on {name} at the AWG, past "
+                    f"bias {b:g} deg needs {amp + i0:.2f} V on {name} at the AWG, past "
                     f"the {p['awg_max']:g} V cap - lower the bias or change the split")
-            if eomilc is not None and amp > 0:
+            if eomilc is not None and abs(amp) > 0:
                 from eomilc.config import CHANNELS
                 from eomilc.ilc import check_limits
                 ch = CHANNELS[name]
-                _, u = plateau(amp, p)
+                _, u = plateau(amp, p, i0)
                 rep = check_limits(u, u * CHAN[name]["gain"], dt, ch, ch.limits)
                 if not rep.ok:
                     raise ValueError(f"bias {b:g} deg, {name}: {rep}")
@@ -253,7 +265,7 @@ class BiasRun:
 
     def __init__(self, folder, name, link, rot, awg, roles, plan=None, log=print,
                  cancelled=None, ask=None, on_point=None, progress=None,
-                 eomilc=None, ilc_bench=None, provenance=None):
+                 eomilc=None, ilc_bench=None, provenance=None, session=None):
         self.folder = os.path.join(folder, name)
         self.provenance = provenance
         self.name = name
@@ -267,6 +279,8 @@ class BiasRun:
         self.progress = progress or (lambda done, total, text: None)
         self.eomilc = eomilc
         self.ib = ilc_bench
+        from . import awg as awgmod
+        self.sess = session or awgmod.Session(awg, ilc_bench, log=log)
         self.points = []
         self.dark = {}
         self.manifest = None
@@ -329,35 +343,27 @@ class BiasRun:
         return bool((x > hi).any() or (x < lo).any())
 
     # -- the AWG -----------------------------------------------------------
-    def _awg_setup(self, period):
+    def _wave(self, bias_deg):
+        """The plateau for a bias on both channels, as an awg.Wave."""
+        from . import awg as awgmod
         p = self.p
-        for name, c in CHAN.items():
-            ch = c["awg"]
-            if self.awg.is_on(ch):
-                raise RuntimeError(f"AWG CH{ch} output is ON - switch it off first; "
-                                   f"the run switches it on itself when it is ready")
-            blocks = {"OUTP": {"LOAD": "HZ"}, "SRATE": {"MODE": "DDS"},
-                      "BSWV": {"WVTP": "ARB", "FRQ": 1.0 / period,
-                               "AMP": 2 * p["full_scale"], "OFST": 0},
-                      "MODE": ("Burst", {"GATE_NCYC": "NCYC", "TIME": 1, "TRSR": "EXT"})}
-            missed = self.awg.apply_channel(ch, blocks, log=lambda m: None)
-            if missed:
-                self.log(f"  AWG CH{ch}: did not take {missed}")
-            if self.ib is not None:
-                problems, notes = self.ib.check_awg_channel(
-                    self.awg, ch, full_scale=p["full_scale"], expect_period=period)
-                if problems:
-                    raise RuntimeError(f"AWG CH{ch} setup: " + "; ".join(problems))
+        idle = p.get("idle") or {}
+        volts = awg_volts(bias_deg, p["split"])
+        u, t = {}, None
+        for name in CHAN:
+            t, u[name] = plateau(volts[name], p, float(idle.get(name, 0.0)))
+        return awgmod.Wave(t, u, p["dt_us"] * 1e-6, f"bias {bias_deg:g} deg",
+                           rotation=bias_deg, source="bias")
 
-    def _upload(self, idx, volts):
-        p = self.p
-        for name, c in CHAN.items():
-            _, u = plateau(volts[name], p)
-            wname = f"BIAS{idx:02d}{name[-1]}"
-            if self.ib is not None:
-                self.ib.upload_drive(self.awg, c["awg"], wname, u, p["full_scale"])
-            else:
-                self.awg.upload_arb(c["awg"], wname, u / p["full_scale"], normalize=False)
+    def _play(self, bias_deg):
+        """Load a bias's plateau. Under the 'off' policy the outputs go off
+        for the change and back on (a selection switched mid-burst steps
+        the drive by the bias difference, which no limit check sees)."""
+        keep = self.p.get("end") == "park"
+        was_on = bool(self.sess.owned)
+        self.sess.load(self._wave(bias_deg), keep_on=keep)
+        if was_on and not all(self.sess.outputs().values()):
+            self.sess.on()
 
     # -- the run -----------------------------------------------------------
     def run(self):
@@ -393,14 +399,13 @@ class BiasRun:
             sc.put(":TIMebase:POSition", f"{-0.2e-3 + div:.6g}")   # LEFT: start 1 div before
             self.log(f"  scope {div*1e3:g} ms/div from -0.2 ms; PD coarse "
                      f"{coarse[0]:g} V/div offset {coarse[1]:g} V")
-            self._awg_setup(period)
-            self._upload(0, awg_volts(biases[0], p["split"]))
+            on = True                  # from here every exit ends the AWG
+            self._play(biases[0])
+            end = "parked at idle" if p.get("end") == "park" else "OFF"
             if not self.ask("Bias points", "The AWG holds the plateaus. Switch "
-                            "both outputs ON now? (They go OFF at the end.)"):
+                            f"both outputs ON now? (At the end they go {end}.)"):
                 raise RuntimeError("outputs left off - nothing measured")
-            for c in CHAN.values():
-                self.awg.set_output(c["awg"], True)
-            on = True
+            self.sess.on()
             time.sleep(p["upload_settle_s"])
 
             # Imax at the first bias from 4 angles (one angle can sit at the
@@ -439,7 +444,7 @@ class BiasRun:
                 d = "up" if (p["order"] != "updown" or i < len(biases) // 2 + 1) else "down"
                 self.progress(i, len(biases), f"bias {b:g} deg ({i + 1}/{len(biases)})")
                 if i > 0:
-                    self._upload(i, awg_volts(b, p["split"]))
+                    self._play(b)
                     time.sleep(p["upload_settle_s"])
                 pt = self._point(i, b, d, coarse, null_sets, w, idle, psi_prev)
                 psi_prev = pt.get("psi")
@@ -451,12 +456,8 @@ class BiasRun:
             self.progress(len(biases), len(biases), "bias points done")
         finally:
             if on:
-                for c in CHAN.values():
-                    try:
-                        self.awg.set_output(c["awg"], False)
-                    except Exception as exc:
-                        self.log(f"  could not switch AWG CH{c['awg']} off: {exc}")
-                self.log("  AWG outputs OFF")
+                self.sess.end(p.get("end", "off"))
+                self.sess.forget()
             try:
                 self.link.set_channel(pd, *saved_pd)
                 for k, v in saved_tb.items():
@@ -616,7 +617,8 @@ def load(folder):
 # ------------------------------------------------------------ find an angle
 def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
                   awg=None, plan=None, half_deg=None, points=None, log=print,
-                  cancelled=None, ask=None, eomilc=None, ilc_bench=None):
+                  cancelled=None, ask=None, eomilc=None, ilc_bench=None,
+                  session=None):
     """The analyzer angle of minimum (crossed) or maximum transmission for the
     light as it is in a time window of the record, and the analyzer left
     there.
@@ -638,7 +640,7 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
     p = dict(PLAN, **(plan or {}))
     br = BiasRun(tempfile.gettempdir(), "find", link, rot, awg, roles, plan=p,
                  log=log, cancelled=cancelled, ask=ask, eomilc=eomilc,
-                 ilc_bench=ilc_bench)
+                 ilc_bench=ilc_bench, session=session)
     half = float(half_deg if half_deg is not None else (p["null_half_deg"] if kind == "min" else 10.0))
     npts = int(points or p["null_points"])
     pd = roles["PD"]
@@ -659,14 +661,12 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
             sc.put(":TIMebase:REFerence", "LEFT")
             sc.put(":TIMebase:SCALe", f"{div:.6g}")
             sc.put(":TIMebase:POSition", f"{-0.2e-3 + div:.6g}")
-            br._awg_setup(period)
-            br._upload(0, awg_volts(bias_deg, p["split"]))
-            if not br.ask("Find angle", f"The AWG holds {bias_deg:g} deg. Switch both "
-                          f"outputs ON now? (They go OFF at the end.)"):
-                raise RuntimeError("outputs left off - nothing measured")
-            for c in CHAN.values():
-                awg.set_output(c["awg"], True)
             on = True
+            br._play(bias_deg)
+            if not br.ask("Find angle", f"The AWG holds {bias_deg:g} deg. Switch both "
+                          f"outputs ON now? (At the end: {p.get('end', 'off')}.)"):
+                raise RuntimeError("outputs left off - nothing measured")
+            br.sess.on()
             time.sleep(p["upload_settle_s"])
         w = window_s if window_s is not None else (-1e9, 1e9)
         th4 = (0.0, 45.0, 90.0, 135.0)
@@ -725,12 +725,8 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
                 "window": None if window_s is None else list(w), "bias": bias_deg}
     finally:
         if on:
-            for c in CHAN.values():
-                try:
-                    awg.set_output(c["awg"], False)
-                except Exception as exc:
-                    log(f"  could not switch AWG CH{c['awg']} off: {exc}")
-            log("  AWG outputs OFF")
+            br.sess.end(p.get("end", "off"))
+            br.sess.forget()
         try:
             link.set_channel(pd, *coarse)
             for k_, v in saved_tb.items():

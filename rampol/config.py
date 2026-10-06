@@ -124,6 +124,8 @@ DEFAULTS = {
     # "Set zero from rest", never from the engraving on the mount.
     "ell_zero_deg": 0.0,
     "simulate": False,
+    # connect the scope and the ELL14 when the window opens (never the AWG)
+    "autoconnect": True,
     "channels": {
         "1": {"role": "PD", "name": "Analyzer PD"},
         "2": {"role": "off", "name": ""},
@@ -135,6 +137,13 @@ DEFAULTS = {
     "bias": {"biases": "0:180:15", "order": "up", "split": 0.5, "shots": 8,
              "null_half_deg": 3.0, "null_points": 9, "hold_ms": 8.0,
              "settle_ms": 4.0, "name": "bias"},
+    # AWG mode (rampol.awg): the 4063B drives the Treks, CH1 -> X1, CH2 -> X2.
+    # idle1/2 blank = from the ILC state files' first sample (the learned trim)
+    "awg": {"source": "ramp", "rotation": 45.0, "split": 0.5, "edge": "cosine",
+            "lead_ms": 0.5, "rise_ms": 1.0, "hold_ms": 8.0, "fall_ms": 1.0,
+            "record_ms": 11.0, "dt_us": 2.0, "idle1": "", "idle2": "",
+            "file1": "", "file2": "", "trig_hz": 3.7, "end": "off",
+            "settle_ms": 4.0, "fit_timebase": True, "shots": 8},
     # Find angle: min/max transmission in a window, or held by the AWG
     "find": {"kind": "min", "window": "-10:-0.5", "bias_on": False, "bias": "45",
              "half": "", "points": "", "shots": "8"},

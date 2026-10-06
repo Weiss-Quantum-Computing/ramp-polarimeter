@@ -32,6 +32,41 @@ def load_scope_grab(path):
     return mod
 
 
+_SHARED_RM = None
+
+
+def shared_rm(pyvisa_mod):
+    """One ResourceManager for the scope and the AWG, closed by neither.
+
+    EOM-ILC's ilc_bench._shared_rm, for the same two measured traps (26 Aug
+    2026): pyvisa hands every default caller the same cached RM and each
+    instrument layer closes the RM it thinks it made, so one instrument's
+    close() killed the other's session; and once NI's visa32 is in the
+    process, Scope Grab's preference for Keysight's ktvisa32 half-loads it
+    and every open fails with VI_ERROR_ALLOC. Default (NI) VISA, shared."""
+    global _SHARED_RM
+    if _SHARED_RM is not None:
+        try:
+            _SHARED_RM.session              # raises once it has been closed
+        except Exception:
+            _SHARED_RM = None
+    if _SHARED_RM is None:
+        _SHARED_RM = pyvisa_mod.ResourceManager()
+    return _SHARED_RM
+
+
+def share_rm(scope, pyvisa_mod):
+    """Put a Scope Grab Scope on the shared RM and keep its close() off it."""
+    scope._make_rm = lambda: shared_rm(pyvisa_mod)
+    orig_close = scope.close
+
+    def close_keeping_rm():
+        scope.rm = None                     # not ours to close
+        orig_close()
+    scope.close = close_keeping_rm
+    return scope
+
+
 def load_eomilc(path):
     """Put the EOM-ILC repo on sys.path and import its eomilc package (the
     correction format, the line-ripple fit, the Trek channels and limits)."""
