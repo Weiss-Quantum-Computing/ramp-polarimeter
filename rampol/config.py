@@ -159,7 +159,9 @@ DEFAULTS = {
     "find": {"kind": "min", "light": "record window", "window": "-10:-0.5",
              "line_hz": 60.0, "step": 10.0, "half": "", "points": "", "shots": "8",
              # write the selected preset and run the scan's settings check first
-             "use_preset": True},
+             "use_preset": True,
+             # the timebase zoomed onto the window while measuring, then put back
+             "zoom": True},
     # the ILC target comparison (rampol.ilc_target)
     "ilc": {"x1": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX1H.state.npz"),
             "x2": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX2A.state.npz"),

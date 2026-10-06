@@ -117,6 +117,68 @@ def plateau(amp, p, idle=0.0):
     return np.arange(len(u)) * dt, u + float(idle)
 
 
+def eta(t0, done, total):
+    """', ~N s left' from the pace so far (time.time() at t0, `done` of
+    `total` steps finished); '' before the first step is done."""
+    if done <= 0 or total <= done:
+        return ""
+    left = (time.time() - t0) / done * (total - done)
+    return f", ~{left / 60:.1f} min left" if left >= 90 else f", ~{left:.0f} s left"
+
+
+def timebase_around(win, margin=0.1):
+    """(s/div, position) for REFerence LEFT that put the window `win` (s
+    from the trigger) on screen with `margin` of its length either side, on
+    a 1-2-5 step. A window before the trigger keeps the trigger on screen:
+    the scope cannot delay the record back past it."""
+    lo, hi = float(win[0]), float(win[1])
+    if lo < 0:
+        hi = max(hi, 0.0)
+    span = (hi - lo) * (1 + 2 * margin)
+    scale = _nice_up(max(span, 1e-6) / 10)
+    t0 = 0.5 * (lo + hi) - 5 * scale
+    return scale, t0 + scale          # LEFT: the record starts one division before
+
+
+class window_timebase:
+    """The timebase zoomed onto a measurement window for the duration, and
+    put back after: a 50 ms spin-echo record read for a 1 ms window spends
+    its points and its readout on what is thrown away.
+
+        with window_timebase(link, (t0, t1), log):
+            ... find_extremum(..., window_s=(t0, t1)) ...
+    """
+
+    KEYS = (":TIMebase:SCALe", ":TIMebase:POSition", ":TIMebase:REFerence")
+
+    def __init__(self, link, win, log=print, margin=0.1):
+        self.link, self.win, self.log, self.margin = link, win, log, margin
+        self.saved = {}
+
+    def __enter__(self):
+        sc = self.link.scope
+        self.saved = {k: sc.get(k) for k in self.KEYS}
+        scale, pos = timebase_around(self.win, self.margin)
+        sc.put(":TIMebase:REFerence", "LEFT")
+        sc.put(":TIMebase:SCALe", f"{scale:.6g}")
+        sc.put(":TIMebase:POSition", f"{pos:.6g}")
+        t0 = pos - scale
+        self.log(f"  timebase {scale*1e3:g} ms/div around the window "
+                 f"{self.win[0]*1e3:.2f}..{self.win[1]*1e3:.2f} ms (record "
+                 f"{t0*1e3:.2f}..{(t0 + 10*scale)*1e3:.2f} ms)")
+        return t0, t0 + 10 * scale
+
+    def __exit__(self, *exc):
+        sc = self.link.scope
+        for k, v in self.saved.items():
+            if v is not None:
+                try:
+                    sc.put(k, v)
+                except Exception as e:
+                    self.log(f"  could not restore {k} ({e})")
+        return False
+
+
 def plateau_wave(bias_deg, p):
     """A bias's plateau on both channels, as an awg.Wave - what a bias run
     plays, and what its dry run checks."""
@@ -317,7 +379,10 @@ class BiasRun:
             raise Cancelled()
 
     def _chans(self):
-        want = ["PD", "MonX1", "MonX2", "CmdX1", "CmdX2"]
+        # Find and the Malus scan look at the PD alone: reading the monitors
+        # as well tripled every readout for nothing
+        want = ["PD"] if getattr(self, "pd_only", False) else \
+            ["PD", "MonX1", "MonX2", "CmdX1", "CmdX2"]
         return [self.roles[r] for r in want if r in self.roles]
 
     def _acquire(self, angle, pd_setting):
@@ -387,6 +452,7 @@ class BiasRun:
         if "PD" not in self.roles:
             raise RuntimeError("no channel has the PD role")
         biases = order_biases(parse_biases(p["biases"]), p["order"])
+        t_run = time.time()
         checks = check_plateaus(biases, p, self.eomilc)
         t_rec, _ = plateau(0.0, p)
         period = float(t_rec[-1] + p["dt_us"] * 1e-6)
@@ -458,7 +524,8 @@ class BiasRun:
             for i, b in enumerate(biases):
                 self._check()
                 d = "up" if (p["order"] != "updown" or i < len(biases) // 2 + 1) else "down"
-                self.progress(i, len(biases), f"bias {b:g} deg ({i + 1}/{len(biases)})")
+                self.progress(i, len(biases), f"bias {b:g} deg ({i + 1}/{len(biases)}"
+                              f"{eta(t_run, i, len(biases))})")
                 if i > 0:
                     self._play(b)
                     time.sleep(p["upload_settle_s"])
@@ -634,7 +701,7 @@ def load(folder):
 def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
                   awg=None, plan=None, half_deg=None, points=None, log=print,
                   cancelled=None, ask=None, eomilc=None, ilc_bench=None,
-                  session=None):
+                  session=None, progress=None):
     """The analyzer angle of minimum (crossed) or maximum transmission for the
     light as it is in a time window of the record, and the analyzer left
     there.
@@ -651,14 +718,25 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
          upside down (the maximum is flat, so this one is less sharp).
     No dark is needed: the fit's floor is free. Returns dict(kind, angle,
     sig, level (raw V at the extremum), psi_coarse, theta, I, sem, vdiv,
-    fit, window)."""
+    fit, window). progress(done, total, text) gets each acquisition with the
+    time left at the pace so far."""
     import tempfile
     p = dict(PLAN, **(plan or {}))
     br = BiasRun(tempfile.gettempdir(), "find", link, rot, awg, roles, plan=p,
                  log=log, cancelled=cancelled, ask=ask, eomilc=eomilc,
                  ilc_bench=ilc_bench, session=session)
+    br.pd_only = True
     half = float(half_deg if half_deg is not None else (p["null_half_deg"] if kind == "min" else 10.0))
     npts = int(points or p["null_points"])
+    prog = {"t0": time.time(), "done": 0, "total": 4 + npts}
+
+    def acquire(angle, setting, what):
+        if progress is not None:
+            d, n = prog["done"], max(prog["total"], prog["done"] + 1)
+            progress(d, n, f"Find {kind}: {what} ({d + 1}/{n}{eta(prog['t0'], d, n)})")
+        out = br._acquire(angle, setting)
+        prog["done"] += 1
+        return out
     pd = roles["PD"]
     sc = link.scope
     coarse = link.channel_state([pd])[pd]
@@ -688,7 +766,7 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
         th4 = (0.0, 45.0, 90.0, 135.0)
         I4 = []
         for a in th4:
-            t, s = br._acquire(a, coarse)
+            t, s = acquire(a, coarse, f"azimuth, analyzer {a:g} deg")
             I4.append(br._window(t, s["PD"], w)[0])
         psi, imax4, imin4 = malus4(th4, I4)
         amp = max(imax4 - imin4, 1e-4)
@@ -711,7 +789,7 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
             th = center + np.linspace(-half, half, npts)
             I, S, clipped = [], [], False
             for a in th:
-                t, s = br._acquire(a % 180, setting)
+                t, s = acquire(a % 180, setting, f"analyzer {a % 180:.2f} deg")
                 if setting != coarse and br._clipped(s["PD"], setting, t, w):
                     clipped = True
                     break
@@ -719,6 +797,7 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
                 I.append(m_)
                 S.append(max(se, 1e-6))
             if clipped:
+                prog["total"] += npts
                 k = min(k + 1, len(sets) - 1)
                 log(f"  off screen at {setting[0]*1e3:g} mV/div - now {sets[k][0]*1e3:g} mV/div")
                 continue
@@ -726,6 +805,7 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
             fit = fit_null(th, y, S)
             if fit["k"] <= 0 and recentred < 2:
                 # curving the wrong way: the sweep sits on the other extremum
+                prog["total"] += npts
                 center = (center + 90.0) % 180.0
                 recentred += 1
                 log(f"  the sweep curves the wrong way - the {kind} is 90 deg away; again")
@@ -734,8 +814,11 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
                 break
             center = fit["theta_n"]
             recentred += 1
+            prog["total"] += npts
             log(f"  extremum at {center:.2f} deg, off centre - again")
         angle = fit["theta_n"] % 180
+        if progress is not None:
+            progress(prog["done"], prog["done"], f"Find {kind} done")
         got = rot.approach(angle)
         level = fit["imin"] if kind == "min" else -fit["imin"]
         log(f"  {kind} transmission at analyzer {angle:.3f} +- {fit['sig_theta_n']*1e3:.0f} "
@@ -804,7 +887,7 @@ class static_light:
 
 
 def malus_scan(link, rot, roles, angles, window_s=None, plan=None, log=print,
-               cancelled=None):
+               cancelled=None, progress=None):
     """The analyzer stepped over `angles` (deg), the PD mean in the window at
     each (the PD's own V/div: a coarse look, not an ER measurement), fitted
     to I = a0 + c2 cos 2theta + s2 sin 2theta. Returns dict(theta, I, sem,
@@ -814,17 +897,23 @@ def malus_scan(link, rot, roles, angles, window_s=None, plan=None, log=print,
     p = dict(PLAN, **(plan or {}))
     br = BiasRun(tempfile.gettempdir(), "scan", link, rot, None, roles, plan=p, log=log,
                  cancelled=cancelled, session=object())
+    br.pd_only = True
     pd = roles["PD"]
     coarse = link.channel_state([pd])[pd]
     w = window_s if window_s is not None else (-1e9, 1e9)
     th, I, S = [], [], []
-    for a in angles:
+    t_run, n = time.time(), len(angles)
+    for i, a in enumerate(angles):
+        if progress is not None:
+            progress(i, n, f"Malus scan: analyzer {a:.1f} deg ({i + 1}/{n}{eta(t_run, i, n)})")
         t, s = br._acquire(float(a) % 360.0, coarse)
         m, se = br._window(t, s["PD"], w)
         th.append(float(a))
         I.append(m)
         S.append(se)
         log(f"  analyzer {a:7.2f}: PD {m*1e3:9.2f} +- {se*1e3:.2f} mV")
+    if progress is not None:
+        progress(n, n, "Malus scan done")
     psi, imax, imin = malus4(th, I)
     out = {"kind": "scan", "theta": th, "I": I, "sem": S, "psi": psi % 180,
            "angle_max": psi % 180, "angle_min": (psi + 90) % 180, "imax": imax,

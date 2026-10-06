@@ -929,9 +929,12 @@ class App:
                 self.bench.wiring = "scope"
                 self.bench.awg_scope = {1: wiring["EO1"], 2: wiring["EO2"]}
             reps = []
+            from .bias import eta
+            t_run = time.time()
             try:
                 for i, w in enumerate(waves):
-                    self._progress(i, len(waves), f"dry run {i + 1}/{len(waves)}: {w.label}")
+                    self._progress(i, len(waves), f"dry run {i + 1}/{len(waves)}: {w.label}"
+                                                  f"{eta(t_run, i, len(waves))}")
                     swing = max(float(np.ptp(w.u[k])) for k in w.u)
                     ident = swing > 0.05 and not any(r["identified"] for r in reps)
                     rep = awgmod.dry_run(sess, self.link, w, wiring, shots=shots,
@@ -1136,6 +1139,7 @@ class App:
         roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
         chroles = self.roles()
         use_preset = bool(self.find_preset.get())
+        zoom = bool(self.find_zoom.get())
         sc_plan = c["scan"]
         plan = {"shots": int(a.get("shots") or 8),
                 "wait_s": float(sc_plan.get("wait_s") or 10.0),
@@ -1151,16 +1155,24 @@ class App:
             if src.startswith("LINE"):
                 raise RuntimeError("the scope triggers on LINE: the AWG bursts on the bench "
                                    "trigger - set the trigger source to it (EXT)")
-            # the AWG's record on screen, whatever the preset's timebase is
-            div, pos = awgmod.timebase_for(wave)
-            sc = self.link.scope
-            sc.put(":TIMebase:REFerence", "LEFT")
-            sc.put(":TIMebase:SCALe", f"{div:.6g}")
-            sc.put(":TIMebase:POSition", f"{pos:.6g}")
-            self._window_in_record(sc.read_settings(), (t0, t1), "hold window")
-            out = biasmod.find_extremum(self.link, self.rot, roles, kind, window_s=(t0, t1),
-                                        plan=plan, log=self.log,
-                                        cancelled=self.stop_flag.is_set, ask=self.ask_main)
+            def run():
+                return biasmod.find_extremum(
+                    self.link, self.rot, roles, kind, window_s=(t0, t1), plan=plan,
+                    log=self.log, cancelled=self.stop_flag.is_set, ask=self.ask_main,
+                    progress=self._progress)
+            if zoom:
+                plan["points"] = 20000
+                with biasmod.window_timebase(self.link, (t0, t1), self.log):
+                    out = run()
+            else:
+                # the AWG's whole record on screen, whatever the preset's timebase
+                div, pos = awgmod.timebase_for(wave)
+                sc = self.link.scope
+                sc.put(":TIMebase:REFerence", "LEFT")
+                sc.put(":TIMebase:SCALe", f"{div:.6g}")
+                sc.put(":TIMebase:POSition", f"{pos:.6g}")
+                self._window_in_record(sc.read_settings(), (t0, t1), "hold window")
+                out = run()
             out["bias"] = rotation
             return out
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
@@ -2333,16 +2345,38 @@ class App:
         self.find_zero_btn.pack(side="left", padx=4)
         self.find_lbl = CopyLabel(f, text="", foreground="#060", width=47)
         self.find_lbl.pack(anchor="w", padx=6)
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
         self.find_preset = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f, text="set the scope from the preset first, as a ramp scan",
-                        variable=self.find_preset).pack(anchor="w", padx=6)
+        ttk.Checkbutton(rr, text="preset first", variable=self.find_preset).pack(side="left")
+        self.find_zoom = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rr, text="timebase to the window", variable=self.find_zoom).pack(
+            side="left", padx=(6, 0))
+        self._btn(rr, "Set scope as ramp scan", self.do_apply_preset, padx=(6, 0))
         ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
             "Static light: nothing ramping - LINE trigger, PD mean over one line "
             "period. Record window: a time in the experiment's record (rest "
             "-10:-0.5, a hold). Malus scan: the whole curve; Find refines it.")).pack(
             anchor="w", padx=6, pady=(2, 4))
 
-    def _find_setup(self, c):
+    def _run_in_window(self, run, static, win, line_hz, zoom, st):
+        """Worker: run(window) with the scope set for it - static light (LINE
+        trigger, one line period), or the record window with the timebase
+        zoomed onto it (zoom) or checked to cover it - and everything changed
+        put back afterwards."""
+        from . import bias as biasmod
+        if static:
+            with biasmod.static_light(self.link, line_hz, self.log) as w:
+                out = run(w)
+            out["static"] = True
+            return out
+        if zoom and win is not None:
+            with biasmod.window_timebase(self.link, win, self.log):
+                return run(win)
+        self._window_in_record(st, win)
+        return run(win)
+
+    def _find_setup(self, c, zoom=False):
         """(static, window s, line Hz, plan) from the Find settings. The
         acquisition is the ramp scan's - its trigger wait, readout points
         and offset dither - with the Find tab's shots: Find used to wait
@@ -2365,6 +2399,10 @@ class App:
             # a line trigger every 16.7 ms: no long wait, and the mean of a
             # 20 ms record needs few points
             plan.update(points=2000, wait_s=2.0)
+        elif zoom and win is not None:
+            # the record now spans the window: the scan's 100k points would
+            # only slow the readout
+            plan["points"] = min(plan["points"], 20000)
         return static, win, line_hz, plan
 
     TIMEBASE = (":TIMebase:SCALe", ":TIMebase:POSition", ":TIMebase:REFerence")
@@ -2427,9 +2465,10 @@ class App:
         roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
         chroles = self.roles()
         use_preset = bool(self.find_preset.get())
+        zoom = bool(self.find_zoom.get())
         kind = self.find_kind.get()
         try:
-            static, win, line_hz, plan = self._find_setup(c)
+            static, win, line_hz, plan = self._find_setup(c, zoom)
             half = float(fcfg["half"]) if str(fcfg.get("half", "")).strip() else None
             points = int(fcfg["points"]) if str(fcfg.get("points", "")).strip() else None
         except ValueError:
@@ -2445,14 +2484,8 @@ class App:
                 return biasmod.find_extremum(
                     self.link, self.rot, roles, kind, window_s=w, plan=plan, half_deg=half,
                     points=points, log=self.log, cancelled=self.stop_flag.is_set,
-                    ask=self.ask_main)
-            if static:
-                with biasmod.static_light(self.link, line_hz, self.log) as w:
-                    out = run(w)
-                out["static"] = True
-                return out
-            self._window_in_record(st, win)
-            return run(win)
+                    ask=self.ask_main, progress=self._progress)
+            return self._run_in_window(run, static, win, line_hz, zoom, st)
 
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
 
@@ -2465,8 +2498,9 @@ class App:
         roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
         chroles = self.roles()
         use_preset = bool(self.find_preset.get())
+        zoom = bool(self.find_zoom.get())
         try:
-            static, win, line_hz, plan = self._find_setup(c)
+            static, win, line_hz, plan = self._find_setup(c, zoom)
             step = float(fcfg.get("step") or 10.0)
             if not 0.5 <= step <= 45:
                 raise ValueError
@@ -2483,14 +2517,9 @@ class App:
             def run(w):
                 return biasmod.malus_scan(self.link, self.rot, roles, angles, window_s=w,
                                           plan=plan, log=self.log,
-                                          cancelled=self.stop_flag.is_set)
-            if static:
-                with biasmod.static_light(self.link, line_hz, self.log) as w:
-                    out = run(w)
-                out["static"] = True
-                return out
-            self._window_in_record(st, win)
-            return run(win)
+                                          cancelled=self.stop_flag.is_set,
+                                          progress=self._progress)
+            return self._run_in_window(run, static, win, line_hz, zoom, st)
 
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
 
@@ -2663,6 +2692,7 @@ class App:
         self.find_kind.set(c["find"].get("kind", "min"))
         self.find_light.set(c["find"].get("light", FIND_LIGHT[0]))
         self.find_preset.set(bool(c["find"].get("use_preset", True)))
+        self.find_zoom.set(bool(c["find"].get("zoom", True)))
         self.order.set(s["order"])
         self.mode.set(s["mode"])
         self.preset.set(c["preset"])
@@ -2713,6 +2743,7 @@ class App:
             fd[k] = v.get().strip()
         fd["kind"], fd["light"] = self.find_kind.get(), self.find_light.get()
         fd["use_preset"] = bool(self.find_preset.get())
+        fd["zoom"] = bool(self.find_zoom.get())
         c["preset"] = self.preset.get()
         c["outdir"] = self.outdir.get().strip()
         c["scan_name"] = self.scan_name.get().strip()

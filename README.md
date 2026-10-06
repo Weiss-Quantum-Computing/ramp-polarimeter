@@ -197,8 +197,16 @@ sign (not built in yet).
    (a FAIL asks before going on). The acquisition is the scan's: its
    trigger wait, readout points and offset dither, with the Find tab's
    shots (a fixed 10 s wait used to time out on the ~10 s spin-echo
-   sequence). A record window the timebase does not cover is refused
-   before the analyzer moves. Static light then switches to the LINE
+   sequence). With *timebase to the window* (on by default) the timebase
+   is zoomed onto the window while measuring - its length plus 10 % either
+   side on a 1-2-5 step, the trigger kept on screen for a window before it,
+   readout capped at 20k points - and put back afterwards; without it, a
+   record window the timebase does not cover is refused before the
+   analyzer moves. *Set scope as ramp scan* writes the preset and runs the
+   settings check on its own (as *Apply to scope* in the Ramp scan tab).
+   Find, the Malus scan, the AWG tab's Find, bias runs and dry runs show
+   their step and the time left (at the pace so far) under the Stop
+   button; Find and the Malus scan read only the PD channel. Static light then switches to the LINE
    trigger and its own timebase, and puts the preset's back; the AWG tab's
    Find keeps the preset's channels and acquisition but puts its own
    record's timebase on screen, and refuses a LINE trigger.
