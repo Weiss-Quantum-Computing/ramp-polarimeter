@@ -32,23 +32,28 @@ from . import config as cfgmod
 from . import checks, hw, lablog, provenance, scan as scanmod, sim
 from .widgets import CopyLabel
 from . import awg as awgmod
+from . import calib
 
 ANGLE_CMAP = "hsv"                 # cyclic: 0 and 360 deg share a colour, none near white
 AWG_HELP = (
-    "AWG mode: the 4063B plays the waveform on the bench trigger (EXT burst), CH1 -> "
-    "Trek X1 -> EO1, CH2 -> Trek X2 -> EO2. 'ramp': idle -> the rotation (split between "
-    "the crystals) -> idle, both ends exactly at idle; idle blank = the ILC state files' "
-    "first sample (the learned trim; file zero parks the EOMs at -9 / -41 V). The "
-    "default record is the ILC's (11 ms at 2 us), so switching between ILC drives and "
-    "ramps needs no channel set-up. 'ILC drives': two drive_<stem>_iNN.csv files, checked "
-    "against their own state's target. Preview draws it and runs the checks (Trek "
-    "limits, length, trigger period, duty, idle cap); Load puts it on the AWG (connecting "
-    "on first use, never on open) with the outputs OFF; Outputs ON asks first; Outputs "
-    "OFF works at any time. Find min/max sweeps the analyzer in the hold, after the "
-    "settle. A ramp scan with this playing: the Ramp scan tab. At the end (close, "
-    "Disconnect, bias run): 'off', or 'park' = an idle waveform with the outputs left ON, "
-    "for driving through the X2 FPGA/buffer stage, whose output goes high on a floating "
-    "input.")
+    "AWG tab. The 4063B plays on the bench trigger (EXT burst), CH1 -> Trek X1 -> EO1, "
+    "CH2 -> Trek X2 -> EO2. 'ramp': idle -> the rotation (split between the crystals, "
+    "volts from the EOM calibration) -> idle, both ends exactly at idle; idle blank = the "
+    "ILC state files' first sample (the learned trim; file zero parks the EOMs at -9 / "
+    "-41 V). The default record is the ILC's (11 ms at 2 us). 'ILC drives': two "
+    "drive_<stem>_iNN.csv, checked against their own state's target. "
+    "ORDER: Preview (draws it, checks the Trek limits, length, trigger period, duty, "
+    "idle cap) -> Dry run on scope (AWG outputs teed to two scope channels, Treks not "
+    "driving the EOMs: each output alone, then both, compared with what was meant - "
+    "cabling, gain, delay, time scale, shape, idle, triggering) -> reconnect the Treks "
+    "-> Outputs ON (or Load to AWG for another dry-run waveform) -> Find min/max in the "
+    "hold, or a ramp scan in the Ramp scan tab. With 'require a dry run' nothing that has "
+    "not passed one this session reaches live outputs. NEVER FLOAT (both outputs): the "
+    "program never switches an output off - changes are made live and the end of anything "
+    "(close, Disconnect, a bias run) is Park: an idle waveform with the outputs ON, because "
+    "the FPGA/buffer stage drives high (-4 to -5.7 kV) on a floating input. Outputs OFF "
+    "then asks first.")
+FIND_LIGHT = ("record window", "static light (line trigger)")
 MAP_MODES = ("transmission", "fit residual (mV)", "residual / standard error")
 PLOT_HINT = ("Click a time on the Map, Angle or Extinction tab to move the "
              "cursor the Malus tab shows.")
@@ -115,10 +120,16 @@ class App:
         self.ilc_summary = None
         self.build_right(right)
         self.load_settings()
+        try:
+            calib.apply(calib.get(self.cfg), self.cfg)
+        except ValueError as exc:
+            self.log(f"EOM calibration in the config refused ({exc}): using 1 Sep 2026 values")
+            calib.apply(calib.get({}), self.cfg)
         self.refresh_scan_list()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.pump()
         self.log(f"Ramp Polarimeter {__version__}. Config: {cfgmod.CONFIG_PATH}")
+        self.log("EOM calibration: " + calib.summary(calib.get(self.cfg)))
         self.load_sg(quiet=True)
         if self.autoconnect.get() and not self.simulate.get():
             root.after(300, self.auto_connect)
@@ -285,9 +296,13 @@ class App:
                          width=7, state="readonly").pack(side="left", padx=4)
             self.ch_name[ch] = tk.StringVar()
             ttk.Entry(r, textvariable=self.ch_name[ch], width=24).pack(side="left")
-        ttk.Label(f, foreground="#666", justify="left", wraplength=330,
+        r = ttk.Frame(f)
+        r.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(r, foreground="#666", justify="left", wraplength=230,
                   text="One PD required. Mon = Trek monitor, Cmd = Trek command, "
-                       "Ref = pick-off before the analyzer.").pack(anchor="w", padx=6, pady=(0, 4))
+                       "Ref = pick-off before the analyzer.").pack(side="left")
+        ttk.Button(r, text="EOM calibration...", command=self.open_calibration).pack(
+            side="right")
 
     def build_scan(self, left):
         f = ttk.Frame(left)
@@ -592,7 +607,8 @@ class App:
         self.bias_order = tk.StringVar()
         ttk.Combobox(rr, textvariable=self.bias_order, values=("up", "updown"),
                      width=8, state="readonly").pack(side="left", padx=4)
-        self._btn(rr, "Start bias points", self.do_start_bias, padx=(8, 0))
+        self._btn(rr, "Dry run on scope", self.do_bias_dry, padx=(8, 0))
+        self._btn(rr, "Start bias points", self.do_start_bias, padx=(4, 0))
         self._btn(rr, "Load...", self.do_load_bias, padx=(4, 0))
         ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
             "Biases: start:stop:step or a list, in target rotation degrees. The "
@@ -642,48 +658,46 @@ class App:
     # -- AWG mode -----------------------------------------------------------------------------
     def build_awg(self, f):
         """The 4063B playing a waveform into the Treks (CH1 -> X1, CH2 -> X2):
-        a ramp to a rotation and back, or two ILC drive files; preview and
-        check, load, outputs on/off, then measure in the hold."""
+        a ramp to a rotation and back, or two ILC drive files. Preview and
+        check, dry run on the scope, load, outputs on / park / off, then
+        measure in the hold."""
         self.av, self.a_choice = {}, {}
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=(4, 1))
-        ttk.Label(rr, text="Waveform").pack(side="left")
-        self.a_choice["source"] = tk.StringVar(value="ramp")
-        ttk.Combobox(rr, textvariable=self.a_choice["source"], values=("ramp", "ILC drives"),
-                     width=10, state="readonly").pack(side="left", padx=4)
-        ttk.Label(rr, text="rotation").pack(side="left")
-        self.av["rotation"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.av["rotation"], width=6).pack(side="left", padx=2)
-        ttk.Label(rr, text="deg, split X1").pack(side="left")
-        self.av["split"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.av["split"], width=4).pack(side="left", padx=2)
-        self.a_choice["edge"] = tk.StringVar(value="cosine")
-        ttk.Combobox(rr, textvariable=self.a_choice["edge"], values=("cosine", "linear"),
-                     width=7, state="readonly").pack(side="left", padx=4)
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        for label, key, w in (("lead", "lead_ms", 4), ("rise", "rise_ms", 4),
-                              ("hold", "hold_ms", 4), ("fall", "fall_ms", 4),
-                              ("record", "record_ms", 5)):
-            ttk.Label(rr, text=label).pack(side="left", padx=(0, 1))
+
+        def row(pady=1):
+            rr = ttk.Frame(f)
+            rr.pack(fill="x", padx=6, pady=pady)
+            return rr
+
+        def entry(rr, key, w, label=None, after=None):
+            if label:
+                ttk.Label(rr, text=label).pack(side="left", padx=(0, 1))
             self.av[key] = tk.StringVar()
             ttk.Entry(rr, textvariable=self.av[key], width=w).pack(side="left", padx=(0, 4))
-        ttk.Label(rr, text="ms, dt").pack(side="left")
-        self.av["dt_us"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.av["dt_us"], width=4).pack(side="left", padx=2)
-        ttk.Label(rr, text="us").pack(side="left")
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        ttk.Label(rr, text="Idle X1").pack(side="left")
-        for key in ("idle1", "idle2"):
-            self.av[key] = tk.StringVar()
-            ttk.Entry(rr, textvariable=self.av[key], width=7).pack(side="left", padx=2)
-            if key == "idle1":
-                ttk.Label(rr, text="X2").pack(side="left")
-        ttk.Label(rr, text="V (blank: the ILC states' trim)", foreground="#666").pack(
-            side="left", padx=4)
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
+            if after:
+                ttk.Label(rr, text=after).pack(side="left", padx=(0, 2))
+
+        def combo(rr, key, values, w, default):
+            self.a_choice[key] = tk.StringVar(value=default)
+            ttk.Combobox(rr, textvariable=self.a_choice[key], values=values, width=w,
+                         state="readonly").pack(side="left", padx=(0, 4))
+
+        rr = row((4, 1))
+        ttk.Label(rr, text="Waveform").pack(side="left", padx=(0, 2))
+        combo(rr, "source", ("ramp", "ILC drives"), 10, "ramp")
+        entry(rr, "rotation", 6, "rotation", "deg, split X1")
+        entry(rr, "split", 4)
+        combo(rr, "edge", ("cosine", "linear"), 7, "cosine")
+        rr = row()
+        for label, key in (("lead", "lead_ms"), ("rise", "rise_ms"), ("hold", "hold_ms"),
+                           ("fall", "fall_ms"), ("record", "record_ms")):
+            entry(rr, key, 4 if key != "record_ms" else 5, label)
+        entry(rr, "dt_us", 4, "ms, dt", "us")
+        rr = row()
+        entry(rr, "idle1", 7, "Idle X1")
+        entry(rr, "idle2", 7, "X2", "V")
+        ttk.Button(rr, text="EOM calibration...", command=self.open_calibration).pack(
+            side="right")
+        rr = row()
         ttk.Label(rr, text="ILC drives").pack(side="left")
         for label, key in (("X1", "file1"), ("X2", "file2")):
             ttk.Label(rr, text=label).pack(side="left", padx=(4, 1))
@@ -691,38 +705,42 @@ class App:
             ttk.Entry(rr, textvariable=self.av[key], width=13).pack(side="left")
             ttk.Button(rr, text="...", width=3,
                        command=lambda k=key: self.pick_awg_file(k)).pack(side="left")
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        ttk.Label(rr, text="Trigger").pack(side="left")
-        self.av["trig_hz"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.av["trig_hz"], width=5).pack(side="left", padx=2)
-        ttk.Label(rr, text="Hz  at the end").pack(side="left")
-        self.a_choice["end"] = tk.StringVar(value="off")
-        ttk.Combobox(rr, textvariable=self.a_choice["end"], values=("off", "park"), width=5,
-                     state="readonly").pack(side="left", padx=4)
+        rr = row()
+        entry(rr, "trig_hz", 5, "Trigger", "Hz")
         self.a_fit_tb = tk.BooleanVar(value=True)
         ttk.Checkbutton(rr, text="scope timebase to the record",
-                        variable=self.a_fit_tb).pack(side="left", padx=(4, 0))
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=(3, 1))
+                        variable=self.a_fit_tb).pack(side="left", padx=(8, 0))
+        rr = row()
+        self.a_never = tk.BooleanVar(value=True)
+        self.a_require = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rr, text="never let an output float (both)", variable=self.a_never,
+                        command=self._awg_flags).pack(side="left")
+        ttk.Checkbutton(rr, text="require a dry run", variable=self.a_require,
+                        command=self._awg_flags).pack(side="left", padx=(8, 0))
+        rr = row()
+        ttk.Label(rr, text="Dry run: AWG CH1 -> scope CH").pack(side="left")
+        combo(rr, "dry_ch1", ("1", "2", "3", "4"), 2, "3")
+        ttk.Label(rr, text="CH2 -> CH").pack(side="left")
+        combo(rr, "dry_ch2", ("1", "2", "3", "4"), 2, "4")
+        entry(rr, "dry_shots", 3, "shots")
+        rr = row((3, 1))
         ttk.Button(rr, text="Preview", command=self.do_awg_preview).pack(side="left")
+        self._btn(rr, "Dry run on scope", self.do_awg_dry, padx=(4, 0))
         self._btn(rr, "Load to AWG", self.do_awg_load, padx=(4, 0))
-        self._btn(rr, "Outputs ON", self.do_awg_on, padx=(4, 0))
-        # never greyed out: it must work while anything else runs
-        ttk.Button(rr, text="Outputs OFF", command=self.do_awg_off).pack(side="left", padx=(4, 0))
         ttk.Button(rr, text="?", width=2, command=lambda: self.log(AWG_HELP)).pack(
             side="left", padx=(4, 0))
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        ttk.Label(rr, text="In the hold, after").pack(side="left")
-        self.av["settle_ms"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.av["settle_ms"], width=4).pack(side="left", padx=2)
-        ttk.Label(rr, text="ms settle, shots").pack(side="left")
-        self.av["shots"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.av["shots"], width=3).pack(side="left", padx=2)
-        self._btn(rr, "Find min", lambda: self.do_awg_find("min"), padx=(6, 0))
+        rr = row()
+        self._btn(rr, "Outputs ON", self.do_awg_on)
+        # never greyed out: they must work while anything else runs
+        ttk.Button(rr, text="Park (idle, ON)", command=self.do_awg_park).pack(
+            side="left", padx=(4, 0))
+        ttk.Button(rr, text="Outputs OFF", command=self.do_awg_off).pack(side="left", padx=(4, 0))
+        rr = row()
+        entry(rr, "settle_ms", 4, "In the hold, after", "ms settle,")
+        entry(rr, "shots", 3, "shots")
+        self._btn(rr, "Find min", lambda: self.do_awg_find("min"), padx=(4, 0))
         self._btn(rr, "Find max", lambda: self.do_awg_find("max"), padx=(4, 0))
-        self.awg_lbl = CopyLabel(f, text="AWG: not connected (connects on Load)",
+        self.awg_lbl = CopyLabel(f, text="AWG: not connected (connects on first use)",
                                  foreground="#666", width=47)
         self.awg_lbl.pack(anchor="w", padx=6, pady=(2, 4))
 
@@ -734,6 +752,25 @@ class App:
                                        filetypes=[("drive CSV", "drive_*.csv"), ("CSV", "*.csv")])
         if p:
             self.av[key].set(p)
+
+    def _awg_flags(self):
+        """The two safety ticks, onto a live session at once. Unticking
+        never-float asks first."""
+        if not self.a_never.get() and not messagebox.askyesno(
+                "Never float", "Untick only when no AWG output reaches a stage that drives "
+                "high on a floating input (the FPGA/buffer stage: -4 to -5.7 kV) - i.e. with "
+                "it bypassed on BOTH channels. With the rule off, outputs go OFF for changes "
+                "and at the end.\n\nUntick it?", parent=self.root):
+            self.a_never.set(True)
+        if not self.a_require.get() and not messagebox.askyesno(
+                "Dry run", "Untick 'require a dry run': waveforms that have not been "
+                "checked on the scope may then drive the Treks. Untick it?", parent=self.root):
+            self.a_require.set(True)
+        s = self.awg_sess
+        if s is not None:
+            s.never_float = bool(self.a_never.get())
+            s.require_dry_run = bool(self.a_require.get())
+        self._awg_status()
 
     def _awg_idle(self, c):
         """{EO1, EO2: idle V}: typed, or the ILC state files' first sample."""
@@ -749,6 +786,13 @@ class App:
             out[name] = v
         return out
 
+    def _eom(self, c):
+        try:
+            return hw.load_eomilc(c["eomilc_path"])
+        except Exception as exc:
+            self.log(f"  EOM-ILC not loaded ({exc}): no Trek limit check")
+            return None
+
     def _awg_build(self, c):
         """The waveform and its checks from the AWG tab (Tk thread)."""
         a = c["awg"]
@@ -756,12 +800,7 @@ class App:
             wave = awgmod.from_files(a.get("file1"), a.get("file2"))
         else:
             wave = awgmod.ramp_hold(float(a["rotation"]), a, idle=self._awg_idle(c))
-        eom = None
-        try:
-            eom = hw.load_eomilc(c["eomilc_path"])
-        except Exception as exc:
-            self.log(f"  EOM-ILC not loaded ({exc}): no Trek limit check")
-        found = awgmod.check(wave, eom, trig_hz=float(a.get("trig_hz") or 0) or None)
+        found = awgmod.check(wave, self._eom(c), trig_hz=float(a.get("trig_hz") or 0) or None)
         return wave, found
 
     def do_awg_preview(self):
@@ -774,21 +813,27 @@ class App:
         self.awg_wave, self.awg_found = wave, found
         self.report_checks(found, f"AWG waveform: {wave.label}", popup=False)
         idle = wave.idle()
+        _, rot = awgmod.predict(wave)
         self.log(f"  {wave.n} points at {wave.dt*1e6:g} us = {wave.period*1e3:.3f} ms "
                  f"(FRQ {1/wave.period:.4f} Hz); idle X1 {idle['EO1']*1e3:+.1f} mV, "
-                 f"X2 {idle['EO2']*1e3:+.1f} mV")
+                 f"X2 {idle['EO2']*1e3:+.1f} mV; peak rotation {np.max(np.abs(rot)):.2f} deg")
+        s = self.awg_sess
+        if s is not None:
+            self.log("  dry run: " + ("passed this session" if s.is_verified(wave)
+                                      else "not yet"))
         self.plot_dirty.add(self.fig_awg._frame)
         self.nb.select(self.fig_awg._frame)
         self.draw_visible()
 
     def _awg_session(self, c):
         """Worker thread: the AWG session, connecting on first use. Never on
-        open: CH1 is often live from another program."""
+        open: CH1 is often live from another program. The safety ticks are
+        applied on every use."""
+        a = c["awg"]
         if self.bench is not None:
             if self.awg_sess is None or getattr(self.awg_sess.awg, "bench", None) is not self.bench:
                 self.awg_sess = awgmod.Session(sim.FakeAWG(self.bench), None, log=self.log)
-            return self.awg_sess
-        if self.awg_sess is None:
+        elif self.awg_sess is None:
             self.awg_eom = hw.load_eomilc(c["eomilc_path"])
             mod = hw.load_module(c["awg_path"], "bk4063b")
             import ilc_bench as ib
@@ -796,16 +841,18 @@ class App:
             awg = mod.BK4063B(connect=False, resource_manager=hw.shared_rm(mod.pyvisa))
             self.log(f"AWG: {awg.connect()}")
             self.awg_sess = awgmod.Session(awg, ib, log=self.log)
+        self.awg_sess.never_float = bool(a.get("never_float", True))
+        self.awg_sess.require_dry_run = bool(a.get("require_dry_run", True))
         return self.awg_sess
 
-    def _awg_close(self, policy):
-        """End the AWG as the policy says (off, or parked) and let it go."""
+    def _awg_close(self):
+        """End the AWG (park under the never-float rule, else off) and let it go."""
         s = self.awg_sess
         if s is None:
             return
         try:
-            if s.owned or policy == "park":
-                s.end(policy)
+            if s.owned or s.never_float:
+                s.end()
             if self.bench is None:
                 s.awg.close()
         except Exception as exc:
@@ -815,12 +862,151 @@ class App:
     def _awg_status(self):
         s = self.awg_sess
         if s is None:
-            self.awg_lbl.configure(text="AWG: not connected", foreground="#666")
+            self.awg_lbl.configure(text="AWG: not connected (connects on first use)",
+                                   foreground="#666")
             return
         on = bool(s.owned)
-        what = s.wave.label if s.wave is not None else "nothing of this window's loaded"
-        self.awg_lbl.configure(text=f"AWG: {what}; outputs {'ON' if on else 'OFF'}",
-                               foreground="#c00000" if on else "#060")
+        if s.wave is None:
+            what = "nothing of this window's loaded"
+        else:
+            what = s.wave.label + ("" if s.wave.source == "park" else
+                                   (" - dry run passed" if s.is_verified(s.wave)
+                                    else " - NOT dry-run"))
+        state = ("parked: idle, outputs ON" if on and s.parked else
+                 ("outputs ON" if on else "outputs OFF"))
+        self.awg_lbl.configure(text=f"AWG: {what}; {state}",
+                               foreground="#c00000" if on and not s.parked else "#060")
+
+    def _awg_wiring(self, c):
+        a = c["awg"]
+        w = {"EO1": int(a.get("dry_ch1") or 3), "EO2": int(a.get("dry_ch2") or 4)}
+        if w["EO1"] == w["EO2"]:
+            raise ValueError("the two AWG outputs need two different scope channels")
+        return w
+
+    def _dry_confirm(self, wiring, n):
+        roles = {ch: r for ch, (r, _n) in cfgmod.channel_roles(self.cfg).items()}
+        busy = [f"CH{ch} ({roles[ch]})" for ch in wiring.values() if ch in roles]
+        note = (f"\n\nScope {', '.join(busy)} normally carries another signal: its cable comes "
+                f"off for the dry run; its V/div and offset are put back after.") if busy else ""
+        return messagebox.askokcancel(
+            "Dry run on the scope",
+            f"Dry run of {n} waveform{'s' if n > 1 else ''}:\n\n"
+            f"   AWG CH1 -> scope CH{wiring['EO1']}\n   AWG CH2 -> scope CH{wiring['EO2']}\n\n"
+            "A BNC tee at each AWG output keeps the next stage's input driven.\n"
+            "The Treks must NOT drive the EOMs: HV disabled, or their outputs "
+            "disconnected.\n\nThe outputs go ON into the scope; each is first played "
+            "alone (the other at idle) to check the cabling. The scope's trigger stays "
+            f"as it is (the bench trigger).{note}\n\nStart?", parent=self.root)
+
+    def do_awg_dry(self):
+        if not self.need(ell=False):
+            return
+        c = self.gather()
+        self.save_settings()
+        try:
+            wave, found = self._awg_build(c)
+            wiring = self._awg_wiring(c)
+        except (ValueError, OSError) as exc:
+            self.log(f"Dry run: {exc}")
+            return
+        self.awg_wave, self.awg_found = wave, found
+        if self.report_checks(found, f"AWG waveform: {wave.label}") == "FAIL":
+            self.log("Dry run not started.")
+            return
+        if not self._dry_confirm(wiring, 1):
+            return
+        self._run_dry([wave], wiring, c, wave.label)
+
+    def _run_dry(self, waves, wiring, c, label):
+        shots = int(c["awg"].get("dry_shots") or 4)
+        wait_s = float(c["scan"].get("wait_s", 10.0))
+        sim_mode = self.bench is not None
+
+        def go():
+            sess = self._awg_session(c)
+            if sim_mode:                       # the simulated re-cabling
+                self.bench.wiring = "scope"
+                self.bench.awg_scope = {1: wiring["EO1"], 2: wiring["EO2"]}
+            reps = []
+            try:
+                for i, w in enumerate(waves):
+                    self._progress(i, len(waves), f"dry run {i + 1}/{len(waves)}: {w.label}")
+                    swing = max(float(np.ptp(w.u[k])) for k in w.u)
+                    ident = swing > 0.05 and not any(r["identified"] for r in reps)
+                    rep = awgmod.dry_run(sess, self.link, w, wiring, shots=shots,
+                                         wait_s=wait_s, cancelled=self.stop_flag.is_set,
+                                         log=self.log, identify=ident)
+                    rep["identified"] = ident
+                    reps.append(rep)
+                    if not rep["ok"]:
+                        break
+                self._progress(len(waves), len(waves), "dry run done")
+            finally:
+                sess.end()
+                if sim_mode:
+                    self.bench.wiring = "treks"
+            return reps
+
+        def done(reps):
+            self.awg_dry, self.awg_dry_all = reps[-1], reps
+            ok = len(reps) == len(waves) and all(r["ok"] for r in reps)
+            self._save_dry(reps, label, c)
+            s = self.awg_sess
+            end = ("parked at idle, outputs ON" if s is not None and s.never_float
+                   else "outputs OFF")
+            if ok:
+                self.log(f"Dry run PASSED: {len(reps)} waveform(s), {label}")
+                messagebox.showinfo(
+                    "Dry run passed",
+                    f"{len(reps)} waveform(s) played as meant ({label}).\n\nThe AWG is now "
+                    f"{end}. To drive the Treks: take the scope off the tees (or put the "
+                    f"cables back) and re-enable the Treks, then Outputs ON or start the run.",
+                    parent=self.root)
+            else:
+                bad = reps[-1]["problems"]
+                self.log(f"Dry run FAILED ({reps[-1]['label']}):")
+                for pr in bad:
+                    self.log(f"  {pr}")
+                messagebox.showwarning("Dry run failed", f"{reps[-1]['label']}:\n\n"
+                                       + "\n\n".join(bad[:6]), parent=self.root)
+            self._awg_status()
+            self.plot_dirty.add(self.fig_awg._frame)
+            self.nb.select(self.fig_awg._frame)
+            self.draw_visible()
+        self.worker(go, done=done)
+
+    def _save_dry(self, reps, label, c):
+        """outdir/awg_dryrun/<time>_<label>.json + .npz (the captured traces),
+        and a lab-log row."""
+        import datetime
+        when = datetime.datetime.now()
+        stem = when.strftime("%Y%m%d-%H%M%S") + "_" + scanmod.safe_name(label)[:60]
+        out = os.path.join(c["outdir"], "awg_dryrun")
+        try:
+            os.makedirs(out, exist_ok=True)
+            traces, slim = {}, []
+            for i, r in enumerate(reps):
+                rr = {k: v for k, v in r.items() if k != "steps"}
+                rr["steps"] = {}
+                for step, res in r["steps"].items():
+                    rr["steps"][step] = {}
+                    for n, x in res.items():
+                        t, v = x["trace"]
+                        traces[f"w{i}_{step}_{n}_t"] = t
+                        traces[f"w{i}_{step}_{n}_v"] = v
+                        rr["steps"][step][n] = {k: v_ for k, v_ in x.items()
+                                                if k not in ("trace", "model")}
+                slim.append(rr)
+            with open(os.path.join(out, stem + ".json"), "w", encoding="utf-8") as fh:
+                json.dump({"label": label, "when": when.isoformat(timespec="seconds"),
+                           "calibration": calib.get(c), "reports": slim}, fh, indent=1,
+                          default=_jsonable)
+            np.savez_compressed(os.path.join(out, stem + ".npz"), **traces)
+            self._lab_upsert(c["outdir"], lablog.dry_row(slim, label, when))
+            self.log(f"  dry run record: {os.path.join(out, stem)}.json/.npz")
+        except OSError as exc:
+            self.log(f"  dry run record not written: {exc}")
 
     def do_awg_load(self):
         if not self.need(ell=False):
@@ -836,12 +1022,11 @@ class App:
         if self.report_checks(found, f"AWG waveform: {wave.label}") == "FAIL":
             self.log("Not loaded.")
             return
-        keep = c["awg"].get("end") == "park"
         fit_tb = bool(c["awg"].get("fit_timebase"))
 
         def go():
             sess = self._awg_session(c)
-            names = sess.load(wave, keep_on=keep)
+            names = sess.load(wave)
             if fit_tb and self.link is not None:
                 div, pos = awgmod.timebase_for(wave)
                 sc = self.link.scope
@@ -863,30 +1048,72 @@ class App:
         if s is None or s.wave is None:
             self.log("AWG: load a waveform first (Load to AWG).")
             return
+        if s.require_dry_run and not s.is_verified(s.wave):
+            if messagebox.askyesno(
+                    "Not dry-run", f"'{s.wave.label}' has not passed a dry run on the scope "
+                    f"this session, and 'require a dry run' is ticked.\n\nRun the dry run "
+                    f"now?", parent=self.root):
+                self.do_awg_dry()
+            return
         _, rot = awgmod.predict(s.wave)
         if not messagebox.askokcancel(
                 "AWG outputs ON",
-                f"Switch both AWG outputs ON?\n\nCH1 -> X1 and CH2 -> X2 play\n"
+                f"Switch both AWG outputs ON into the Treks?\n\nCH1 -> X1 and CH2 -> X2 play\n"
                 f"{s.wave.label}\non every bench trigger (up to "
-                f"{float(np.max(np.abs(rot))):.1f} deg of rotation).\n\nOutputs OFF "
-                f"switches them off at any time.", parent=self.root):
+                f"{float(np.max(np.abs(rot))):.1f} deg of rotation).\n\nPark or Outputs "
+                f"OFF stop it at any time.", parent=self.root):
             return
         self.worker(s.on, done=lambda _o: self._awg_status())
 
+    def _bg_awg(self, fn, what):
+        """An AWG action beside the worker, so Park / OFF work while a
+        measurement runs. One thread takes them in the order they were
+        pressed: two threads per click once let a Park that started first
+        finish last, switching the outputs back on after an OFF."""
+        if getattr(self, "_awg_q", None) is None:
+            self._awg_q = queue.Queue()
+
+            def loop():
+                while True:
+                    f, w = self._awg_q.get()
+                    try:
+                        f()
+                    except Exception as exc:
+                        self.log(f"AWG {w} failed: {exc}")
+                    self.call(self._awg_status)
+            threading.Thread(target=loop, daemon=True, name="awg-actions").start()
+        self._awg_q.put((fn, what))
+
+    def do_awg_park(self):
+        """Stop driving without letting anything float: an idle-level
+        waveform, outputs ON."""
+        c = self.gather()
+        try:
+            idle = self._awg_idle(c)
+        except ValueError as exc:
+            self.log(f"Park: {exc}")
+            return
+        base = awgmod.ramp_hold(0.0, c["awg"], idle=idle)
+        s = self.awg_sess
+        if s is not None:
+            self._bg_awg(lambda: s.park(like=s.wave or base), "park")
+        else:
+            self.worker(lambda: self._awg_session(c).park(like=base),
+                        done=lambda _o: self._awg_status())
+
     def do_awg_off(self):
-        """Runs beside the worker (its own thread, the session's lock)."""
         s = self.awg_sess
         if s is None:
             self.log("AWG not connected - nothing to switch off from here.")
             return
-
-        def bg():
-            try:
-                s.off()
-            except Exception as exc:
-                self.log(f"AWG OFF failed: {exc}")
-            self.call(self._awg_status)
-        threading.Thread(target=bg, daemon=True).start()
+        if s.never_float and not messagebox.askyesno(
+                "Outputs OFF", "The never-float rule is on. An output switched OFF lets its "
+                "cable float, and a stage that drives high on a floating input (the "
+                "FPGA/buffer stage: -4 to -5.7 kV) will do so.\n\nPark stops the drive "
+                "safely. Switch OFF only with that stage bypassed on both channels.\n\n"
+                "Switch both outputs OFF?", parent=self.root):
+            return
+        self._bg_awg(lambda: s.off(force=True), "OFF")
 
     def do_awg_find(self, kind):
         s = self.awg_sess
@@ -895,8 +1122,8 @@ class App:
         if s is None or s.wave is None or s.wave.hold is None:
             self.log("AWG: load a ramp waveform (it has a hold) first.")
             return
-        if s.owned != set(awgmod.CHANNELS.values()):
-            self.log("AWG: switch the outputs ON first (Outputs ON).")
+        if s.owned != set(awgmod.CHANNELS.values()) or s.parked:
+            self.log("AWG: switch the outputs ON with the waveform first (Outputs ON).")
             return
         c = self.gather()
         a = c["awg"]
@@ -929,6 +1156,9 @@ class App:
                     va="center", transform=ax.transAxes, color="#888")
             ax.set_axis_off()
             return
+        dry = getattr(self, "awg_dry", None)
+        if dry is not None and tuple(dry["names"]) == awgmod.names(w) and "both" in dry["steps"]:
+            return self._draw_dry(fig, w, dry)
         mon, rot = awgmod.predict(w)
         t = w.t * 1e3
         ax = fig.add_subplot(211)
@@ -941,7 +1171,7 @@ class App:
         ax.grid(alpha=0.3)
         ax.tick_params(labelbottom=False)
         ax2 = fig.add_subplot(212, sharex=ax)
-        ax2.plot(t, rot, color="k", lw=0.9, label="rotation from the monitors' model")
+        ax2.plot(t, rot, color="k", lw=0.9, label="rotation (EOM calibration)")
         for name, col in (("EO1", "#1f77b4"), ("EO2", "#2ca02c")):
             ax2.plot(t, 90 * mon[name] / awgmod.biasmod.CHAN[name]["v90"], color=col,
                      lw=0.6, ls="--", label=f"{name} share")
@@ -958,6 +1188,183 @@ class App:
         ax2.set_ylabel("rotation (deg)")
         ax2.legend(fontsize=7, loc="upper right")
         ax2.grid(alpha=0.3)
+
+    def _draw_dry(self, fig, w, dry):
+        """The dry run: what the scope saw on each output against what was
+        meant, and what is left after the fitted delay, scale, gain and
+        offset."""
+        both = dry["steps"]["both"]
+        ax = fig.add_subplot(211)
+        ax2 = fig.add_subplot(212, sharex=ax)
+        for name, col in (("EO1", "#1f77b4"), ("EO2", "#2ca02c")):
+            r = both[name]
+            t, v = r["trace"]
+            meant = awgmod._model(t, w.u[name], w.dt, 0.0, 1.0)
+            ch = dry["wiring"][name]
+            ax.plot(t * 1e3, meant, color="k", lw=0.6, ls="--")
+            ax.plot(t * 1e3, v, color=col, lw=0.9,
+                    label=f"AWG CH{awgmod.CHANNELS[name]} on scope CH{ch}: gain "
+                          f"{r['gain']:.4f}, delay {r['delay_us']:.1f} us, scale "
+                          f"{r['stretch']:.5f}")
+            d, st, g, o = r["model"]
+            model = g * awgmod._model(t, w.u[name], w.dt, d, st) + o
+            tt, rr = self._decimate(t, (v - model) * 1e3, 3000)
+            ax2.plot(tt * 1e3, rr, color=col, lw=0.6,
+                     label=f"{name}: {r['rms_mV']:.1f} mV rms, idle {r['idle_meas_V']*1e3 if r['idle_meas_V'] is not None else float('nan'):+.0f} "
+                           f"mV (meant {r['idle_meant_V']*1e3:+.0f})")
+        ax.plot([], [], color="k", lw=0.6, ls="--", label="meant (no delay, gain 1)")
+        verdict = "PASSED" if dry["ok"] else "FAILED"
+        ax.set_title(f"Dry run {verdict}: {w.label} ({dry['shots']} shots per step)", fontsize=9)
+        ax.set_ylabel("scope (V)")
+        ax.legend(fontsize=6, loc="upper right")
+        ax.grid(alpha=0.3)
+        ax.tick_params(labelbottom=False)
+        ax2.axhline(0, color="k", lw=0.5)
+        ax2.set_ylabel("seen - fitted (mV)")
+        ax2.set_xlabel("time from the trigger (ms)")
+        ax2.legend(fontsize=6, loc="upper right")
+        ax2.grid(alpha=0.3)
+        if dry["problems"]:
+            ax2.set_title("; ".join(dry["problems"])[:160], fontsize=7, color="#c00000")
+
+    # -- EOM calibration ---------------------------------------------------------------------------
+    def open_calibration(self):
+        win = getattr(self, "cal_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        cal = calib.get(self.cfg)
+        w = tk.Toplevel(self.root)
+        w.title("EOM calibration")
+        self.cal_win = w
+        ttk.Label(w, justify="left", wraplength=640, text=(
+            "AWG volts -> Trek monitor volts -> kV at the EOM -> rotation, per crystal:\n"
+            "    monitor V = gain x (AWG V - idle),   kV = monitor V / (monitor V per kV),"
+            "   deg = 90 x kV / V90.\nThe pair turns the light by the sum of the two. Used "
+            "by the AWG waveforms and bias runs (rotation -> AWG volts), the scans' "
+            "rotation from the monitors and the ILC-target comparison.")).grid(
+            row=0, column=0, columnspan=6, sticky="w", padx=8, pady=(8, 6))
+        for j, h in enumerate(("", "AWG -> monitor (V/V)", "monitor V per kV", "V90 (kV)",
+                               "deg per AWG V", "deg per monitor V")):
+            ttk.Label(w, text=h).grid(row=1, column=j, padx=4, sticky="w")
+        self.cal_vars, self.cal_der = {}, {}
+        for i, n in enumerate(calib.NAMES):
+            ttk.Label(w, text=f"{n}  (AWG CH{i + 1} -> X{i + 1})").grid(
+                row=2 + i, column=0, sticky="w", padx=8)
+            for j, k in enumerate(("gain", "mon_per_kv", "v90_kv")):
+                v = tk.StringVar(value=f"{cal[n][k]:.6g}")
+                self.cal_vars[(n, k)] = v
+                ttk.Entry(w, textvariable=v, width=11).grid(row=2 + i, column=1 + j, padx=4,
+                                                            sticky="w")
+                v.trace_add("write", lambda *_: self._cal_derived())
+            for j, k in enumerate(("awg", "mon")):
+                lab = ttk.Label(w, text="", width=12)
+                lab.grid(row=2 + i, column=4 + j, padx=4, sticky="w")
+                self.cal_der[(n, k)] = lab
+        self.cal_source = (cal.get("source", ""), cal.get("date", ""))
+        self.cal_src = CopyLabel(w, text="", foreground="#666", width=90)
+        self.cal_src.grid(row=4, column=0, columnspan=6, sticky="w", padx=8, pady=(4, 0))
+        cf = ttk.LabelFrame(w, text="Convert - type a value in one box, press Enter")
+        cf.grid(row=5, column=0, columnspan=6, sticky="we", padx=8, pady=6)
+        self.conv_ch = tk.StringVar(value="EO1")
+        ttk.Combobox(cf, textvariable=self.conv_ch, values=calib.NAMES, width=5,
+                     state="readonly").pack(side="left", padx=4, pady=4)
+        self.conv = {}
+        for key, label in (("awg", "AWG V above idle"), ("mon", "monitor V"),
+                           ("kv", "kV"), ("deg", "deg")):
+            ttk.Label(cf, text=label).pack(side="left", padx=(8, 2))
+            v = tk.StringVar()
+            self.conv[key] = v
+            e = ttk.Entry(cf, textvariable=v, width=9)
+            e.pack(side="left")
+            e.bind("<Return>", lambda _e, k=key: self._cal_convert(k))
+        bf = ttk.Frame(w)
+        bf.grid(row=6, column=0, columnspan=6, sticky="we", padx=8, pady=(2, 8))
+        ttk.Button(bf, text="1 Sep 2026 values", command=lambda: self._cal_fill(
+            calib.DEFAULT)).pack(side="left")
+        ttk.Button(bf, text="From EOM-ILC", command=self._cal_from_eomilc).pack(side="left", padx=4)
+        ttk.Button(bf, text="Fit to the loaded bias run", command=self._cal_from_bias).pack(
+            side="left")
+        ttk.Button(bf, text="Close", command=w.destroy).pack(side="right")
+        ttk.Button(bf, text="Apply and save", command=self._cal_apply).pack(side="right", padx=4)
+        self._cal_derived()
+
+    def _cal_read(self):
+        cal = calib.get(self.cfg)
+        for (n, k), v in self.cal_vars.items():
+            cal[n][k] = float(v.get())
+        return cal
+
+    def _cal_derived(self):
+        try:
+            cal = calib.validate(self._cal_read())
+        except (ValueError, KeyError) as exc:
+            for lab in self.cal_der.values():
+                lab.configure(text="?")
+            self.cal_src.configure(text=f"! {exc}", foreground="#c00000")
+            return
+        for n in calib.NAMES:
+            self.cal_der[(n, "awg")].configure(text=f"{calib.deg_per_awg_v(cal, n):.4f}")
+            self.cal_der[(n, "mon")].configure(text=f"{calib.deg_per_mon_v(cal, n):.4f}")
+        src, date = self.cal_source
+        self.cal_src.configure(text=f"source: {src} ({date})", foreground="#666")
+
+    def _cal_fill(self, cal, source=None):
+        for (n, k), v in self.cal_vars.items():
+            v.set(f"{cal[n][k]:.6g}")
+        self.cal_source = (source or cal.get("source", ""), cal.get("date", ""))
+        self._cal_derived()
+
+    def _cal_convert(self, key):
+        try:
+            cal = calib.validate(self._cal_read())
+            val = float(self.conv[key].get())
+        except ValueError as exc:
+            self.log(f"Convert: {exc}")
+            return
+        res = calib.convert(cal, self.conv_ch.get(), **{key: val})
+        for k, v in self.conv.items():
+            v.set(f"{res[k]:.6g}")
+
+    def _cal_from_eomilc(self):
+        try:
+            hw.load_eomilc(self.cfg["eomilc_path"])
+            self._cal_fill(calib.from_eomilc())
+        except Exception as exc:
+            self.log(f"Calibration from EOM-ILC: {exc}")
+
+    def _cal_from_bias(self):
+        r = getattr(self, "bias_result", None)
+        if not r:
+            self.log("Load a bias run first (Bias points tab: Load...).")
+            return
+        try:
+            cal, rep = calib.from_bias(r, self._cal_read())
+        except ValueError as exc:
+            self.log(f"Calibration fit: {exc}")
+            return
+        self.log(f"Calibration fit to {r.get('name')}:")
+        for line in rep:
+            self.log(f"  {line}")
+        self._cal_fill(cal)
+
+    def _cal_apply(self):
+        import datetime
+        try:
+            cal = self._cal_read()
+            cal["source"] = self.cal_source[0] or "typed"
+            cal["date"] = self.cal_source[1] or datetime.date.today().isoformat()
+            calib.apply(calib.validate(cal), self.cfg)
+        except ValueError as exc:
+            messagebox.showerror("EOM calibration", str(exc), parent=self.cal_win)
+            return
+        self.save_settings()
+        self.log("EOM calibration applied: " + calib.summary(cal))
+        self.awg_wave = None
+        self.plot_dirty.add(self.fig_awg._frame)
+        if self.result:
+            self.reanalyse()
+        self.draw_visible()
 
     def pick_ilc_file(self, key, kind):
         if kind == "state":
@@ -1019,7 +1426,19 @@ class App:
         except ValueError as exc:
             self.log(f"Bias points: {exc}")
             return
-        plan["end"] = c["awg"].get("end", "off")
+        plan["end"] = "park" if c["awg"].get("never_float", True) else "off"
+        if c["awg"].get("require_dry_run", True):
+            waves = self._bias_waves(plan)
+            s = self.awg_sess
+            missing = [w for w in waves if s is None or not s.is_verified(w)]
+            if missing:
+                messagebox.showwarning(
+                    "Dry run first", f"{len(missing)} of the {len(waves)} plateaus in this "
+                    f"plan have not passed a dry run on the scope (e.g. "
+                    f"{', '.join(w.label for w in missing[:3])}).\n\nBias points tab: 'Dry "
+                    f"run on scope' plays every plateau into the scope first.",
+                    parent=self.root)
+                return
 
         def go():
             from . import bias as biasmod
@@ -1040,6 +1459,43 @@ class App:
         def done(folder):
             self.load_bias(folder)
         self.worker(go, done=done)
+
+    def _bias_plan(self, c):
+        plan = dict(c["bias"])
+        plan.pop("name", None)
+        plan["idle"] = self._awg_idle(c)
+        return plan
+
+    def _bias_waves(self, plan):
+        """One plateau wave per distinct bias of the plan, as the run plays them."""
+        from . import bias as biasmod
+        p = dict(biasmod.PLAN, **plan)
+        seen, out = set(), []
+        for b in biasmod.order_biases(biasmod.parse_biases(p["biases"]), p["order"]):
+            if b not in seen:
+                seen.add(b)
+                out.append(biasmod.plateau_wave(b, p))
+        return out
+
+    def do_bias_dry(self):
+        """Every plateau of the bias plan through the scope, before the run."""
+        if not self.need(ell=False):
+            return
+        c = self.gather()
+        self.save_settings()
+        from . import bias as biasmod
+        try:
+            plan = self._bias_plan(c)
+            biasmod.check_plateaus(biasmod.parse_biases(plan["biases"]),
+                                   dict(biasmod.PLAN, **plan), self._eom(c))
+            waves = self._bias_waves(plan)
+            wiring = self._awg_wiring(c)
+        except (ValueError, OSError) as exc:
+            self.log(f"Bias dry run: {exc}")
+            return
+        if not self._dry_confirm(wiring, len(waves)):
+            return
+        self._run_dry(waves, wiring, c, f"bias plan {plan['biases']}")
 
     def _bias_point(self, p):
         self.bias_live.setdefault("points", []).append(p)
@@ -1831,33 +2287,57 @@ class App:
         self.find_kind = tk.StringVar(value="min")
         ttk.Combobox(rr, textvariable=self.find_kind, values=("min", "max"), width=5,
                      state="readonly").pack(side="left", padx=4)
-        ttk.Label(rr, text="transmission in window (ms)").pack(side="left")
-        self.fv["window"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.fv["window"], width=12).pack(side="left", padx=4)
+        ttk.Label(rr, text="transmission of").pack(side="left")
+        self.find_light = tk.StringVar(value=FIND_LIGHT[0])
+        ttk.Combobox(rr, textvariable=self.find_light, values=FIND_LIGHT, width=24,
+                     state="readonly").pack(side="left", padx=4)
         rr = ttk.Frame(f)
         rr.pack(fill="x", padx=6, pady=1)
-        self.find_bias_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(rr, text="hold with the AWG at", variable=self.find_bias_on).pack(side="left")
-        self.fv["bias"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.fv["bias"], width=6).pack(side="left", padx=2)
-        ttk.Label(rr, text="deg").pack(side="left")
-        for label, key, w in (("+-deg", "half", 4), ("points", "points", 3), ("shots", "shots", 3)):
-            ttk.Label(rr, text=label).pack(side="left", padx=(8, 2))
+        for label, key, w, after in (("window", "window", 11, "ms"), ("line", "line_hz", 4, "Hz"),
+                                     ("scan step", "step", 4, "deg")):
+            ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
             self.fv[key] = tk.StringVar()
             ttk.Entry(rr, textvariable=self.fv[key], width=w).pack(side="left")
+            ttk.Label(rr, text=after).pack(side="left", padx=(1, 8))
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        for label, key, w in (("+-deg", "half", 4), ("points", "points", 3), ("shots", "shots", 3)):
+            ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
+            self.fv[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.fv[key], width=w).pack(side="left", padx=(0, 8))
         rr = ttk.Frame(f)
         rr.pack(fill="x", padx=6, pady=(3, 1))
-        self._btn(rr, "Find and go there", self.do_find_angle)
+        self._btn(rr, "Malus scan 0-180", self.do_malus_scan)
+        self._btn(rr, "Find and go there", self.do_find_angle, padx=(4, 0))
         self.find_zero_btn = ttk.Button(rr, text="Make it analyzer 0", state="disabled",
                                         command=self.do_find_zero)
-        self.find_zero_btn.pack(side="left", padx=6)
+        self.find_zero_btn.pack(side="left", padx=4)
         self.find_lbl = CopyLabel(f, text="", foreground="#060", width=47)
         self.find_lbl.pack(anchor="w", padx=6)
         ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
-            "Window: the rest before the ramp (-10:-0.5) or a hold; ticked, the AWG "
-            "holds a bias instead. 4 angles give the azimuth, then +-deg steps around "
-            "crossed (min, at the most sensitive V/div) or aligned (max) are fitted. "
-            "'Make it analyzer 0': crossed reads 0 deg.")).pack(anchor="w", padx=6, pady=(2, 4))
+            "Static light: the light as it is, nothing ramping - LINE trigger, the PD "
+            "mean over one line period. Record window: a time in the experiment's record "
+            "(rest -10:-0.5, a hold) on its trigger. Malus scan: the whole curve, coarse; "
+            "Find refines it (+-deg at the most sensitive V/div). Under an AWG hold: the "
+            "AWG tab.")).pack(anchor="w", padx=6, pady=(2, 4))
+
+    def _find_setup(self, c):
+        """(static, window s, line Hz, plan) from the Find settings."""
+        fcfg = c["find"]
+        static = fcfg.get("light") == FIND_LIGHT[1]
+        win = None
+        line_hz = float(fcfg.get("line_hz") or 60.0)
+        if not static:
+            txt = str(fcfg.get("window", "")).strip()
+            if txt:
+                a, b = (float(x) * 1e-3 for x in txt.split(":"))
+                win = (min(a, b), max(a, b))
+        plan = {"shots": int(fcfg.get("shots") or 8)}
+        if static:
+            # a line trigger every 16.7 ms: no long wait, and the mean of a
+            # 20 ms record needs few points
+            plan.update(points=2000, wait_s=2.0)
+        return static, win, line_hz, plan
 
     def do_find_angle(self):
         if not self.need():
@@ -1868,56 +2348,89 @@ class App:
         roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
         kind = self.find_kind.get()
         try:
-            win = None
-            txt = str(fcfg.get("window", "")).strip()
-            if txt:
-                a, b = (float(x) * 1e-3 for x in txt.split(":"))
-                win = (min(a, b), max(a, b))
-            bias_deg = float(fcfg["bias"]) if self.find_bias_on.get() else None
+            static, win, line_hz, plan = self._find_setup(c)
+            half = float(fcfg["half"]) if str(fcfg.get("half", "")).strip() else None
+            points = int(fcfg["points"]) if str(fcfg.get("points", "")).strip() else None
         except ValueError:
-            self.log("Find: window as from:to in ms (e.g. -10:-0.5), bias in deg")
+            self.log("Find: window as from:to in ms (e.g. -10:-0.5); numbers elsewhere")
             return
-        plan = {"shots": int(fcfg.get("shots") or 8), "end": c["awg"].get("end", "off")}
-        if bias_deg is not None:
-            try:
-                plan["idle"] = self._awg_idle(c)
-            except ValueError as exc:
-                self.log(f"Find: {exc}")
-                return
 
         def go():
             from . import bias as biasmod
-            sess = self._awg_session(c) if bias_deg is not None else None
-            try:
+
+            def run(w):
                 return biasmod.find_extremum(
-                    self.link, self.rot, roles, kind, window_s=win, bias_deg=bias_deg,
-                    awg=sess and sess.awg, plan=plan,
-                    half_deg=float(fcfg["half"]) if str(fcfg.get("half", "")).strip() else None,
-                    points=int(fcfg["points"]) if str(fcfg.get("points", "")).strip() else None,
-                    log=self.log, cancelled=self.stop_flag.is_set, ask=self.ask_main,
-                    eomilc=self.awg_eom, ilc_bench=sess and sess.ib, session=sess)
-            finally:
-                if sess is not None:
-                    self.call(self._awg_status)
+                    self.link, self.rot, roles, kind, window_s=w, plan=plan, half_deg=half,
+                    points=points, log=self.log, cancelled=self.stop_flag.is_set,
+                    ask=self.ask_main)
+            if static:
+                with biasmod.static_light(self.link, line_hz, self.log) as w:
+                    out = run(w)
+                out["static"] = True
+                return out
+            return run(win)
+
+        self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
+
+    def do_malus_scan(self):
+        if not self.need():
+            return
+        c = self.gather()
+        self.save_settings()
+        fcfg = c["find"]
+        roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
+        try:
+            static, win, line_hz, plan = self._find_setup(c)
+            step = float(fcfg.get("step") or 10.0)
+            if not 0.5 <= step <= 45:
+                raise ValueError
+        except ValueError:
+            self.log("Malus scan: a window as from:to in ms, a step of 0.5-45 deg")
+            return
+        angles = np.arange(0.0, 180.0 - 1e-9, step)
+
+        def go():
+            from . import bias as biasmod
+
+            def run(w):
+                return biasmod.malus_scan(self.link, self.rot, roles, angles, window_s=w,
+                                          plan=plan, log=self.log,
+                                          cancelled=self.stop_flag.is_set)
+            if static:
+                with biasmod.static_light(self.link, line_hz, self.log) as w:
+                    out = run(w)
+                out["static"] = True
+                return out
+            return run(win)
 
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
 
     def _find_done(self, out, outdir):
         self.find_result = out
         self._lab_upsert(outdir, lablog.find_row(out))
-        self.find_lbl.configure(
-            text=f"{out['kind']} at analyzer {out['angle']:.3f} +- "
-                 f"{out['sig']*1e3:.0f} mdeg ({out['level']*1e3:.2f} mV raw); "
-                 f"the analyzer is there now")
-        self.find_zero_btn.configure(state="normal" if out["kind"] == "min" else "disabled")
-        self.show_pos(out["angle"])
+        if out["kind"] == "scan":
+            out["angle"] = out["angle_min"]
+            self.find_lbl.configure(
+                text=f"Malus scan: maximum at {out['angle_max']:.2f} deg, minimum at "
+                     f"{out['angle_min']:.2f} deg (coarse, {out['vdiv']:g} V/div) - Find "
+                     f"min refines it")
+            self.find_zero_btn.configure(state="normal")
+            if self.rot is not None:
+                self.show_pos(self.rot.position())
+        else:
+            self.find_lbl.configure(
+                text=f"{out['kind']} at analyzer {out['angle']:.3f} +- "
+                     f"{out['sig']*1e3:.0f} mdeg ({out['level']*1e3:.2f} mV raw); "
+                     f"the analyzer is there now")
+            self.find_zero_btn.configure(state="normal" if out["kind"] == "min" else "disabled")
+            self.show_pos(out["angle"])
         self.plot_dirty.add(self.fig_find._frame)
         self.nb.select(self.fig_find._frame)
         self.draw_visible()
 
     def do_find_zero(self):
         out = getattr(self, "find_result", None)
-        if not out or out["kind"] != "min" or self.rot is None:
+        if not out or out["kind"] not in ("min", "scan") or self.rot is None:
             return
         z = (self.rot.zero + out["angle"]) % 360.0
         if not messagebox.askyesno(
@@ -1932,26 +2445,44 @@ class App:
         out = getattr(self, "find_result", None)
         ax = fig.add_subplot(111)
         if not out:
-            ax.text(0.5, 0.5, "Nothing found yet - Find angle tab", ha="center",
+            ax.text(0.5, 0.5, "Nothing found yet - Analyzer tab", ha="center",
                     transform=ax.transAxes, color="#888")
             ax.set_axis_off()
             return
         th = np.array(out["theta"])
         I = np.array(out["I"])
-        ax.errorbar(th, I * 1e3, np.array(out["sem"]) * 1e3, fmt="o", ms=4)
-        f_ = out["fit"]
-        xx = np.linspace(th.min(), th.max(), 300)
-        model = f_["imin"] + f_["k"] * np.sin(np.deg2rad(xx - f_["theta_n"])) ** 2
-        ax.plot(xx, (model if out["kind"] == "min" else -model) * 1e3, color="k", lw=0.9)
-        ax.axvline(out["angle"] if abs(out["angle"] - th.mean()) < 90 else out["angle"] + 180,
-                   color="#d62728", lw=0.8, ls="--")
-        ax.set_xlabel("analyzer angle (deg)")
-        ax.set_ylabel(f"PD (mV, raw, at {out['vdiv']*1e3:g} mV/div)")
         w = out.get("window")
-        where = (f"held at {out['bias']:g} deg by the AWG" if out.get("bias") is not None
-                 else ("whole record" if not w else f"window {w[0]*1e3:.2f}..{w[1]*1e3:.2f} ms"))
-        ax.set_title(f"{out['kind']} transmission at {out['angle']:.3f} +- "
-                     f"{out['sig']*1e3:.0f} mdeg ({where})", fontsize=9)
+        if out.get("static"):
+            where = "static light, LINE trigger, one line period"
+        elif out.get("bias") is not None:
+            where = f"AWG hold at {out['bias']:g} deg"
+        else:
+            where = "whole record" if not w else f"window {w[0]*1e3:.2f}..{w[1]*1e3:.2f} ms"
+        ax.errorbar(th, I * 1e3, np.array(out["sem"]) * 1e3, fmt="o", ms=4,
+                    label="PD mean per angle")
+        if out["kind"] == "scan":
+            xx = np.linspace(0, 180, 361)
+            model = out["imin"] + (out["imax"] - out["imin"]) * np.cos(
+                np.deg2rad(xx - out["angle_max"])) ** 2
+            ax.plot(xx, model * 1e3, color="k", lw=0.9, label="a0 + B cos 2(theta - psi)")
+            ax.axvline(out["angle_max"], color="#2ca02c", lw=0.8, ls="--",
+                       label=f"maximum {out['angle_max']:.2f} deg")
+            ax.axvline(out["angle_min"], color="#9467bd", lw=0.8, ls="--",
+                       label=f"minimum {out['angle_min']:.2f} deg")
+            ax.set_ylabel(f"PD (mV, raw, at {out['vdiv']:g} V/div)")
+            ax.set_title(f"Malus scan ({where})", fontsize=9)
+            ax.legend(fontsize=7)
+        else:
+            f_ = out["fit"]
+            xx = np.linspace(th.min(), th.max(), 300)
+            model = f_["imin"] + f_["k"] * np.sin(np.deg2rad(xx - f_["theta_n"])) ** 2
+            ax.plot(xx, (model if out["kind"] == "min" else -model) * 1e3, color="k", lw=0.9)
+            ax.axvline(out["angle"] if abs(out["angle"] - th.mean()) < 90 else out["angle"] + 180,
+                       color="#d62728", lw=0.8, ls="--")
+            ax.set_ylabel(f"PD (mV, raw, at {out['vdiv']*1e3:g} mV/div)")
+            ax.set_title(f"{out['kind']} transmission at {out['angle']:.3f} +- "
+                         f"{out['sig']*1e3:.0f} mdeg ({where})", fontsize=9)
+        ax.set_xlabel("analyzer angle (deg)")
         ax.grid(alpha=0.3)
 
     # -- ILC target ----------------------------------------------------------------
@@ -2041,7 +2572,7 @@ class App:
         for k, v in self.fv.items():
             v.set(str(c["find"].get(k, "")))
         self.find_kind.set(c["find"].get("kind", "min"))
-        self.find_bias_on.set(bool(c["find"].get("bias_on", False)))
+        self.find_light.set(c["find"].get("light", FIND_LIGHT[0]))
         self.order.set(s["order"])
         self.mode.set(s["mode"])
         self.preset.set(c["preset"])
@@ -2057,9 +2588,11 @@ class App:
         a = c["awg"]
         for k, v in self.av.items():
             v.set(str(a.get(k, "")))
-        for k in ("source", "edge", "end"):
-            self.a_choice[k].set(a.get(k, awgmod.DEFAULTS[k]))
+        for k in self.a_choice:
+            self.a_choice[k].set(str(a.get(k, awgmod.DEFAULTS.get(k, ""))))
         self.a_fit_tb.set(bool(a.get("fit_timebase", True)))
+        self.a_never.set(bool(a.get("never_float", True)))
+        self.a_require.set(bool(a.get("require_dry_run", True)))
 
     def gather(self):
         """The window's values into self.cfg (validated where it matters)."""
@@ -2088,7 +2621,7 @@ class App:
         fd = c["find"]
         for k, v in self.fv.items():
             fd[k] = v.get().strip()
-        fd["kind"], fd["bias_on"] = self.find_kind.get(), bool(self.find_bias_on.get())
+        fd["kind"], fd["light"] = self.find_kind.get(), self.find_light.get()
         c["preset"] = self.preset.get()
         c["outdir"] = self.outdir.get().strip()
         c["scan_name"] = self.scan_name.get().strip()
@@ -2108,10 +2641,12 @@ class App:
             if k in ("idle1", "idle2", "file1", "file2"):
                 a[k] = txt
             elif _isnum(txt):
-                a[k] = int(float(txt)) if k == "shots" else float(txt)
-        for k in ("source", "edge", "end"):
+                a[k] = int(float(txt)) if k in ("shots", "dry_shots") else float(txt)
+        for k in self.a_choice:
             a[k] = self.a_choice[k].get()
         a["fit_timebase"] = bool(self.a_fit_tb.get())
+        a["never_float"] = bool(self.a_never.get())
+        a["require_dry_run"] = bool(self.a_require.get())
         i = c["ilc"]
         for k, v in self.iv.items():
             txt = v.get().strip()
@@ -2274,10 +2809,8 @@ class App:
         self.worker(go, done=done)
 
     def do_disconnect(self):
-        policy = self.a_choice["end"].get()
-
         def go():
-            self._awg_close(policy)
+            self._awg_close()
             if self.link is not None and self.bench is None:
                 self.link.scope.close()
             if self.rot is not None and self.bench is None:
@@ -3965,7 +4498,7 @@ class App:
         th = self._worker_thread
         if th is not None and th.is_alive():
             th.join(timeout=20.0)
-        self._awg_close(self.a_choice["end"].get())
+        self._awg_close()
         try:
             if self.bench is None:
                 if self.rot is not None:

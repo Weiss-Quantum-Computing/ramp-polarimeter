@@ -12,7 +12,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from rampol import awg, bias, config, hw, sim  # noqa: E402
+from rampol import awg, bias, calib, config, hw, sim  # noqa: E402
 
 FAILS = []
 ILC = config.DEFAULTS["eomilc_path"]
@@ -121,7 +121,8 @@ def session_checks():
     print("\nthe session: outputs, names, park")
     bench = sim.Bench(seed=1)
     a = sim.FakeAWG(bench)
-    s = awg.Session(a, None, log=lambda *_: None)
+    # the mechanics first, with both rules off
+    s = awg.Session(a, None, log=lambda *_: None, never_float=False, require_dry_run=False)
     w = awg.ramp_hold(30.0, {}, idle={"EO1": 0.0, "EO2": 0.0})
     check("ON before anything is loaded is refused", raises(s.on) is not None)
     s.load(w)
@@ -153,11 +154,103 @@ def session_checks():
           msg is not None and "FRQ" in msg, (msg or "")[:70])
     s.off()
     fb = sim.Bench(seed=2)
-    fs = awg.Session(FlakyAWG(fb), None, log=lambda *_: None)
+    fs = awg.Session(FlakyAWG(fb), None, log=lambda *_: None, never_float=False,
+                     require_dry_run=False)
     fs.load(w)
     check("CH2 refusing to switch on raises", raises(fs.on) is not None)
     check("and CH1 is not left on", not any(fb.awg_on.values()) and not fs.owned,
           fb.awg_on)
+
+
+def rule_checks():
+    print("\nnever float, and a dry run before anything drives the Treks")
+    sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
+    scope, _ell, bench = sim.make(sg, roles={1: "PD", 3: "MonX1", 4: "MonX2"})
+    link = hw.ScopeLink(scope, log=lambda *a: None)
+    s = awg.Session(sim.FakeAWG(bench), None, log=lambda *a: None)
+    check("the rules are on by default", s.never_float and s.require_dry_run)
+    w = awg.ramp_hold(45.0, {}, idle={"EO1": 0.026, "EO2": 0.078})
+    s.load(w)
+    msg = raises(s.on)
+    check("ON refused for a waveform that has not passed a dry run",
+          msg is not None and "dry run" in msg, (msg or "")[:70])
+    check("OFF refused without force under the rule", raises(s.off) is not None)
+    bench.wiring, bench.awg_scope = "scope", {1: 3, 2: 4}
+    tb0 = scope.get(":TIMebase:SCALe")
+    v0 = link.channel_state([3, 4])
+    rep = awg.dry_run(s, link, w, {"EO1": 3, "EO2": 4}, shots=3, log=lambda *a: None)
+    b = rep["steps"]["both"]
+    check("dry run passes: gain, delay, time scale and shape as meant", rep["ok"],
+          rep["problems"][:2])
+    check("it sees the generator's zero-code error at idle (-12 / -40 mV)",
+          abs(b["EO1"]["idle_meas_V"] - (0.026 - 0.012)) < 0.004
+          and abs(b["EO2"]["idle_meas_V"] - (0.078 - 0.040)) < 0.004,
+          f"{b['EO1']['idle_meas_V']*1e3:.1f} / {b['EO2']['idle_meas_V']*1e3:.1f} mV")
+    check("the scope is put back", scope.get(":TIMebase:SCALe") == tb0
+          and link.channel_state([3, 4]) == v0)
+    check("the waveform is now verified", s.is_verified(w))
+    s.end()
+    check("the end under the rule is park: idle waveform, outputs ON",
+          all(bench.awg_on.values()) and s.parked and np.ptp(bench.awg_drive[1][1]) == 0)
+    bench.wiring = "treks"
+    s.load(w)
+    s.on()
+    check("a verified waveform goes onto the live outputs and ON", all(bench.awg_on.values())
+          and not s.parked)
+    w2 = awg.ramp_hold(60.0, {})
+    check("an unverified one is refused on live outputs",
+          "dry run" in (raises(s.load, w2) or ""))
+    bench.wiring, bench.awg_scope = "scope", {1: 4, 2: 3}
+    rep = awg.dry_run(s, link, w2, {"EO1": 3, "EO2": 4}, shots=2, log=lambda *a: None)
+    check("swapped cabling fails the dry run and says so",
+          not rep["ok"] and "swapped" in " ".join(rep["problems"]), rep["problems"][:1])
+    check("and the waveform stays unverified", not s.is_verified(w2))
+    bench.awg_scope = {1: 3, 2: 4}
+    s.off(force=True)
+    s._period = {}
+    w12 = awg.ramp_hold(45.0, {"record_ms": 12.0})
+    s.load(w12)
+    bench.awg_drive = {ch: (w.period, d) for ch, (_p, d) in bench.awg_drive.items()}
+    s.awg.frq = {1: 1 / w.period, 2: 1 / w.period}
+    s.dry = True
+    s.on()
+    s.dry = False
+    rep = awg.dry_run(s, link, w12, {"EO1": 3, "EO2": 4}, shots=2, log=lambda *a: None,
+                      identify=False)
+    check("a record played at the wrong FRQ fails (time scale)",
+          not rep["ok"] and any("as long as meant" in x for x in rep["problems"]),
+          rep["problems"][:1])
+    s.off(force=True)
+
+
+def calib_checks():
+    print("\nthe EOM calibration")
+    cal = calib.get({})
+    check("defaults: 17.55 deg per monitor V on EO1",
+          abs(calib.deg_per_mon_v(cal, "EO1") - 17.550) < 0.002)
+    r = calib.convert(cal, "EO1", deg=45.0)
+    check("45 deg on EO1 alone = 9.168 / 2 x ... AWG V round trip",
+          abs(calib.convert(cal, "EO1", awg=r["awg"])["deg"] - 45.0) < 1e-9
+          and abs(r["kv"] - 5.1283 / 2) < 1e-6, f"{r['awg']:.4f} V AWG, {r['kv']:.4f} kV")
+    cfg = {"analysis": {}}
+    new = calib.get({"calibration": {"EO1": {"gain": 0.60}}})
+    calib.apply(new, cfg)
+    v = bias.awg_volts(90, 1.0)
+    check("applied: the AWG waveforms use it", abs(v["EO1"] - 5.1283 / 0.60) < 1e-6,
+          f"{v['EO1']:.4f} V")
+    check("applied: the analysis' degrees per monitor volt follow",
+          abs(cfg["analysis"]["deg_per_mon_v"]["MonX1"] - 90 / 5.1283) < 1e-9)
+    calib.apply(calib.get({}), {"analysis": {}})
+    check("a nonsense value is refused",
+          raises(calib.validate, calib.get({"calibration": {"EO2": {"v90_kv": -1}}})) is not None)
+    man = {"name": "fake", "transfer": {"gain": 1.01, "rms_resid": 0.01},
+           "points": [{"awg": {"EO1": a1, "EO2": a1 * 0.95},
+                       "mon_V": {"MonX1": 0.57 * a1, "MonX2": 0.58 * a1 * 0.95}}
+                      for a1 in (0.0, 2.0, 4.0, 6.0)]}
+    fit, rep = calib.from_bias(man, calib.get({}))
+    check("fit to a bias run: gains from monitor vs AWG, V90 scaled by the light",
+          abs(fit["EO1"]["gain"] - 0.57) < 1e-9 and abs(fit["EO2"]["gain"] - 0.58) < 1e-9
+          and abs(fit["EO1"]["v90_kv"] - 5.1283 / 1.01) < 1e-9, rep[0])
 
 
 def bias_checks():
@@ -179,6 +272,8 @@ def main():
     wave_checks(eom)
     file_checks(eom)
     session_checks()
+    rule_checks()
+    calib_checks()
     bias_checks()
     print()
     if FAILS:

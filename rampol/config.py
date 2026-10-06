@@ -142,11 +142,22 @@ DEFAULTS = {
     "awg": {"source": "ramp", "rotation": 45.0, "split": 0.5, "edge": "cosine",
             "lead_ms": 0.5, "rise_ms": 1.0, "hold_ms": 8.0, "fall_ms": 1.0,
             "record_ms": 11.0, "dt_us": 2.0, "idle1": "", "idle2": "",
-            "file1": "", "file2": "", "trig_hz": 3.7, "end": "off",
-            "settle_ms": 4.0, "fit_timebase": True, "shots": 8},
+            "file1": "", "file2": "", "trig_hz": 3.7,
+            "settle_ms": 4.0, "fit_timebase": True, "shots": 8,
+            # BOTH outputs: never switched off by the program (the X2 path's
+            # FPGA/buffer stage drives high on a floating input; which output
+            # meets it depends on the cabling) - the end of anything is 'park'
+            "never_float": True,
+            # a waveform must have been played into the scope (dry run) before
+            # it may drive the Treks; where the AWG BNCs go for that
+            "require_dry_run": True, "dry_ch1": "3", "dry_ch2": "4", "dry_shots": 4},
+    # the EOM voltage chain (rampol.calib): AWG V -> monitor V -> kV -> deg
+    "calibration": {"EO1": {"gain": 0.5594, "mon_per_kv": 1.0, "v90_kv": 5.1283},
+                    "EO2": {"gain": 0.5924, "mon_per_kv": 1.0, "v90_kv": 5.1374},
+                    "source": "1 Sep 2026 optical calibration", "date": "2026-09-01"},
     # Find angle: min/max transmission in a window, or held by the AWG
-    "find": {"kind": "min", "window": "-10:-0.5", "bias_on": False, "bias": "45",
-             "half": "", "points": "", "shots": "8"},
+    "find": {"kind": "min", "light": "record window", "window": "-10:-0.5",
+             "line_hz": 60.0, "step": 10.0, "half": "", "points": "", "shots": "8"},
     # the ILC target comparison (rampol.ilc_target)
     "ilc": {"x1": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX1H.state.npz"),
             "x2": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX2A.state.npz"),

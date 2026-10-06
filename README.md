@@ -174,13 +174,22 @@ sign (not built in yet).
    windows `auto` (rest, hold, after) or `t1-t2` in ms,
    offsets around crossed, the PD V/div at the null. It takes a background
    at that V/div first (block the beam when asked).
-7. *Find the min / max transmission angle*: the analyzer angle of minimum (crossed) or maximum
-   transmission for the light as it is in a window of the record (the rest
-   before the ramp, `-10:-0.5`; a hold of the sequence), or with the AWG
-   holding a bias. 4 angles give the azimuth, then the analyzer steps
-   +-deg around crossed (at the most sensitive V/div that holds it) or
-   aligned, the dip is fitted and the analyzer is left there. *Make it
-   analyzer 0* sets the zero so crossed reads 0.
+7. *Find the min / max transmission angle*, of either
+   - **static light (line trigger)**: the light as it is with nothing
+     ramping - the experiment runs on, mains-synchronous, so the scope
+     triggers on LINE (2 ms/div from the trigger) and the PD is averaged
+     over exactly one line period (`line` Hz), which takes the 60 Hz out;
+     the trigger and timebase are put back afterwards; or
+   - **record window**: a time in the experiment's own record on its
+     trigger (the rest before the ramp, `-10:-0.5`; a hold).
+
+   *Malus scan 0-180* steps the analyzer every `scan step` deg and fits the
+   whole curve: the maximum and minimum angles, coarse (at the PD's V/div).
+   *Find and go there* refines one: 4 angles give the azimuth, then the
+   analyzer steps +-deg around crossed (at the most sensitive V/div that
+   holds it) or aligned, the dip is fitted and the analyzer is left there.
+   *Make it analyzer 0* sets the zero so crossed reads 0. Under an
+   AWG-held rotation: the AWG tab's Find.
 
 A scan that stops can be resumed: start a scan with the same name and answer
 Yes.
@@ -285,42 +294,78 @@ partly the filter, and correcting it would put a real error on the light.
 
 The 4063B plays a waveform into the Treks on the bench trigger (EXT burst),
 CH1 -> X1 -> EO1, CH2 -> X2 -> EO2, through EOM-ILC's upload path and checks
-(`rampol/awg.py`).
+(`rampol/awg.py`). The order, each step its own button:
 
-- **ramp**: idle -> the rotation -> idle, split between the crystals
-  (`split` on X1), cosine or linear edges, lead / rise / hold / fall in a
-  `record`-ms record on a `dt` grid. The default record is the ILC's (11 ms
-  at 2 us, 5501 points, 90.893 Hz), so switching between an ILC drive and a
-  ramp never needs the channel set up again. **Idle** blank = the ILC state
-  files' first sample (the learned trim, X1 ~+20-26 mV, X2 ~+78-81 mV): the
-  AWG holds the first sample between bursts, and file zero parks the EOMs at
-  -9 / -41 V. Both ends are exactly idle.
-- **ILC drives**: two `run/drive_<stem>_iNN.csv` files (AWG volts; a target
-  file in EOM volts is refused), checked against their own state's target as
-  the ILC does - a keeper checked as u x gain fails the 2 mA current limit.
-- **Preview** draws it with the rotation the monitors' model gives and runs
-  the checks: Trek limits, the 9.6 V cap, the 100 mV idle cap, <= 16384
-  points (5501 proven), the record under 80 % of the trigger period, and a
-  warning for long holds at kV (duty).
-- **Load to AWG** sets a channel up only where it is not already right for
-  the record length (FRQ = 1/(N dt), 20 Vpp, DDS, burst on EXT - a setting
-  that does not take stops it), then puts the waveform on: a waveform's name
-  is a hash of its samples, so the same one is selected again rather than
-  stored again (the 4063B cannot delete over SCPI). The outputs go OFF for a
-  change.
-- **Outputs ON** asks first; both are switched one at a time and read back,
-  and if either fails both go off. **Outputs OFF** works at any time, even
-  while a measurement runs. A channel that is ON but was not switched on by
-  this window (the ILC panel) is refused.
-- **Find min / max** sweeps the analyzer in the hold, `settle` ms after it
-  starts (scope overdrive recovery; the Trek's last 0.1 % takes 10-20 ms).
-  A ramp scan with the waveform playing is the Ramp scan tab.
-- **At the end** (window closed, Disconnect, a bias run or AWG-held Find):
-  `off`, or `park` = an idle-level waveform with the outputs left ON - for
-  when the drive goes through the X2 FPGA/buffer stage, whose output goes
-  high on a floating input (the pull-down is not fitted). Closing the window
-  first lets a running measurement finish its own cleanup, then ends the
-  AWG, then closes the scope.
+1. **Preview**: the waveform per channel and the rotation it gives (from the
+   EOM calibration), and the checks: Trek limits, the 9.6 V cap, the 100 mV
+   idle cap, <= 16384 points (5501 proven), the record under 80 % of the
+   trigger period, a warning for long holds at kV.
+   - **ramp**: idle -> the rotation -> idle, split between the crystals
+     (`split` on X1), cosine or linear edges, lead / rise / hold / fall in a
+     `record`-ms record on a `dt` grid - by default the ILC's (11 ms at 2 us,
+     5501 points, 90.893 Hz), so an ILC drive and a ramp share the channel
+     set-up. **Idle** blank = the ILC state files' first sample (the learned
+     trim, X1 ~+20-26 mV, X2 ~+78-81 mV): the AWG holds the first sample
+     between bursts, and file zero parks the EOMs at -9 / -41 V.
+   - **ILC drives**: two `run/drive_<stem>_iNN.csv` (AWG volts; a target in
+     EOM volts is refused), checked against their own state's target.
+2. **Dry run on scope**: the AWG's outputs go to two scope channels (`Dry
+   run: AWG CH1 -> scope CH3, CH2 -> CH4` by default) - a BNC tee keeps the
+   next stage's input driven - while the Treks do NOT drive the EOMs (HV
+   disabled or outputs disconnected). Each output is played alone first, the
+   other at idle, so the cabling is checked (a swap is caught even when both
+   carry the same shape); then both. Each trace is fitted to what was meant
+   (`v = gain x u((t - delay) / scale) + offset`) and must pass: gain within
+   4 % (the scope's own accuracy is 3 %), time scale within 5e-4 (a record
+   played at the wrong FRQ shows here), delay under 20 us, shape within 1.5 %
+   rms of the swing, shots within 5 us of each other (triggered, not
+   free-running), idle within 100 mV of the meant level (the generator's own
+   zero-code error, -12 / -40 mV, is expected and shown). The scope's V/div,
+   offset and timebase are put back; its trigger is left alone (the bench
+   trigger). A pass is remembered by the waveform's name (the hash of its
+   samples) for the session; the record goes to `<outdir>/awg_dryrun/`
+   (`.json` + the traces in `.npz`) and the lab log. The AWG plot tab then
+   shows what the scope saw against what was meant, and the residual.
+3. Reconnect the Treks. **Load to AWG** / **Outputs ON** (asks first). With
+   **require a dry run** ticked (the default), nothing that has not passed a
+   dry run this session is loaded onto live outputs or switched on.
+4. **Find min / max** in the hold (after `settle` ms: scope overdrive
+   recovery; the Trek's last 0.1 % takes 10-20 ms), or a ramp scan with the
+   waveform playing (Ramp scan tab).
+
+**Never float** (ticked by default, BOTH outputs - which output reaches the
+X2 path's FPGA/buffer stage, whose output goes high (-4 to -5.7 kV) on a
+floating input, depends on the cabling): the program never switches an output
+off. Waveform changes are made live (as EOM-ILC's uploads are), and the end of
+anything - closing the window, Disconnect, a dry run, a bias run - is
+**Park**: an idle-level waveform with the outputs ON. **Outputs OFF** then
+asks first. Unticking the rule asks too, and is only for when that stage is
+bypassed on both channels. Park and OFF work while a measurement runs, and
+are carried out in the order pressed. After the AWG has been used here it
+plays idle (parked): the experiment's own ramps come back when its drive is
+put back (the ILC panel uploads it).
+
+A waveform's name is a hash of its samples, so the same one is selected
+again rather than stored again (the 4063B cannot delete over SCPI). A channel
+that is ON but was not switched on by this window (the ILC panel) is
+refused. Outputs are switched one at a time and read back; if either fails,
+nothing is left on.
+
+## EOM calibration (EOM calibration... button)
+
+One chain per crystal, every number visible and editable (`rampol/calib.py`):
+`monitor V = gain x (AWG V - idle)`, `kV = monitor V / (monitor V per kV)`,
+`deg = 90 x kV / V90`; the pair turns the light by the sum of the two. The
+AWG waveforms and bias runs (rotation -> AWG volts), the scans' rotation from
+the monitors and the ILC-target comparison all use it. Defaults: the 1 Sep
+2026 optical calibration (gain 0.5594 / 0.5924, V90 5.1283 / 5.1374 kV).
+*From EOM-ILC* reads `eomilc.config` as it is now; *Fit to the loaded bias
+run* takes each crystal's gain from the points' monitor against AWG volts
+and scales both V90s by the static transfer curve's light / monitors gain
+(the crystals are driven together there, so their V90s are not separable
+from one run). The converter turns any of AWG V, monitor V, kV or degrees
+into the others. *Apply and save* stores it in the config with its source
+and date; every dry-run record carries the calibration it was made with.
 
 ## Bias points (Bias points tab)
 
@@ -332,9 +377,12 @@ were one step at 1 V/div - ER ~1800 there is the scope's floor. Mid-ramp
 Bias points hold the EOMs at fixed rotations with the AWG (4063B; close its
 GUI; CH1 -> X1, CH2 -> X2; plateaus on the bench trigger, EXT, each checked
 with EOM-ILC's limit check before upload). They use the AWG tab's session,
-idle levels and end policy; the plateaus are the ILC's record length (5501
-points), so the ILC's FRQ check passes afterwards, and the outputs go off
-for each change of bias. Per bias:
+idle levels and its two rules: with 'require a dry run', *Dry run on scope*
+in this tab first plays every distinct plateau of the plan into the scope
+(wiring checked on the first one that moves), and Start refuses a plan with
+any plateau that has not passed; under never-float the bias changes are
+made live and the run ends parked. The plateaus are the ILC's record length
+(5501 points), so the ILC's FRQ check passes afterwards. Per bias:
 
 1. 4 analyzer angles at the normal V/div: the azimuth and Imax;
 2. the analyzer stepped +-`null` deg around the crossed position at the most
@@ -374,6 +422,7 @@ Each scan is a folder `<outdir>/<name>/` (default outdir
 | `<name>_n2_a137.25_001...` | null refine, window 2 |
 | `analysis/brief/` | Export brief: figures, summary.json, summary.md |
 | `analysis/direct_er/` | `tools/direct_er.py` output |
+| `<outdir>/awg_dryrun/<time>_<label>.json/.npz` | every AWG dry run: the waveform(s), the wiring, each step's fit and verdict, the calibration in use; the scope traces |
 
 Next to the scan folders: `lab_log.csv`, one row per scan, bias run and found
 angle.
@@ -398,7 +447,7 @@ box opens any angle: key `<name>_a045.00`, runs `1-4`.
 | Corrections | what is subtracted (dark / background traces and levels, borrowed ones dashed), the reference drift, the per-angle transmission, shots kept and dropped per step |
 | Compare | the shown scan against up to 6 others picked in a list: rotation, the difference from the shown scan (smoothed, with the shown scan's +-1 SD), ER_fit and the direct points; each with the window's Apply switches |
 | Find angle | the last Find angle scan and its fit |
-| AWG | the AWG tab's waveform per channel, the rotation it gives, the hold and the Find window |
+| AWG | the AWG tab's waveform per channel, the rotation it gives, the hold and the Find window; after a dry run, what the scope saw against what was meant and the residual |
 | Bias points | static ER vs rotation (Imax/Imin and from the null curvature), light - monitors static (and the shown scan's ramp), Imin with the V/div it was read at, the last null scan |
 | ILC target | the ILC comparison's figures for the shown scan |
 
@@ -438,7 +487,7 @@ python tests/run_tests.py
 | `test_ell14.py` | the driver against a fake serial port (the real mount's IN reply), the approach-from-below wrapper |
 | `test_analysis.py` | the harmonic fit exact on noise-free data, its uncertainties checked by pulls (unit spread), lower bounds; a 72-angle simulated scan written and read back: rotation, rest azimuth, drift correction, 142 dip ERs against the model, direct ERs against the model and their Imax against the fit, the residual map at unit noise, the Stokes identities, segments, monitor prediction; provenance (this repository's commit, an ILC state's fingerprint) and the lab log's update-in-place |
 | `test_checks.py` | the pre-run check against the simulator: a hand-changed scope put back by a preset and confirmed, a silently refused setting reported, and each failure it should catch (AUTO sweep, channel off, wait <= repetition, AC coupling, clipping, off screen, small signal, ramp cut off, no light, no pre-trigger) |
-| `test_awg.py` | ramps (the ILC's record, ends at idle, the hold at the rotation), every check (length, trigger period, duty, idle and AWG caps), ILC drive files (header, a target refused, keepers against their targets pass and as u x gain fail), the session against the simulated AWG (names reused, a foreign ON refused, OFF for a change, park, a live FRQ change refused, CH2 refusing ON leaves nothing on) |
+| `test_awg.py` | ramps (the ILC's record, ends at idle, the hold at the rotation), every check (length, trigger period, duty, idle and AWG caps), ILC drive files (header, a target refused, keepers against their targets pass and as u x gain fail), the session against the simulated AWG (names reused, a foreign ON refused, OFF for a change, park, a live FRQ change refused, CH2 refusing ON leaves nothing on); the rules (ON and live loads refused without a dry run, OFF needs force, the end is park); the dry run into the simulated scope (passes and sees the zero-code error, puts the scope back; catches swapped cables and a wrong FRQ); the calibration (conversions, applied everywhere, a bias-run fit) |
 | `test_bias.py` | the plan (AWG volts, plateaus, the Trek limit check), the null fit and ER, and a whole bias run on the simulated bench (AWG plateaus into the bench model): ER at 0-90 deg against the model, a 2 deg static rotator error recovered, outputs off and scope restored at the end |
 | `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER, a bias run from the Bias points tab, the direct points, residual map, Poincaré, Compare, Export brief, provenance and lab-log rows; config sandboxed, window off screen |
 

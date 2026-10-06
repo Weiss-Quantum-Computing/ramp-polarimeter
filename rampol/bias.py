@@ -117,6 +117,22 @@ def plateau(amp, p, idle=0.0):
     return np.arange(len(u)) * dt, u + float(idle)
 
 
+def plateau_wave(bias_deg, p):
+    """A bias's plateau on both channels, as an awg.Wave - what a bias run
+    plays, and what its dry run checks."""
+    from . import awg as awgmod
+    p = dict(PLAN, **p)
+    idle = p.get("idle") or {}
+    volts = awg_volts(bias_deg, p["split"])
+    u, t = {}, None
+    for name in CHAN:
+        t, u[name] = plateau(volts[name], p, float(idle.get(name, 0.0)))
+    return awgmod.Wave(t, u, p["dt_us"] * 1e-6, f"bias {bias_deg:g} deg",
+                       hold=((p["lead_ms"] + p["rise_ms"]) * 1e-3,
+                             (p["lead_ms"] + p["rise_ms"] + p["hold_ms"]) * 1e-3),
+                       rotation=bias_deg, source="bias")
+
+
 def windows(p):
     """(hold window, idle window) in seconds after the trigger."""
     t_hold = (p["lead_ms"] + p["rise_ms"]) * 1e-3
@@ -187,12 +203,17 @@ def fit_null(theta_deg, I, sem=None):
     tn0 = th.mean() - c[1] / (2 * c[0]) if c[0] > 0 else th[np.argmin(I)]
     tn0 = float(np.clip(tn0, th.min(), th.max()))
     k0 = max(c[0] * (180 / np.pi) ** 2, 1e-9)
-    i0 = max(float(np.min(I)), 0.0)
+    # the floor starts at the lowest reading, NOT clipped at 0: Find max fits
+    # -I, whose floor is near -Imax, and a start at 0 with a 1e-6 step scale
+    # collapsed the fit (k -> 0, the angle anywhere) in 9 of 40 simulated
+    # runs (6 Oct 2026)
+    i0 = float(np.min(I))
+    i_scale = max(abs(i0), float(np.ptp(I)), 1e-6)
 
     def resid(p):
         tn, imin, k = p
         return (imin + k * np.sin(np.deg2rad(th - tn)) ** 2 - I) * w
-    r = least_squares(resid, [tn0, i0, k0], x_scale=[0.1, max(abs(i0), 1e-6), k0])
+    r = least_squares(resid, [tn0, i0, k0], x_scale=[0.1, i_scale, k0])
     J = r.jac
     dof = max(len(th) - 3, 1)
     s2 = float(r.fun @ r.fun) / dof
@@ -280,7 +301,11 @@ class BiasRun:
         self.eomilc = eomilc
         self.ib = ilc_bench
         from . import awg as awgmod
-        self.sess = session or awgmod.Session(awg, ilc_bench, log=log)
+        # the window passes its session (with its never-float and dry-run
+        # policy); a script calling this directly gets a plain one
+        self.sess = session or awgmod.Session(
+            awg, ilc_bench, log=log, never_float=self.p.get("end") == "park",
+            require_dry_run=False)
         self.points = []
         self.dark = {}
         self.manifest = None
@@ -344,16 +369,7 @@ class BiasRun:
 
     # -- the AWG -----------------------------------------------------------
     def _wave(self, bias_deg):
-        """The plateau for a bias on both channels, as an awg.Wave."""
-        from . import awg as awgmod
-        p = self.p
-        idle = p.get("idle") or {}
-        volts = awg_volts(bias_deg, p["split"])
-        u, t = {}, None
-        for name in CHAN:
-            t, u[name] = plateau(volts[name], p, float(idle.get(name, 0.0)))
-        return awgmod.Wave(t, u, p["dt_us"] * 1e-6, f"bias {bias_deg:g} deg",
-                           rotation=bias_deg, source="bias")
+        return plateau_wave(bias_deg, self.p)
 
     def _play(self, bias_deg):
         """Load a bias's plateau. Under the 'off' policy the outputs go off
@@ -708,6 +724,12 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
                 continue
             y = np.array(I) if kind == "min" else -np.array(I)
             fit = fit_null(th, y, S)
+            if fit["k"] <= 0 and recentred < 2:
+                # curving the wrong way: the sweep sits on the other extremum
+                center = (center + 90.0) % 180.0
+                recentred += 1
+                log(f"  the sweep curves the wrong way - the {kind} is 90 deg away; again")
+                continue
             if (fit["inside"] and abs(fit["theta_n"] - center) < 0.6 * half) or recentred >= 2:
                 break
             center = fit["theta_n"]
@@ -734,3 +756,81 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
                     sc.put(k_, v)
         except Exception as exc:
             log(f"  could not restore the scope ({exc})")
+
+
+# ------------------------------------------------- the light as it is (static)
+class static_light:
+    """The scope set for the light as it is, no ramp: trigger on the LINE
+    (the experiment runs on, synchronous with the mains), 2 ms/div from the
+    trigger - a 20 ms record - and the window one whole line period from
+    just after the trigger, so the PD mean takes the 60 Hz out. Everything
+    changed is put back on exit.
+
+        with static_light(link, 60.0, log) as window:
+            ... find_extremum(..., window_s=window) ...
+    """
+
+    KEYS = (":TRIGger:EDGE:SOURce", ":TRIGger:SWEep", ":TIMebase:SCALe",
+            ":TIMebase:POSition", ":TIMebase:REFerence")
+
+    def __init__(self, link, line_hz=60.0, log=print):
+        self.link, self.line_hz, self.log = link, float(line_hz), log
+        self.saved = {}
+
+    def __enter__(self):
+        sc = self.link.scope
+        self.saved = {k: sc.get(k) for k in self.KEYS}
+        sc.put(":TRIGger:EDGE:SOURce", "LINE")
+        sc.put(":TRIGger:SWEep", "NORMal")
+        sc.put(":TIMebase:REFerence", "LEFT")
+        sc.put(":TIMebase:SCALe", "2.0E-03")
+        # LEFT starts the record one division before the position
+        sc.put(":TIMebase:POSition", "2.0E-03")
+        period = 1.0 / self.line_hz
+        self.log(f"  scope: LINE trigger, 2 ms/div from the trigger; PD mean over one "
+                 f"{self.line_hz:g} Hz period ({period*1e3:.3f} ms)")
+        return (0.05e-3, 0.05e-3 + period)
+
+    def __exit__(self, *exc):
+        sc = self.link.scope
+        for k, v in self.saved.items():
+            if v is not None:
+                try:
+                    sc.put(k, v)
+                except Exception as e:
+                    self.log(f"  could not restore {k} ({e})")
+        self.log("  scope trigger and timebase put back")
+        return False
+
+
+def malus_scan(link, rot, roles, angles, window_s=None, plan=None, log=print,
+               cancelled=None):
+    """The analyzer stepped over `angles` (deg), the PD mean in the window at
+    each (the PD's own V/div: a coarse look, not an ER measurement), fitted
+    to I = a0 + c2 cos 2theta + s2 sin 2theta. Returns dict(theta, I, sem,
+    psi (max transmission), angle_max, angle_min, imax, imin, er_coarse,
+    window). Leaves the analyzer at the last angle."""
+    import tempfile
+    p = dict(PLAN, **(plan or {}))
+    br = BiasRun(tempfile.gettempdir(), "scan", link, rot, None, roles, plan=p, log=log,
+                 cancelled=cancelled, session=object())
+    pd = roles["PD"]
+    coarse = link.channel_state([pd])[pd]
+    w = window_s if window_s is not None else (-1e9, 1e9)
+    th, I, S = [], [], []
+    for a in angles:
+        t, s = br._acquire(float(a) % 360.0, coarse)
+        m, se = br._window(t, s["PD"], w)
+        th.append(float(a))
+        I.append(m)
+        S.append(se)
+        log(f"  analyzer {a:7.2f}: PD {m*1e3:9.2f} +- {se*1e3:.2f} mV")
+    psi, imax, imin = malus4(th, I)
+    out = {"kind": "scan", "theta": th, "I": I, "sem": S, "psi": psi % 180,
+           "angle_max": psi % 180, "angle_min": (psi + 90) % 180, "imax": imax,
+           "imin": imin, "er_coarse": imax / imin if imin > 0 else None,
+           "window": None if window_s is None else list(w), "vdiv": coarse[0]}
+    log(f"Malus scan: maximum at analyzer {out['angle_max']:.2f} deg, minimum at "
+        f"{out['angle_min']:.2f} deg; Imax {imax:.3f} V, Imin {imin*1e3:.1f} mV at "
+        f"{coarse[0]:g} V/div (coarse - Find min refines the minimum at a sensitive V/div)")
+    return out

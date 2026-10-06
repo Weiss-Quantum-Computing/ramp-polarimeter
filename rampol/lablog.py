@@ -132,13 +132,42 @@ def bias_row(man):
 
 
 def find_row(out, when=None):
-    """A Find angle result's row (bias.find_extremum's dict)."""
+    """A Find angle / Malus scan result's row (bias.find_extremum,
+    bias.malus_scan)."""
     when = when or datetime.datetime.now().isoformat(timespec="seconds")
     w = out.get("window")
-    where = (f"held at {out['bias']:g} deg" if out.get("bias") is not None
-             else ("whole record" if not w else f"{w[0]*1e3:.2f}..{w[1]*1e3:.2f} ms"))
-    return {"kind": f"find {out['kind']}", "name": f"find-{when.replace(':', '')}",
-            "measured": when, "status": "done",
-            "result": (f"{out['kind']} transmission at analyzer {out['angle']:.3f} +- "
-                       f"{out['sig']*1e3:.0f} mdeg ({where}), {out['level']*1e3:.2f} mV raw "
-                       f"at {out['vdiv']*1e3:g} mV/div")}
+    if out.get("static"):
+        where = "static light, LINE trigger, one line period"
+    elif out.get("bias") is not None:
+        where = f"AWG hold at {out['bias']:g} deg"
+    else:
+        where = "whole record" if not w else f"{w[0]*1e3:.2f}..{w[1]*1e3:.2f} ms"
+    if out["kind"] == "scan":
+        kind = "malus scan"
+        res = (f"maximum at analyzer {out['angle_max']:.2f} deg, minimum at "
+               f"{out['angle_min']:.2f} deg ({where}); Imax {out['imax']:.3f} V, Imin "
+               f"{out['imin']*1e3:.1f} mV at {out['vdiv']:g} V/div")
+    else:
+        kind = f"find {out['kind']}"
+        res = (f"{out['kind']} transmission at analyzer {out['angle']:.3f} +- "
+               f"{out['sig']*1e3:.0f} mdeg ({where}), {out['level']*1e3:.2f} mV raw "
+               f"at {out['vdiv']*1e3:g} mV/div")
+    return {"kind": kind, "name": f"{kind.replace(' ', '-')}-{when.replace(':', '')}",
+            "measured": when, "status": "done", "result": res}
+
+
+def dry_row(reports, label, when):
+    """An AWG dry run's row: what was played, passed or not, and the numbers."""
+    when_s = when.isoformat(timespec="seconds")
+    ok = all(r.get("ok") for r in reports)
+    last = reports[-1] if reports else {}
+    nums = []
+    both = (last.get("steps") or {}).get("both") or {}
+    for n, r in both.items():
+        nums.append(f"{n} gain {r.get('gain', float('nan')):.4f}, delay "
+                    f"{r.get('delay_us', float('nan')):.1f} us")
+    res = ("PASSED" if ok else "FAILED: " + "; ".join(last.get("problems", [])[:3]))
+    return {"kind": "AWG dry run", "name": f"dryrun-{when_s.replace(':', '')}",
+            "measured": when_s, "status": "passed" if ok else "failed",
+            "result": f"{label}: {len(reports)} waveform(s) {res}" + (
+                f" ({'; '.join(nums)})" if nums else "")}

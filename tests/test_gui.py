@@ -30,6 +30,8 @@ from rampol import analysis as an  # noqa: E402
 gui.messagebox.askokcancel = lambda *a, **k: True
 gui.messagebox.showinfo = lambda *a, **k: None
 gui.messagebox.askyesno = lambda *a, **k: True
+gui.messagebox.showwarning = lambda *a, **k: None
+gui.messagebox.showerror = lambda *a, **k: None
 # Export brief and Lab log open Explorer / Excel: not from a test
 os.startfile = lambda *a, **k: None
 
@@ -274,6 +276,20 @@ def main():
     app.bv["shots"].set("4")
     app.bv["name"].set("gui-bias")
     app._sim_parts[0].realtime = 0.0
+    app.bias_result = None
+    app.do_start_bias()
+    settle(root, app)
+    check("a bias run without a dry run of its plateaus is refused", app.bias_result is None)
+    app.do_bias_dry()
+    settle(root, app, timeout=300)
+    dry = getattr(app, "awg_dry_all", [])
+    check("dry run of the plan: every plateau played into the scope and passed",
+          len(dry) == 3 and all(r["ok"] for r in dry), [r["problems"][:1] for r in dry])
+    check("the dry run is on record (file and lab log)",
+          os.path.isdir(os.path.join(app.outdir.get(), "awg_dryrun"))
+          and any(r["kind"] == "AWG dry run" for r in lablog.read(app.outdir.get())))
+    check("after the dry run the AWG is parked (never-float rule)",
+          all(app.bench.awg_on.values()) and app.awg_sess.parked)
     app.do_start_bias()
     settle(root, app, timeout=300)
     br = app.bias_result
@@ -282,8 +298,14 @@ def main():
           ", ".join(f"{p['bias']:g}: ER {p.get('er') or 0:.0f}" for p in pts))
     check("ER at rest near the bench's 3333", bool(pts) and bool(pts[0].get("er"))
           and abs(pts[0]["er"] / 3333 - 1) < 0.2, pts and pts[0].get("er"))
-    check("AWG outputs off afterwards", not any(app.bench.awg_on.values()))
+    check("AWG parked afterwards: idle waveform, outputs ON (nothing floats)",
+          all(app.bench.awg_on.values()) and app.awg_sess.parked
+          and __import__("numpy").ptp(app.bench.awg_drive[1][1]) == 0)
     check("the beam is back (dark unblocked)", app.bench.imax > 0)
+    # the AWG now plays idle; the experiment's ramps come back when its own
+    # drive is put back (on the bench: the ILC panel uploads it)
+    app.awg_sess.off(force=True)
+    app.awg_sess.forget()
     app.nb.select(app.fig_bias._frame)
     root.update()
     app.fig_bias.savefig(os.path.join(out, "Bias_points.png"))
@@ -442,41 +464,93 @@ def main():
 
     print("\nfind the min / max transmission angle")
     t0 = app.result["d"].t[0] * 1e3
+    app.find_light.set(gui.FIND_LIGHT[0])
     app.fv["window"].set(f"{t0 + 0.2:.2f}:-0.1")
     app.fv["shots"].set("4")
     for kind, truth in (("min", (23.7 + 90) % 180), ("max", 23.7)):
         app.find_kind.set(kind)
-        app.find_bias_on.set(False)
         app.do_find_angle()
         settle(root, app, timeout=300)
         fr = getattr(app, "find_result", None) or {}
         err = abs((fr.get("angle", 999) - truth + 90) % 180 - 90)
         check(f"{kind} found at rest", err < 0.1, f"{fr.get('angle')} vs {truth}")
+    app.fig_find.savefig(os.path.join(out, "Find_angle.png"))
+
+    print("\nstatic light: line trigger, the PD mean, no ramp")
+    sc = app.link.scope
+    trig0 = sc.get(":TRIGger:EDGE:SOURce")
+    app.find_light.set(gui.FIND_LIGHT[1])
+    app.fv["step"].set("15")
+    app.do_malus_scan()
+    settle(root, app, timeout=300)
+    fr = app.find_result
+    err = abs((fr["angle_max"] - 23.7 + 90) % 180 - 90)
+    check("Malus scan of the static light: maximum at the rest azimuth", fr["kind"] == "scan"
+          and err < 0.5 and fr.get("static"), f"{fr['angle_max']:.2f}")
+    app.fig_find.savefig(os.path.join(out, "Malus_scan.png"))
     app.find_kind.set("min")
-    app.find_bias_on.set(True)
-    app.fv["bias"].set("60")
     app.do_find_angle()
     settle(root, app, timeout=300)
     fr = app.find_result
-    err = abs((fr["angle"] - (23.7 + 90 + 60) % 180 + 90) % 180 - 90)
-    check("min found with the AWG holding 60 deg", err < 0.1 and not any(app.bench.awg_on.values()),
-          f"{fr['angle']:.3f}")
-    app.fig_find.savefig(os.path.join(out, "Find_angle.png"))
-    print("\nAWG mode: ramp to a rotation, find the null in the hold")
+    err = abs((fr["angle"] - (23.7 + 90)) % 180)
+    err = min(err, 180 - err)
+    check("static light: crossed found", err < 0.1 and fr.get("static"), f"{fr['angle']:.3f}")
+    check("the scope's trigger is put back after", sc.get(":TRIGger:EDGE:SOURce") == trig0,
+          sc.get(":TRIGger:EDGE:SOURce"))
+    app.find_light.set(gui.FIND_LIGHT[0])
+
+    print("\nEOM calibration")
+    app.open_calibration()
+    root.update()
+    app.cal_vars[("EO1", "gain")].set("0.6")
+    app.conv_ch.set("EO1")
+    app.conv["deg"].set("45")
+    app._cal_convert("deg")
+    check("the converter: 45 deg on EO1 -> AWG volts with the typed gain",
+          abs(float(app.conv["awg"].get()) - 45 / 90 * 5.1283 / 0.6) < 1e-3,
+          app.conv["awg"].get())
+    app._cal_apply()
+    from rampol import bias as biasmod
+    check("applied: waveforms and analysis use it", abs(biasmod.CHAN["EO1"]["gain"] - 0.6) < 1e-12
+          and abs(app.cfg["calibration"]["EO1"]["gain"] - 0.6) < 1e-12)
+    app._cal_fill(gui.calib.DEFAULT)
+    app._cal_apply()
+    check("and back to the 1 Sep values", abs(biasmod.CHAN["EO1"]["gain"] - 0.5594) < 1e-12)
+    app.cal_win.destroy()
+
+    print("\nAWG mode: dry run, then ramp to a rotation and find the null in the hold")
     app.a_choice["source"].set("ramp")
     app.av["rotation"].set("60")
     app.do_awg_preview()
     root.update()
     check("preview drew the waveform", len(app.fig_awg.axes) >= 2
           and "ramp to 60" in app.fig_awg.axes[0].get_title(), app.fig_awg.axes[0].get_title())
+    app.do_awg_park()                # live outputs at idle: nothing floats
+    t1 = time.time()
+    while not (app.awg_sess and app.awg_sess.parked) and time.time() - t1 < 10:
+        root.update()
+        time.sleep(0.02)
+    settle(root, app)
     app.do_awg_load()
     settle(root, app)
-    check("loaded, outputs still off", app.awg_sess is not None and app.awg_sess.wave is not None
-          and not any(app.bench.awg_on.values()))
+    check("an unverified waveform is refused onto the live (parked) outputs",
+          "has not passed a dry run" in app.logbox.get("1.0", "end")
+          and app.awg_sess.parked)
+    app.do_awg_dry()
+    settle(root, app, timeout=300)
+    check("dry run of the ramp passed", app.awg_dry["ok"], app.awg_dry["problems"][:2])
+    app.nb.select(app.fig_awg._frame)
+    root.update()
+    check("the AWG tab shows what the scope saw", "Dry run PASSED" in app.fig_awg.axes[0].get_title(),
+          app.fig_awg.axes[0].get_title())
+    app.fig_awg.savefig(os.path.join(out, "AWG_dry_run.png"))
+    app.do_awg_load()
+    settle(root, app)
     app.do_awg_on()
     settle(root, app)
-    check("outputs on (asked first)", all(app.bench.awg_on.values()) and
-          "ON" in app.awg_lbl.cget("text"), app.awg_lbl.cget("text"))
+    check("outputs on with the ramp (asked first)", all(app.bench.awg_on.values())
+          and not app.awg_sess.parked and "ON" in app.awg_lbl.cget("text"),
+          app.awg_lbl.cget("text"))
     app.av["shots"].set("4")
     app.do_awg_find("min")
     settle(root, app, timeout=300)
@@ -484,22 +558,39 @@ def main():
     err = abs((fr["angle"] - (23.7 + 90 + 60) % 180 + 90) % 180 - 90)
     check("null in the hold of a 60 deg ramp", err < 0.1 and all(app.bench.awg_on.values()),
           f"{fr['angle']:.3f}")
-    app.do_awg_off()
-    t0 = time.time()
-    while any(app.bench.awg_on.values()) and time.time() - t0 < 5:
-        root.update()
-        time.sleep(0.02)
-    root.update()
-    check("Outputs OFF", not any(app.bench.awg_on.values()) and "OFF" in app.awg_lbl.cget("text"))
+
+    def wait_for(cond, limit=5.0):
+        t1 = time.time()
+        while not cond() and time.time() - t1 < limit:
+            root.update()
+            time.sleep(0.02)
+        # the status line is updated by the pump (every 80 ms)
+        t1 = time.time()
+        while time.time() - t1 < 0.3:
+            root.update()
+            time.sleep(0.02)
+    app.do_awg_park()
+    wait_for(lambda: app.awg_sess.parked)
+    check("Park: idle waveform, outputs still ON", app.awg_sess.parked
+          and all(app.bench.awg_on.values()))
+    app.do_awg_off()                 # asks (stubbed yes) under the never-float rule
+    wait_for(lambda: not any(app.bench.awg_on.values()))
+    check("Outputs OFF, after asking", not any(app.bench.awg_on.values())
+          and "OFF" in app.awg_lbl.cget("text"),
+          app.awg_lbl.cget("text") + " | " + app.logbox.get("1.0", "end")[-300:])
+    app.do_awg_load()                # the ramp again (dry-run passed), then ON
+    settle(root, app)
     app.do_awg_on()
     settle(root, app)
     check("found angles go to the lab log",
           sum(r["kind"].startswith("find") for r in lablog.read(app.outdir.get())) >= 3)
     print(f"\nfigures in {out}")
     bench = app.bench
-    live = all(bench.awg_on.values())
+    live = all(bench.awg_on.values()) and not app.awg_sess.parked
+    sess = app.awg_sess
     app.on_close()
-    check("closing the window switches the AWG off", live and not any(bench.awg_on.values()))
+    check("closing the window parks the AWG (never-float rule)", live and sess.parked
+          and all(bench.awg_on.values()) and __import__("numpy").ptp(bench.awg_drive[2][1]) == 0)
     check("settings saved to the sandbox", os.path.exists(cfgmod.CONFIG_PATH))
     return report()
 

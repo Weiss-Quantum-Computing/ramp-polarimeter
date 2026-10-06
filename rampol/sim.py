@@ -55,6 +55,13 @@ class Bench:
         self.awg_drive = {}
         self.awg_on = {1: False, 2: False}
         self.awg_gain = {1: 0.5594, 2: 0.5924}     # AWG V -> monitor V
+        # where the AWG's BNCs go: 'treks' (the bench) or 'scope' (a dry run:
+        # awg_scope {AWG ch: scope ch}); the generator's zero-code error at
+        # 20 Vpp (measured 24 Aug 2026) and its burst delay after the trigger
+        self.wiring = "treks"
+        self.awg_scope = {}
+        self.awg_zero = {1: -0.012, 2: -0.040}
+        self.awg_delay = 1.0e-6
         # stray light on the PD that does not come through the analyzer (V),
         # there with the beam blocked; only covering the PD removes it
         self.ambient = ambient
@@ -66,6 +73,8 @@ class Bench:
         otherwise the ramp legs shared equally."""
         t = np.asarray(t, float)
         if any(self.awg_on.values()) and self.awg_drive:
+            if self.wiring != "treks":          # the AWG is on the scope, not the Treks
+                return np.zeros_like(t), np.zeros_like(t)
             out = []
             for ch in (1, 2):
                 if not self.awg_on.get(ch) or ch not in self.awg_drive:
@@ -79,6 +88,17 @@ class Bench:
         rot = sum(self._leg(t - t0) for t0 in self.legs)
         m = rot / (self.k1 + self.k2)
         return m, m
+
+    def awg_out(self, ch, t):
+        """The AWG output's voltage at t (what a scope channel cabled to it
+        reads): the burst from the trigger + awg_delay, the first sample
+        held around it, the zero-code error added; 0 V with the output off."""
+        t = np.asarray(t, float)
+        if not self.awg_on.get(ch) or ch not in self.awg_drive:
+            return np.zeros_like(t)
+        period, u = self.awg_drive[ch]
+        tu = np.arange(len(u)) * period / len(u)
+        return np.interp(t - self.awg_delay, tu, u, left=u[0], right=u[0]) + self.awg_zero[ch]
 
     def rotation(self, t):
         """Rotation from the rest polarization (deg) at time t (s) after the
@@ -112,10 +132,13 @@ class Bench:
     def intensity_gain(self):
         return 1 + self.drift * math.sin(2 * math.pi * self.clock / self.drift_period)
 
-    def signals(self, t, shots):
+    def signals(self, t, shots, static=False):
         """Noise-free-ish channel voltages for one acquisition of `shots`
-        triggers at the current mount angle: {role: volts}."""
+        triggers at the current mount angle: {role: volts}. static: a line-
+        triggered record of the light as it is - no ramp in it."""
         m1, m2 = self.monitors(t)
+        if static:
+            m1, m2 = np.zeros_like(t), np.zeros_like(t)
         rot = self.k1 * m1 + self.k2 * m2
         light = rot + self.rot_err * np.sin(2 * np.pi * rot / self.rot_err_period)
         # analyzer angle relative to the polarization
@@ -351,9 +374,18 @@ def make_scope_class(sg):
         def _make(self, n):
             t0, dt = self._grid(n)
             t = t0 + dt * np.arange(n)
-            sig = self.bench.signals(t, self._pending)
-            self._acq = (t0, dt, {ch: sig[self.roles.get(ch, "Other")]
-                                  for ch in self.prof.channels}, self._pending)
+            src = str(self.inst.state.get(":TRIGger:EDGE:SOURce", "EXT")).upper()
+            sig = self.bench.signals(t, self._pending, static=src.startswith("LINE"))
+            b = self.bench
+            to_scope = {sch: ach for ach, sch in b.awg_scope.items()} if b.wiring == "scope" else {}
+            chans = {}
+            for ch in self.prof.channels:
+                if ch in to_scope:
+                    n_ = math.sqrt(max(self._pending, 1))
+                    chans[ch] = b.awg_out(to_scope[ch], t) + b.rng.normal(0, 2e-3 / n_, t.size)
+                else:
+                    chans[ch] = sig[self.roles.get(ch, "Other")]
+            self._acq = (t0, dt, chans, self._pending)
 
         def single(self, wait_s=10.0, cancelled=None):
             if cancelled is not None and cancelled():

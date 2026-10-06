@@ -25,10 +25,22 @@ against EOM-ILC and bk4063b.py):
   one channel at a time with the bookkeeping first, and read back; every
   exit switches off whatever was touched. A channel that is ON but was not
   switched on here belongs to someone else (the ILC panel): refused.
-* End state. 'off' (the default, fine with the X2 FPGA/buffer stage
-  bypassed) or 'park': an idle-level waveform with the outputs left ON, for
-  when the drive goes THROUGH that stage, whose output goes high on a
-  floating input (3 Sep 2026; pull-down not fitted).
+* Never float (default ON, BOTH channels - which output reaches which
+  stage depends on the day's cabling). The X2 drive path's FPGA/buffer
+  stage drives its output high (-4 to -5.7 kV) when its input floats (3 Sep
+  2026; pull-down not fitted). Under the rule an output, once on, is never
+  switched off by the program: waveform changes are made live, and the end
+  of anything is 'park' - an idle-level waveform with the outputs ON.
+  Switching OFF is then an explicit, confirmed act. With the rule off the
+  outputs go OFF for changes and at the end.
+* Dry run. Before a waveform drives the Treks it is played into two scope
+  channels (the AWG's BNCs moved from the Trek inputs to the scope) and
+  compared with what was meant: which output is which (each played alone,
+  the other at idle), delay, time scale (a wrong FRQ plays the record
+  stretched), gain, offset, shape, the idle level, and that every shot is
+  triggered. A waveform that passed is remembered by name (the hash of its
+  samples); with 'require a dry run' on, nothing else is allowed onto live
+  outputs or switched on.
 * Limits. A synthetic ramp is checked as check_limits(u, u x gain); an ILC
   drive against its own state's target (the ILC's way - a keeper fails the
   2 mA current check computed from u x gain but passes against its target).
@@ -304,18 +316,43 @@ def timebase_for(wave):
 
 
 # ------------------------------------------------------------------- session
+def names(wave):
+    """(CH1 name, CH2 name) of a wave: its identity for the dry-run record."""
+    return (wave_name(wave.u["EO1"], 1), wave_name(wave.u["EO2"], 2))
+
+
+class NotVerified(RuntimeError):
+    pass
+
+
 class Session:
     """The AWG as this window holds it. One lock serialises every AWG call
     (Outputs OFF can be pressed while a measurement runs on the worker).
-    `owned` is the set of channels this session switched ON."""
+    `owned` is the set of channels this session switched ON. never_float and
+    require_dry_run: see the module docstring. `verified` holds the names of
+    waveforms that passed a dry run; `dry` is set while one runs."""
 
-    def __init__(self, awg, ib=None, log=print):
+    def __init__(self, awg, ib=None, log=print, never_float=True, require_dry_run=True):
         self.awg, self.ib, self.log = awg, ib, log
         self.lock = threading.RLock()
         self.owned = set()
         self.wave = None          # what is loaded (None: unknown / replaced)
         self.parked = False
         self._period = {}         # without ilc_bench (simulator): the FRQ set here
+        self.never_float = never_float
+        self.require_dry_run = require_dry_run
+        self.verified = {}        # names(wave) -> dry-run summary
+        self.dry = False
+
+    def is_verified(self, wave):
+        return wave.source == "park" or names(wave) in self.verified
+
+    def _gate(self, wave, what):
+        if self.require_dry_run and not self.dry and not self.is_verified(wave):
+            raise NotVerified(
+                f"{what}: '{wave.label}' has not passed a dry run on the scope. Dry-run "
+                f"it first (AWG outputs to the scope, Treks disconnected), or untick "
+                f"'require a dry run'.")
 
     # -- state --------------------------------------------------------------
     def outputs(self):
@@ -360,7 +397,8 @@ class Session:
             stored = set()
         if name in stored:
             self.awg.write(f"C{ch}:ARWV NAME,{name}")
-            self.log(f"  CH{ch}: {name} (already stored) selected")
+            if not self.dry:
+                self.log(f"  CH{ch}: {name} (already stored) selected")
             return name
         if self.ib is not None:
             self.ib.upload_drive(self.awg, ch, name, u, FULL_SCALE)
@@ -383,21 +421,25 @@ class Session:
                     f"switch it on - another program (the ILC panel?) may be driving the "
                     f"Treks. Switch it off there first.")
             live = [ch for ch, on in self.outputs().items() if on]
+            keep_on = keep_on or self.never_float
+            if live:
+                self._gate(wave, "Not loaded onto live outputs")
             if live and not keep_on:
-                self.off()
+                self.off(force=True)
                 live = []
             for name, ch in CHANNELS.items():
                 if self.setup_ok(ch, wave.period):
                     if ch in live:
                         raise RuntimeError(
                             f"CH{ch} needs setting up for a {wave.period*1e3:.3f} ms record "
-                            f"(FRQ), which needs its output OFF - use the same record "
-                            f"length, or the 'off' end policy for this change")
+                            f"(FRQ), which needs its output OFF - and the never-float rule "
+                            f"keeps it on. Keep the record length (11 ms), or with the "
+                            f"stage bypassed untick the rule for this change.")
                     self._setup(ch, wave.period)
             names = {}
+            if live and not self.dry:
+                self.log("  outputs live: the change can land mid-burst (as EOM-ILC's uploads)")
             for name, ch in CHANNELS.items():
-                if ch in live:
-                    self.log(f"  CH{ch} is live: the change can land mid-burst")
                 names[name] = self._put(ch, wave.u[name])
             self.wave = wave
             self.parked = wave.source == "park"
@@ -409,6 +451,7 @@ class Session:
         with self.lock:
             if self.wave is None:
                 raise RuntimeError("nothing loaded on the AWG by this window - Load first")
+            self._gate(self.wave, "Outputs not switched on")
             try:
                 for ch in CHANNELS.values():
                     self.owned.add(ch)
@@ -416,16 +459,20 @@ class Session:
                 state = self.outputs()
             except Exception:
                 # CH1 may be live with CH2 refused: never leave half of it on
-                self.off()
+                self.off(force=True)
                 raise
             if not all(state.values()):
                 bad = [ch for ch, on in state.items() if not on]
-                self.off()
+                self.off(force=True)
                 raise RuntimeError(f"CH{bad} did not switch on - both switched OFF")
             self.log("AWG outputs ON (CH1 -> X1, CH2 -> X2)")
 
-    def off(self):
-        """Both outputs OFF, each tried whatever the other does."""
+    def off(self, force=False):
+        """Both outputs OFF, each tried whatever the other does. Under the
+        never-float rule only with force=True (the window asks first)."""
+        if self.never_float and not force:
+            raise RuntimeError("never-float rule: switching OFF leaves the inputs floating - "
+                               "park instead, or confirm OFF")
         errs = []
         with self.lock:
             for ch in CHANNELS.values():
@@ -452,15 +499,247 @@ class Session:
                 self.on()
             self.log("AWG parked: idle level, outputs ON")
 
-    def end(self, policy="off"):
-        if policy == "park" and self.wave is not None:
+    def end(self, policy=None):
+        """The end of an operation: park under the never-float rule (or
+        policy 'park'), else OFF. Under the rule a failed park is reported
+        and the outputs are left as they are - switching off is the act the
+        rule forbids."""
+        park = self.never_float or policy == "park"
+        if park and self.wave is not None:
             try:
                 self.park()
                 return
             except Exception as exc:
+                if self.never_float:
+                    self.log(f"  PARK FAILED ({exc}) - outputs left as they are (never-"
+                             f"float rule); switch off by hand only with the stage bypassed")
+                    return
                 self.log(f"  park failed ({exc}) - switching OFF instead")
-        self.off()
+        if park and self.wave is None and self.never_float:
+            return                 # nothing of ours loaded: leave the outputs alone
+        self.off(force=True)
 
     def forget(self):
         """Something else (a bias run) replaced the waveform."""
         self.wave = None
+
+
+# ------------------------------------------------------------------- dry run
+TOL = {"gain": 0.04,        # the MSO-X's own DC gain accuracy is +-3 % of full scale
+       "stretch": 5e-4,     # a record played at the wrong FRQ is stretched
+       "delay_us": 20.0,
+       "shape": 0.015,      # rms residual / peak-to-peak (+ 3 mV for the scope)
+       "idle_V": 0.10,      # the generator's zero-code error is -12 / -40 mV at 20 Vpp
+       "jitter_us": 5.0}    # shot-to-shot delay spread: more = not triggered
+
+
+def _model(t, u, dt, delay, stretch):
+    """The AWG's output at scope time t: sample k at delay + k dt stretch, the
+    first sample held outside the burst."""
+    tu = (np.asarray(t) - delay) / stretch
+    return np.interp(tu, np.arange(len(u)) * dt, u, left=u[0], right=u[0])
+
+
+def _xcorr_delay(t, v, u, dt, search=(-100e-6, 300e-6)):
+    """Coarse delay from the cross-correlation of the derivatives."""
+    tt = np.arange(search[0], search[1], 0.5e-6)
+    dv = np.gradient(v)
+    best, arg = -np.inf, 0.0
+    for d in tt[::4]:
+        m = _model(t, u, dt, d, 1.0)
+        c = float(np.dot(dv, np.gradient(m)))
+        if c > best:
+            best, arg = c, d
+    for d in np.arange(arg - 2e-6, arg + 2e-6, 0.25e-6):
+        m = _model(t, u, dt, d, 1.0)
+        c = float(np.dot(dv, np.gradient(m)))
+        if c > best:
+            best, arg = c, d
+    return arg
+
+
+def compare(t, v, u, dt, shots=None):
+    """Fit the captured trace v(t) (mean of the shots) to the intended u:
+    v = gain x u((t - delay) / stretch) + offset. `shots` (k x n) gives the
+    per-shot delay spread. Returns a dict of numbers and 'problems'."""
+    from scipy.optimize import least_squares
+    t, v, u = np.asarray(t, float), np.asarray(v, float), np.asarray(u, float)
+    d0 = _xcorr_delay(t, v, u, dt)
+
+    def lin(p):
+        m = _model(t, u, dt, p[0], p[1])
+        A = np.column_stack([m, np.ones_like(m)])
+        coef, *_ = np.linalg.lstsq(A, v, rcond=None)
+        return coef, v - A @ coef
+
+    r = least_squares(lambda p: lin(p)[1], [d0, 1.0], x_scale=[1e-6, 1e-4],
+                      bounds=([d0 - 50e-6, 0.5], [d0 + 50e-6, 2.0]))
+    (gain, off), res = lin(r.x)
+    delay, stretch = float(r.x[0]), float(r.x[1])
+    ptp = float(np.ptp(u))
+    rms = float(np.sqrt(np.mean(res ** 2)))
+    pre = t < delay - 20e-6
+    idle_meas = float(np.mean(v[pre])) if pre.sum() > 20 else None
+    jit = None
+    if shots is not None and len(shots) > 1 and ptp > 0.05:
+        ds = [_xcorr_delay(t, s_, u, dt, (delay - 50e-6, delay + 50e-6)) for s_ in shots]
+        jit = float(np.ptp(ds))
+    out = {"delay_us": delay * 1e6, "stretch": stretch, "gain": float(gain),
+           "offset_mV": float(off) * 1e3, "rms_mV": rms * 1e3, "ptp_V": ptp,
+           "peak_err_mV": float(np.max(np.abs(res))) * 1e3,
+           "idle_meant_V": float(u[0]), "idle_meas_V": idle_meas,
+           "jitter_us": None if jit is None else jit * 1e6}
+    probs = []
+    if ptp > 0.05:
+        if abs(gain - 1) > TOL["gain"]:
+            probs.append(f"gain {gain:.4f} (x{gain:.2f}: a load or scaling error?)")
+        if abs(stretch - 1) > TOL["stretch"]:
+            probs.append(f"played {stretch:.5f} x as long as meant (FRQ wrong for this "
+                         f"record?)")
+        if abs(delay) * 1e6 > TOL["delay_us"]:
+            probs.append(f"starts {delay*1e6:.1f} us after the trigger")
+        if rms > TOL["shape"] * ptp + 3e-3:
+            probs.append(f"shape off by {rms*1e3:.1f} mV rms ({rms/ptp:.1%} of the swing)")
+        if jit is not None and jit * 1e6 > TOL["jitter_us"]:
+            probs.append(f"shots start {jit:.1f} us apart: not triggered (free-running?)")
+    if idle_meas is not None and abs(idle_meas - u[0]) > TOL["idle_V"]:
+        probs.append(f"idle {idle_meas*1e3:+.0f} mV, meant {u[0]*1e3:+.0f} mV")
+    out["problems"] = probs
+    out["model"] = (delay, stretch, float(gain), float(off))
+    return out
+
+
+def solo(wave, which):
+    """`wave` on channel `which` (EO1/EO2), the other at its idle level -
+    to see which scope channel each output reaches without letting either
+    float."""
+    u = {k: (wave.u[k] if k == which else np.full(wave.n, float(wave.u[k][0])))
+         for k in CHANNELS}
+    return Wave(wave.t, u, wave.dt, f"{wave.label} on {which} only", hold=wave.hold,
+                source="dry-solo")
+
+
+def capture(link, scope_chs, shots, points, wait_s, cancelled):
+    """{scope ch: (t, mean, shots k x n)} of `shots` single shots."""
+    acc, tt = {ch: [] for ch in scope_chs}, {}
+
+    def on_block(k, recs, hits):
+        for ch, rec in recs.items():
+            acc[ch].append(rec.v())
+            tt[ch] = rec.t()
+    link.acquire_blocks(list(scope_chs), "single", shots, shots, dither_codes=0,
+                        points=points, wait_s=wait_s, cancelled=cancelled,
+                        on_block=on_block)
+    out = {}
+    for ch in scope_chs:
+        n = min(len(x) for x in acc[ch])
+        stack = np.array([x[:n] for x in acc[ch]])
+        out[ch] = (tt[ch][:n], stack.mean(axis=0), stack)
+    return out
+
+
+def _nice(x):
+    return biasmod._nice_up(max(x, 1e-3))
+
+
+def dry_run(sess, link, wave, wiring, shots=4, points=20000, wait_s=10.0,
+            cancelled=None, log=print, identify=True):
+    """Play `wave` into the scope and check it. wiring: {EO1: scope ch, EO2:
+    scope ch} - where the AWG's CH1 / CH2 BNCs go for the dry run. The scope
+    channels' V/div, offset and the timebase are set to show the record and
+    put back afterwards; the trigger is left alone (the bench trigger the AWG
+    bursts on). With `identify`, each output is first played alone (the
+    other at idle) to see which scope channel it reaches. Returns the report;
+    a pass is entered in sess.verified."""
+    cancelled = cancelled or (lambda: False)
+    sc = link.scope
+    chs = [wiring["EO1"], wiring["EO2"]]
+    if chs[0] == chs[1]:
+        raise ValueError("the two AWG outputs need two different scope channels")
+    saved_ch = link.channel_state(chs)
+    tb_keys = (":TIMebase:SCALe", ":TIMebase:POSition", ":TIMebase:REFerence")
+    saved_tb = {k: sc.get(k) for k in tb_keys}
+    trig = (sc.get(":TRIGger:EDGE:SOURce") or "").strip().upper()
+    report = {"label": wave.label, "names": list(names(wave)), "wiring": dict(wiring),
+              "shots": shots, "trigger": trig, "steps": {}, "problems": []}
+    if trig.startswith("LINE"):
+        report["problems"].append("the scope triggers on LINE: the AWG bursts on the bench "
+                                  "trigger, so the two are not in step - set EXT")
+    sess.dry = True
+    try:
+        div, pos = timebase_for(wave)
+        sc.put(":TIMebase:REFerence", "LEFT")
+        sc.put(":TIMebase:SCALe", f"{div:.6g}")
+        sc.put(":TIMebase:POSition", f"{pos:.6g}")
+        # one setting for both channels, covering both outputs: a swapped
+        # cable then shows the other output on screen instead of clipped
+        allu = np.concatenate([wave.u[n] for n in CHANNELS])
+        lo, hi = float(min(allu.min(), 0.0)), float(max(allu.max(), 0.0))
+        vd = _nice((hi - lo) / 6.0)
+        for ch in chs:
+            link.set_channel(ch, vd, (hi + lo) / 2.0)
+        steps = ([("EO1", solo(wave, "EO1")), ("EO2", solo(wave, "EO2"))] if identify else [])
+        steps.append(("both", wave))
+        for key, w in steps:
+            if cancelled():
+                from .hw import Cancelled
+                raise Cancelled()
+            sess.load(w, keep_on=True)
+            if not all(sess.outputs().values()):
+                sess.on()
+            got = capture(link, chs, shots, points, wait_s, cancelled)
+            res = {}
+            for name, ch in zip(CHANNELS, chs):
+                t, mean, stack = got[ch]
+                res[name] = compare(t, mean, w.u[name], w.dt, stack)
+                res[name]["trace"] = (t, mean)
+            report["steps"][key] = res
+            log(f"  dry run {key}: " + "; ".join(
+                f"{n} -> scope CH{c}: gain {res[n]['gain']:.3f}, delay "
+                f"{res[n]['delay_us']:.1f} us, {res[n]['rms_mV']:.1f} mV rms"
+                for n, c in zip(CHANNELS, chs)))
+        # which output reached which scope channel
+        if identify:
+            for name, other in (("EO1", "EO2"), ("EO2", "EO1")):
+                st = report["steps"][name]
+                ptp_meant = float(np.ptp(wave.u[name]))
+                if ptp_meant < 0.05:
+                    continue
+                seen_here = float(np.ptp(st[name]["trace"][1]))
+                seen_there = float(np.ptp(st[other]["trace"][1]))
+                swapped = seen_here < 0.5 * ptp_meant and seen_there > 0.5 * ptp_meant
+                if seen_here < 0.5 * ptp_meant:
+                    if seen_there > 0.5 * ptp_meant:
+                        report["problems"].append(
+                            f"AWG CH{CHANNELS[name]} ({name}) shows on scope CH{wiring[other]}, "
+                            f"not CH{wiring[name]}: the outputs are swapped against the "
+                            f"wiring given - the Treks would get each other's drive")
+                    else:
+                        report["problems"].append(
+                            f"AWG CH{CHANNELS[name]} ({name}) not seen on scope "
+                            f"CH{wiring[name]} ({seen_here*1e3:.0f} mV p-p of "
+                            f"{ptp_meant*1e3:.0f} meant): not connected, or output off?")
+                if seen_there > 0.1 * ptp_meant + 0.02 and not swapped:
+                    report["problems"].append(
+                        f"scope CH{wiring[other]} moved {seen_there*1e3:.0f} mV p-p while only "
+                        f"{name} played: cross-talk or the wrong cable")
+        for name in CHANNELS:
+            for pr in report["steps"]["both"][name]["problems"]:
+                report["problems"].append(f"{name}: {pr}")
+    finally:
+        sess.dry = False
+        try:
+            for ch, (vd, off) in saved_ch.items():
+                link.set_channel(ch, vd, off)
+            for k, v in saved_tb.items():
+                if v is not None:
+                    sc.put(k, v)
+        except Exception as exc:
+            log(f"  could not restore the scope ({exc})")
+    report["ok"] = not report["problems"]
+    if report["ok"]:
+        both = report["steps"]["both"]
+        sess.verified[names(wave)] = {
+            "label": wave.label, "gain": [both[n]["gain"] for n in CHANNELS],
+            "delay_us": [both[n]["delay_us"] for n in CHANNELS]}
+    return report
