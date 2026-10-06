@@ -5,7 +5,8 @@ A scan is a folder <outdir>/<name>/ holding
     <name>_scan.json             the manifest - plan, wiring, every step
     <name>_a045.00_001.npz/.txt  one file per dither block, Scope Grab's format
     <name>_ref003_001.npz/.txt   returns to the reference angle (drift)
-    <name>_dark_001.npz/.txt     beam blocked
+    <name>_dark_001.npz/.txt     PD covered (before 6 Oct 2026: beam blocked)
+    <name>_bg_001.npz/.txt       beam blocked, room as during the scan
     <name>_n1_a137.25_001...     null-refine captures for window 1
 The capture names split as Scope Grab expects (prefix_NNN), so its Compare box
 opens any angle: KEY:RUNS with KEY = <name>_a045.00.
@@ -31,6 +32,30 @@ def safe_name(text):
     spaces, nothing Windows refuses."""
     text = re.sub(r'[<>:"/\\|?*]', "", str(text).strip())
     return re.sub(r"\s+", "-", text) or "scan"
+
+
+def next_free_name(outdir, name):
+    """`name` if no scan uses it in outdir, else the next free one: a
+    trailing number is counted up (test-4 -> test-5), otherwise -2, -3 ...
+    is added. So a name never has to be retyped to start another scan."""
+    name = safe_name(name)
+
+    def taken(n):
+        return os.path.exists(os.path.join(outdir, n))
+    if not taken(name):
+        return name
+    m = re.match(r"^(.*?)(\d+)$", name)
+    if m:
+        head, num = m.group(1), int(m.group(2))
+        width = len(m.group(2))
+        k = num + 1
+        while taken(f"{head}{k:0{width}d}"):
+            k += 1
+        return f"{head}{k:0{width}d}"
+    k = 2
+    while taken(f"{name}-{k}"):
+        k += 1
+    return f"{name}-{k}"
 
 
 def angle_list(start, stop, step):
@@ -83,6 +108,8 @@ def stem(name, step):
     kind = step["kind"]
     if kind == "dark":
         return f"{name}_dark"
+    if kind == "background":
+        return f"{name}_bg"
     if kind == "ref":
         return f"{name}_ref{step['ref']:03d}"
     a = step["target"] % 360.0
@@ -163,6 +190,9 @@ class ScanRun:
                       "model": self.link.prof.key},
             "rotator": self._rotator_info(),
             "steps": [dict(s, status="todo") for s in steps],
+            # 'dark' steps mean the PD covered from here on (see
+            # analysis.OFFSET_KINDS); older scans' darks were beam-blocked
+            "offsets_v2": True,
         }
         self.manifest.update(extra or {})
         self.save()
@@ -201,8 +231,9 @@ class ScanRun:
             if done:
                 left = (time.time() - started) / done * (total - done)
                 eta = f", ~{left / 60:.1f} min left"
-            what = ("dark (beam blocked)" if s["kind"] == "dark"
-                    else f"{s['kind']} {s['target']:.2f} deg")
+            what = ({"dark": "dark (PD covered)",
+                     "background": "background (beam blocked)"}.get(s["kind"])
+                    or f"{s['kind']} {s['target']:.2f} deg")
             self.progress(done, total, f"{what} ({done + 1}/{total}{eta})")
             self.measure(s, plan)
             done += 1
@@ -220,7 +251,7 @@ class ScanRun:
         s["t_start"] = now()
         s["clock"] = float(self.clock())
         s["files"], s["hits"] = [], []
-        if s["kind"] != "dark":
+        if s["kind"] not in ("dark", "background"):
             s["landed"] = float(self.rot.approach(
                 s["target"], backoff=plan.get("backoff_deg", 3.0)))
             s["mount"] = float(self.rot.dev.position() + self.rot.zero) % 360.0

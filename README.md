@@ -106,8 +106,19 @@ table reports `ER light` with it divided out.
      average count and offsets as it found them.
    - Records holding both spin-echo legs are segmented per leg: rest, up 1,
      hold 1, down 1, after 1, up 2, ... after 2.
-   `dark first` asks you to block the beam before the analyzer, takes the
-   dark, then asks you to unblock it.
+   **Dark (PD covered)** and **Background (beam blocked)**, each *measure*
+   (asks you, takes it, asks you to undo it), *reuse latest* (the newest one
+   in another scan at the same PD V/div AND offset - the scope's offset error
+   depends on both: -34 mV at +2.65 V on 5 Oct) or *none*. The dark is the
+   PD with no light at all; the background is the beam blocked before the
+   EOMs with the room as during the scan, so it also holds the stray light.
+   The background is subtracted when there is one (it contains the dark),
+   else the dark; with both, the corrections line shows the stray light
+   apart. Scans before 6 Oct 2026 have one "dark", taken with the beam
+   blocked - a background in this sense; the numbers are the same.
+   **Scan name**: a name already used counts up (`test-4` -> `test-5`,
+   `scan` -> `scan-2`); a stopped scan of that name is offered for resuming
+   first.
    **Check scope** (and `check first`, on by default, before every scan)
    judges the settings - trigger sweep, channels displayed, DC coupling, a
    pre-trigger stretch, trigger wait longer than the repetition - then takes
@@ -123,11 +134,27 @@ table reports `ER light` with it divided out.
    (the mount angle of analyzer 0) to the scan's fitted rest azimuth. Never
    trust the engraving.
 6. **Null refine**: windows `auto` (rest, hold, after) or `t1-t2` in ms,
-   offsets around crossed, the PD V/div at the null. It takes a dark at that
-   V/div first (block the beam when asked).
+   offsets around crossed, the PD V/div at the null. It takes a background
+   at that V/div first (block the beam when asked).
+7. **Find angle**: the analyzer angle of minimum (crossed) or maximum
+   transmission for the light as it is in a window of the record (the rest
+   before the ramp, `-10:-0.5`; a hold of the sequence), or with the AWG
+   holding a bias. 4 angles give the azimuth, then the analyzer steps
+   +-deg around crossed (at the most sensitive V/div that holds it) or
+   aligned, the dip is fitted and the analyzer is left there. *Make it
+   analyzer 0* sets the zero so crossed reads 0.
 
 A scan that stops can be resumed: start a scan with the same name and answer
 Yes.
+
+**What is applied, up front.** Under the plot bar: switches for the dark /
+background subtraction, the per-angle transmission and dropping missed-lock
+shots (with the existing drift correction), and one line saying what each
+correction did to the shown scan - what was subtracted and where it came
+from, the drift, the per-angle gains, the shots dropped. The Corrections tab
+draws them, and *Borrow dark / background from another scan...* applies an
+earlier measurement to the shown scan after the fact (written to its
+manifest; *Remove borrowed* takes it out).
 
 ## Per-angle transmission
 
@@ -253,6 +280,10 @@ box opens any angle: key `<name>_a045.00`, runs `1-4`.
 | Extinction | ER_fit (smoothed by the plot bar's Smooth box), dip points (rising/falling), refine points, the drift and analyzer limits; x = time or rotation |
 | Diagnostics | ref returns vs time, 1-theta and 4-theta amplitudes, residual vs block SEM, landing error and off-screen samples per step |
 | Table | per-segment medians, every refine and dip ER; Save CSV |
+| Shots | the data behind every number: pick steps (several with ctrl/shift), a channel, and any of single shots straight from the files, the average the fit uses, +-1 SE, the min-max over the shots, the dropped (missed-lock) shots dashed, the analyzer 90 deg away; a shot list (`1, 3-5`) and a time window - zoom with the toolbar and the view re-reads the files at full resolution. *Crossed at cursor* picks the angle nearest crossed at the cursor time with its partner: the direct-ER view |
+| Build | how the angles become the polarization: a time slider; top every angle's averaged trace as fitted, bottom left the points at that instant (and before corrections) with the Malus fit a0 + B cos 2(theta - psi), its maximum and null, bottom right the rotation with the instant marked |
+| Corrections | what is subtracted (dark / background traces and levels, borrowed ones dashed), the reference drift, the per-angle transmission, shots kept and dropped per step |
+| Find angle | the last Find angle scan and its fit |
 | Bias points | static ER vs rotation (Imax/Imin and from the null curvature), light - monitors static (and the shown scan's ramp), Imin with the V/div it was read at, the last null scan |
 | ILC target | the ILC comparison's figures for the shown scan |
 

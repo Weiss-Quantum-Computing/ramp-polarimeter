@@ -609,3 +609,130 @@ def load(folder):
     man["transfer"] = transfer(man.get("points", []))
     man["folder"] = os.path.dirname(path)
     return man
+
+
+# ------------------------------------------------------------ find an angle
+def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
+                  awg=None, plan=None, half_deg=None, points=None, log=print,
+                  cancelled=None, ask=None, eomilc=None, ilc_bench=None):
+    """The analyzer angle of minimum (crossed) or maximum transmission for the
+    light as it is in a time window of the record, and the analyzer left
+    there.
+
+    window_s: (t0, t1) after the trigger in s - the rest before the ramp, a
+    hold of the experiment's own sequence - or None for the whole record. With
+    bias_deg (and an AWG) the EOMs are instead held at that rotation by a
+    plateau, as in a bias run, and the window is the plateau's.
+
+    4 analyzer angles at the PD's V/div give the azimuth; then
+    min: +-half_deg (3) around crossed at the most sensitive V/div that keeps
+         the scan on screen, I = Imin + K sin^2(theta - theta_n);
+    max: +-half_deg (10) around the azimuth at the PD's V/div, the same shape
+         upside down (the maximum is flat, so this one is less sharp).
+    No dark is needed: the fit's floor is free. Returns dict(kind, angle,
+    sig, level (raw V at the extremum), psi_coarse, theta, I, sem, vdiv,
+    fit, window)."""
+    import tempfile
+    p = dict(PLAN, **(plan or {}))
+    br = BiasRun(tempfile.gettempdir(), "find", link, rot, awg, roles, plan=p,
+                 log=log, cancelled=cancelled, ask=ask, eomilc=eomilc,
+                 ilc_bench=ilc_bench)
+    half = float(half_deg if half_deg is not None else (p["null_half_deg"] if kind == "min" else 10.0))
+    npts = int(points or p["null_points"])
+    pd = roles["PD"]
+    sc = link.scope
+    coarse = link.channel_state([pd])[pd]
+    saved_tb, on = {}, False
+    try:
+        if bias_deg is not None:
+            if awg is None:
+                raise RuntimeError("holding a bias needs the AWG")
+            check_plateaus([bias_deg], p, eomilc)
+            t_rec, _ = plateau(0.0, p)
+            period = float(t_rec[-1] + p["dt_us"] * 1e-6)
+            window_s = windows(p)[0]
+            saved_tb = {k: sc.get(k) for k in (":TIMebase:SCALe", ":TIMebase:POSition",
+                                               ":TIMebase:REFerence")}
+            div = _nice_up(period * 1.05 / 10)
+            sc.put(":TIMebase:REFerence", "LEFT")
+            sc.put(":TIMebase:SCALe", f"{div:.6g}")
+            sc.put(":TIMebase:POSition", f"{-0.2e-3 + div:.6g}")
+            br._awg_setup(period)
+            br._upload(0, awg_volts(bias_deg, p["split"]))
+            if not br.ask("Find angle", f"The AWG holds {bias_deg:g} deg. Switch both "
+                          f"outputs ON now? (They go OFF at the end.)"):
+                raise RuntimeError("outputs left off - nothing measured")
+            for c in CHAN.values():
+                awg.set_output(c["awg"], True)
+            on = True
+            time.sleep(p["upload_settle_s"])
+        w = window_s if window_s is not None else (-1e9, 1e9)
+        th4 = (0.0, 45.0, 90.0, 135.0)
+        I4 = []
+        for a in th4:
+            t, s = br._acquire(a, coarse)
+            I4.append(br._window(t, s["PD"], w)[0])
+        psi, imax4, imin4 = malus4(th4, I4)
+        amp = max(imax4 - imin4, 1e-4)
+        log(f"Find {kind}: azimuth {psi:.2f} deg from 4 angles, Imax {imax4:.3f} V, "
+            f"Imin {imin4*1e3:.1f} mV (raw, coarse) in "
+            + ("the whole record" if window_s is None else
+               f"{w[0]*1e3:.2f}..{w[1]*1e3:.2f} ms"))
+        if kind == "min":
+            center = (psi + 90) % 180
+            ladder = _ladder(amp, half, coarse[0])
+            est = amp * math.sin(math.radians(half + 1)) ** 2
+            sets = [(v, imin4 + 3 * v) for v in ladder] + [coarse]
+            k = next((i for i, s_ in enumerate(sets) if est < 5.5 * s_[0]), len(sets) - 1)
+        else:
+            center = psi % 180
+            sets, k = [coarse], 0
+        fit, recentred = None, 0
+        while True:
+            setting = sets[k]
+            th = center + np.linspace(-half, half, npts)
+            I, S, clipped = [], [], False
+            for a in th:
+                t, s = br._acquire(a % 180, setting)
+                if setting != coarse and br._clipped(s["PD"], setting, t, w):
+                    clipped = True
+                    break
+                m_, se = br._window(t, s["PD"], w)
+                I.append(m_)
+                S.append(max(se, 1e-6))
+            if clipped:
+                k = min(k + 1, len(sets) - 1)
+                log(f"  off screen at {setting[0]*1e3:g} mV/div - now {sets[k][0]*1e3:g} mV/div")
+                continue
+            y = np.array(I) if kind == "min" else -np.array(I)
+            fit = fit_null(th, y, S)
+            if (fit["inside"] and abs(fit["theta_n"] - center) < 0.6 * half) or recentred >= 2:
+                break
+            center = fit["theta_n"]
+            recentred += 1
+            log(f"  extremum at {center:.2f} deg, off centre - again")
+        angle = fit["theta_n"] % 180
+        got = rot.approach(angle)
+        level = fit["imin"] if kind == "min" else -fit["imin"]
+        log(f"  {kind} transmission at analyzer {angle:.3f} +- {fit['sig_theta_n']*1e3:.0f} "
+            f"mdeg ({level*1e3:.2f} mV raw at {setting[0]*1e3:g} mV/div); analyzer now "
+            f"at {got:.3f}")
+        return {"kind": kind, "angle": float(angle), "sig": fit["sig_theta_n"],
+                "level": float(level), "psi_coarse": psi, "theta": th.tolist(),
+                "I": [float(x) for x in I], "sem": S, "vdiv": setting[0], "fit": fit,
+                "window": None if window_s is None else list(w), "bias": bias_deg}
+    finally:
+        if on:
+            for c in CHAN.values():
+                try:
+                    awg.set_output(c["awg"], False)
+                except Exception as exc:
+                    log(f"  could not switch AWG CH{c['awg']} off: {exc}")
+            log("  AWG outputs OFF")
+        try:
+            link.set_channel(pd, *coarse)
+            for k_, v in saved_tb.items():
+                if v is not None:
+                    sc.put(k_, v)
+        except Exception as exc:
+            log(f"  could not restore the scope ({exc})")

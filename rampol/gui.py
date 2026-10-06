@@ -10,6 +10,7 @@ which the pump runs on the Tk thread.
 
     python polarimeter.py            (or python -m rampol, or Run in VS Code)
 """
+import json
 import os
 import queue
 import threading
@@ -82,6 +83,7 @@ class App:
         self.build_refine(self._mode_tab("Null refine"))
         self.build_bias(self._mode_tab("Bias points"))
         self.build_ilc(self._mode_tab("ILC target"))
+        self.build_find(self._mode_tab("Find angle"))
         self.build_runbar(left)
         self.bias_result = None
         self.ilc_summary = None
@@ -304,10 +306,19 @@ class App:
         ttk.Label(rr, text="Scan name").pack(side="left")
         self.scan_name = tk.StringVar()
         ttk.Entry(rr, textvariable=self.scan_name, width=24).pack(side="left", padx=4)
-        self.with_dark = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="dark first", variable=self.with_dark).pack(side="left")
         self.check_first = tk.BooleanVar(value=True)
         ttk.Checkbutton(rr, text="check first", variable=self.check_first).pack(side="left")
+        ttk.Label(rr, text="(a used name counts up)", foreground="#666").pack(side="left")
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        self.dark_mode = tk.StringVar(value="none")
+        self.bg_mode = tk.StringVar(value="measure")
+        for label, var in (("Dark (PD covered)", self.dark_mode),
+                           ("Background (beam blocked)", self.bg_mode)):
+            ttk.Label(rr, text=label).pack(side="left")
+            ttk.Combobox(rr, textvariable=var, width=11, state="readonly",
+                         values=("measure", "reuse latest", "none")).pack(side="left",
+                                                                         padx=(2, 8))
         rr = ttk.Frame(f)
         rr.pack(fill="x", padx=6, pady=(4, 2))
         self._btn(rr, "Check scope", self.do_check_scope)
@@ -374,6 +385,20 @@ class App:
                         command=self.reanalyse).pack(side="left", padx=(10, 0))
         self.plot_status = ttk.Label(r, text=PLOT_HINT, foreground="#666")
         self.plot_status.pack(side="left", padx=(12, 0))
+        r = ttk.Frame(bar)
+        r.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(r, text="Apply:").pack(side="left")
+        self.sub_dark = tk.BooleanVar(value=True)
+        self.gains_on = tk.BooleanVar(value=True)
+        self.lock_on = tk.BooleanVar(value=True)
+        for text, var in (("dark / background", self.sub_dark),
+                          ("per-angle transmission", self.gains_on),
+                          ("drop missed-lock shots", self.lock_on)):
+            ttk.Checkbutton(r, text=text, variable=var, command=self.reanalyse).pack(
+                side="left", padx=(6, 0))
+        self.corr_label = ttk.Label(bar, text="", foreground="#8a4b00", wraplength=900,
+                                    justify="left")
+        self.corr_label.pack(fill="x", padx=6, pady=(0, 4))
 
         pane = ttk.PanedWindow(right, orient="vertical")
         pane.pack(fill="both", expand=True, padx=8, pady=4)
@@ -401,10 +426,16 @@ class App:
         cb.bind("<<ComboboxSelected>>", lambda _e: self.redraw(self.fig_ext))
         self.fig_diag = self._fig_tab("Diagnostics", self.draw_diagnostics)
         self.build_table_tab()
-        # these two draw without a ramp scan loaded
+        self.build_shots_tab()
+        self.build_build_tab()
+        self.fig_corr = self._fig_tab("Corrections", self.draw_corrections)
+        ttk.Button(self.fig_corr._ctl, text="Borrow dark / background from another scan...",
+                   command=self.do_borrow_dialog).pack(side="left")
+        # these draw without a ramp scan loaded
         self.fig_bias = self._fig_tab("Bias points", self.draw_bias)
         self.fig_ilc = self._fig_tab("ILC target", self.draw_ilc)
-        self.free_tabs = {self.fig_bias._frame, self.fig_ilc._frame}
+        self.fig_find = self._fig_tab("Find angle", self.draw_find)
+        self.free_tabs = {self.fig_bias._frame, self.fig_ilc._frame, self.fig_find._frame}
         ttk.Label(self.fig_ilc._ctl, text="figure:").pack(side="left")
         self.ilc_fig = tk.StringVar(value="fig2_rotation_vs_target.png")
         cb = ttk.Combobox(self.fig_ilc._ctl, textvariable=self.ilc_fig, width=28,
@@ -590,7 +621,13 @@ class App:
             self.log("No channel has the PD role.")
             return
         plan = dict(c["bias"])
-        name = plan.pop("name", "bias") or "bias"
+        name = scanmod.safe_name(plan.pop("name", "bias") or "bias")
+        new = scanmod.next_free_name(c["outdir"], name)
+        if new != name:
+            self.log(f"{name} exists - this bias run is {new}")
+            self.bv["name"].set(new)
+            c["bias"]["name"] = new
+            name = new
         sim_mode = self.bench is not None
 
         def go():
@@ -754,6 +791,783 @@ class App:
                          f"+- {p['sig_theta_n']*1e3:.0f} mdeg", fontsize=8)
             ax.grid(alpha=0.3)
 
+    # -- dark and background ---------------------------------------------------------
+    OFFSET_PROMPTS = {
+        "dark": ("Dark (PD covered)",
+                 "Cover the photodiode so no light at all reaches it (cap or card "
+                 "over the PD itself), then OK.",
+                 "Dark done. Uncover the photodiode, then OK."),
+        "background": ("Background (beam blocked)",
+                       "Block the laser beam before the EOMs. Leave the room, the PD "
+                       "and its cover as they are during the scan, so stray light is "
+                       "included. Then OK.",
+                       "Background done. Unblock the beam, then OK."),
+    }
+
+    def offsets_then(self, run, kinds, after):
+        """Ask for each offset measurement in turn (dark: PD covered;
+        background: beam blocked), take it, ask to undo it, then after()."""
+        kinds = list(kinds)
+        if not kinds:
+            after()
+            return
+        kind = kinds.pop(0)
+        title, ask, undo = self.OFFSET_PROMPTS[kind]
+        if not messagebox.askokcancel(title, ask, parent=self.root):
+            self.log(f"{title} skipped.")
+            for s in run.manifest["steps"]:
+                if s["kind"] == kind and s["status"] != "done":
+                    s["status"] = "skipped"
+            run.save()
+            self.offsets_then(run, kinds, after)
+            return
+        b = self.bench
+        if b is not None:
+            if kind == "dark":
+                b.covered = True
+            else:
+                b._imax_saved, b.imax = b.imax, 0.0
+
+        def undone(_):
+            if b is not None:
+                if kind == "dark":
+                    b.covered = False
+                else:
+                    b.imax = b._imax_saved
+            messagebox.showinfo(title, undo, parent=self.root)
+            self.offsets_then(run, kinds, after)
+        self.worker(lambda: run.run(kinds={kind}), done=undone)
+
+    def borrow_latest(self, run, kinds, then):
+        """Worker: the newest dark/background of other scans at this PD
+        V/div and offset, written into the run's manifest (borrowed)."""
+        roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(self.cfg).items()}
+        outdir = self.cfg["outdir"]
+        sg = self.load_sg()
+
+        def go():
+            pd = roles["PD"]
+            vdiv, off = self.link.channel_state([pd])[pd]
+            found = an.find_offsets(outdir, vdiv, off, sg.load_capture, exclude=run.folder)
+            got = {}
+            for kind in kinds:
+                f = next((x for x in found if x["kind"] == kind), None)
+                if f is None:
+                    self.log(f"  no earlier {kind} at {vdiv:g} V/div, offset {off:+.4g} V in "
+                             f"{outdir} - nothing borrowed (measure one, or Borrow... later)")
+                    continue
+                got[kind] = {k: f[k] for k in ("level", "sem", "n", "vdiv", "offset",
+                                                "source", "measured")}
+                self.log(f"  {kind}: reusing {f['level']*1e3:+.2f} mV from {f['source']} "
+                         f"({f['n']} shots, {f['measured']})")
+            if got:
+                run.manifest.setdefault("borrowed", {}).update(got)
+                run.save()
+            return got
+        self.worker(go, done=lambda _g: then())
+
+    def do_borrow_dialog(self):
+        """Pick a dark/background from another scan at the shown scan's PD
+        V/div and offset, for the shown scan (written to its manifest)."""
+        if not self.result:
+            self.log("Load a scan first.")
+            return
+        d = self.result["d"]
+        st = [s for s in d.steps if s["kind"] == "scan"]
+        if not st:
+            return
+        v, off = an._scale_of(d, st[0])[:2]
+        found = an.find_offsets(os.path.dirname(d.folder), v, off, self.load_sg().load_capture,
+                                exclude=d.folder)
+        top = tk.Toplevel(self.root)
+        top.title("Borrow a dark or background")
+        top.transient(self.root)
+        ttk.Label(top, wraplength=520, justify="left", text=(
+            f"Measurements in other scans at the PD's {v:g} V/div and {off:+.4g} V offset "
+            f"(the scope's offset error depends on both), newest first. The one picked "
+            f"is written into {d.name}'s manifest and subtracted (a background is used "
+            f"in preference to a dark).")).pack(padx=8, pady=6)
+        lb = tk.Listbox(top, width=90, height=min(12, max(3, len(found))))
+        for f in found:
+            lb.insert("end", f"{f['kind']:10s} {f['level']*1e3:+8.2f} mV  {f['n']:3d} shots  "
+                             f"{f['measured']}  {f['source']}")
+        lb.pack(padx=8)
+        if not found:
+            lb.insert("end", "(none at these settings)")
+
+        def use():
+            sel = lb.curselection()
+            if not sel or not found:
+                return
+            f = found[sel[0]]
+            self._write_borrowed(d.folder, {f["kind"]: {k: f[k] for k in (
+                "level", "sem", "n", "vdiv", "offset", "source", "measured")}})
+            top.destroy()
+
+        def clear():
+            self._write_borrowed(d.folder, None)
+            top.destroy()
+        r = ttk.Frame(top)
+        r.pack(pady=6)
+        ttk.Button(r, text="Use selected", command=use).pack(side="left", padx=4)
+        ttk.Button(r, text="Remove borrowed", command=clear).pack(side="left", padx=4)
+        ttk.Button(r, text="Cancel", command=top.destroy).pack(side="left", padx=4)
+
+    def _write_borrowed(self, folder, entries):
+        name = os.path.basename(folder)
+        mp = os.path.join(folder, f"{name}_scan.json")
+        with open(mp, encoding="utf-8") as fh:
+            man = json.load(fh)
+        if entries is None:
+            man.pop("borrowed", None)
+            self.log(f"{name}: borrowed dark/background removed")
+        else:
+            man.setdefault("borrowed", {}).update(entries)
+            for k, e in entries.items():
+                self.log(f"{name}: {k} {e['level']*1e3:+.2f} mV borrowed from {e['source']}")
+        tmp = mp + ".part"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(man, fh, indent=1)
+        cfgmod.replace_retrying(tmp, mp)
+        self.scan_cache.pop(os.path.normcase(os.path.abspath(folder)), None)
+        self.reanalyse()
+
+    def _opts(self):
+        """The analysis switches on the plot bar (read on the Tk thread)."""
+        return {"sub_dark": bool(self.sub_dark.get()), "gains": bool(self.gains_on.get()),
+                "lock": bool(self.lock_on.get())}
+
+    def show_corrections(self):
+        res = self.result
+        txt = res.get("corr", {}).get("text", "") if res else ""
+        self.corr_label.configure(text=("Corrections: " + txt) if txt else "")
+
+    # -- shots: single traces and averages ------------------------------------------
+    def build_shots_tab(self):
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="Shots")
+        side = ttk.Frame(frame)
+        side.pack(side="left", fill="y", padx=(4, 2), pady=4)
+        right = ttk.Frame(frame)
+        right.pack(side="left", fill="both", expand=True)
+        ttk.Label(side, text="Steps (ctrl/shift-click for several)").pack(anchor="w")
+        lf = ttk.Frame(side)
+        lf.pack(fill="y", expand=True)
+        self.shots_lb = tk.Listbox(lf, selectmode="extended", width=30, height=16,
+                                   exportselection=False, font=("Consolas", 8))
+        sb = ttk.Scrollbar(lf, command=self.shots_lb.yview)
+        self.shots_lb.configure(yscrollcommand=sb.set)
+        self.shots_lb.pack(side="left", fill="y", expand=True)
+        sb.pack(side="left", fill="y")
+        self.shots_lb.bind("<<ListboxSelect>>", lambda _e: self.redraw(self.fig_shots))
+        self._shots_keys = []
+        r = ttk.Frame(side)
+        r.pack(fill="x", pady=(4, 0))
+        ttk.Label(r, text="Channel").pack(side="left")
+        self.shots_role = tk.StringVar(value="PD")
+        self.shots_role_cb = ttk.Combobox(r, textvariable=self.shots_role, width=8,
+                                          state="readonly", values=("PD",))
+        self.shots_role_cb.pack(side="left", padx=4)
+        self.shots_role_cb.bind("<<ComboboxSelected>>", lambda _e: self.redraw(self.fig_shots))
+        self.sv_shots = {}
+        for key, text, val in (("single", "single shots (from the files)", True),
+                               ("avg", "average the fit uses", True),
+                               ("sem", "+-1 standard error band", False),
+                               ("env", "min-max over the shots shown", False),
+                               ("dropped", "dropped shots (dashed)", True),
+                               ("dark", "subtract dark / background", True),
+                               ("partner", "+ the analyzer 90 deg away", False)):
+            v = tk.BooleanVar(value=val)
+            ttk.Checkbutton(side, text=text, variable=v,
+                            command=lambda: self.redraw(self.fig_shots)).pack(anchor="w")
+            self.sv_shots[key] = v
+        r = ttk.Frame(side)
+        r.pack(fill="x", pady=(4, 0))
+        ttk.Label(r, text="Shots").pack(side="left")
+        self.shots_pick = tk.StringVar(value="all")
+        e = ttk.Entry(r, textvariable=self.shots_pick, width=10)
+        e.pack(side="left", padx=4)
+        e.bind("<Return>", lambda _e: self.redraw(self.fig_shots))
+        ttk.Label(r, text="(all, 1, 2-4)", foreground="#666").pack(side="left")
+        r = ttk.Frame(side)
+        r.pack(fill="x", pady=(2, 0))
+        ttk.Label(r, text="t from").pack(side="left")
+        self.shots_t0 = tk.StringVar()
+        self.shots_t1 = tk.StringVar()
+        for var in (self.shots_t0, self.shots_t1):
+            e = ttk.Entry(r, textvariable=var, width=7)
+            e.pack(side="left", padx=2)
+            e.bind("<Return>", lambda _e: self.redraw(self.fig_shots))
+            if var is self.shots_t0:
+                ttk.Label(r, text="to").pack(side="left")
+        ttk.Label(r, text="ms").pack(side="left")
+        r = ttk.Frame(side)
+        r.pack(fill="x", pady=(4, 0))
+        ttk.Button(r, text="Draw", command=lambda: self.redraw(self.fig_shots)).pack(side="left")
+        ttk.Button(r, text="Crossed at cursor", command=self.shots_crossed).pack(
+            side="left", padx=4)
+        ttk.Button(r, text="Whole record", command=self.shots_whole).pack(side="left")
+        self.shots_info = ttk.Label(side, text="", foreground="#666", wraplength=230,
+                                    justify="left")
+        self.shots_info.pack(anchor="w", pady=(4, 0))
+        fig = Figure(figsize=(7.0, 5.0), dpi=100, constrained_layout=True)
+        canvas = FigureCanvasTkAgg(fig, master=right)
+        toolbar = NavigationToolbar2Tk(canvas, right)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, side, frame
+        canvas.mpl_connect("button_press_event", lambda ev: self._shots_click(ev))
+        self.plot_tabs[frame] = (fig, self.draw_shots)
+        self.plot_dirty.add(frame)
+        self.fig_shots = fig
+        self._shot_cache = {}
+        self._shots_drawing = False
+
+    def _step_label(self, s):
+        k = s["kind"]
+        n = s.get("nb", 0)
+        rej = s.get("rejected", 0)
+        tail = f"{n:2d} shots" + (f", {rej} dropped" if rej else "")
+        if k in ("dark", "background"):
+            return f"{k:10s}        {tail}"
+        a = s.get("landed", s.get("target", 0.0))
+        if k == "ref":
+            return f"ref #{s.get('ref', 0):<4d} {a:7.2f}  {tail}"
+        if k == "null":
+            return f"null w{s.get('window', 0) + 1:<4d} {a:7.2f}  {tail}"
+        return f"scan       {a:7.2f}  {tail}"
+
+    @staticmethod
+    def _step_short(s):
+        k = s["kind"]
+        if k in ("dark", "background"):
+            return k
+        a = s.get("landed", s.get("target", 0.0))
+        if k == "ref":
+            return f"ref #{s.get('ref', 0)} ({a:.1f} deg)"
+        if k == "null":
+            return f"null w{s.get('window', 0) + 1} {a:.2f} deg"
+        return f"analyzer {a:.1f} deg"
+
+    def _shots_fill(self, d):
+        keys = [(s["kind"], s.get("ref"), s.get("window"), round(s.get("target", 0.0), 4))
+                for s in d.steps]
+        if keys == self._shots_keys:
+            return
+        sel = {self._shots_keys[i] for i in self.shots_lb.curselection()
+               if i < len(self._shots_keys)}
+        self.shots_lb.delete(0, "end")
+        for s in d.steps:
+            self.shots_lb.insert("end", self._step_label(s))
+        self._shots_keys = keys
+        idx = [i for i, k in enumerate(keys) if k in sel]
+        if not idx:
+            # a sensible start: the first scan angle
+            idx = [next((i for i, s in enumerate(d.steps) if s["kind"] == "scan"), 0)]
+        for i in idx:
+            self.shots_lb.selection_set(i)
+        roles = sorted(d.roles, key=lambda r: (r != "PD", r))
+        self.shots_role_cb["values"] = roles
+        if self.shots_role.get() not in roles:
+            self.shots_role.set("PD")
+
+    def _shots_of(self, d, s):
+        key = (d.folder, tuple(s.get("files", [])))
+        hit = self._shot_cache.get(key)
+        if hit is None:
+            hit = an.step_shots(d, s, self.load_sg().load_capture,
+                                trim=int(self.cfg["analysis"]["trim"]))
+            self._shot_cache[key] = hit
+            while len(self._shot_cache) > 8:
+                self._shot_cache.pop(next(iter(self._shot_cache)))
+        return hit
+
+    @staticmethod
+    def _pick_shots(text, n):
+        text = (text or "").strip().lower()
+        if not text or text == "all":
+            return list(range(n))
+        out = []
+        for part in text.replace(";", ",").split(","):
+            part = part.strip()
+            if "-" in part:
+                a, b = part.split("-", 1)
+                out += list(range(int(a) - 1, int(b)))
+            elif part:
+                out.append(int(part) - 1)
+        return [i for i in out if 0 <= i < n]
+
+    @staticmethod
+    def _decimate(t, y, n=3000):
+        """Min and max of each bin, so a dip survives the thinning."""
+        if len(t) <= 2 * n:
+            return t, y
+        k = len(t) // n
+        m = (len(t) // k) * k
+        tb = t[:m].reshape(-1, k)
+        yb = y[:m].reshape(-1, k)
+        lo, hi = yb.min(axis=1), yb.max(axis=1)
+        tt = np.repeat(tb.mean(axis=1), 2)
+        yy = np.empty(2 * len(lo))
+        yy[0::2], yy[1::2] = lo, hi
+        return tt, yy
+
+    def _shots_range(self, d):
+        try:
+            t0 = float(self.shots_t0.get()) * 1e-3 if self.shots_t0.get().strip() else d.t[0]
+            t1 = float(self.shots_t1.get()) * 1e-3 if self.shots_t1.get().strip() else d.t[-1]
+        except ValueError:
+            t0, t1 = d.t[0], d.t[-1]
+        return min(t0, t1), max(t0, t1)
+
+    def draw_shots(self, fig):
+        res = self.result
+        d = res["d"]
+        self._shots_fill(d)
+        sel = list(self.shots_lb.curselection())
+        role = self.shots_role.get() or "PD"
+        o = {k: v.get() for k, v in self.sv_shots.items()}
+        steps = [d.steps[i] for i in sel if i < len(d.steps)]
+        if o["partner"]:
+            extra = []
+            for s in steps:
+                if s["kind"] in ("scan", "ref") and "landed" in s:
+                    want = (s["landed"] + 90) % 180
+                    p = min((x for x in d.steps if x["kind"] == "scan" and "landed" in x),
+                            key=lambda x: abs((x["landed"] - want + 90) % 180 - 90), default=None)
+                    if p is not None and p not in steps and p not in extra:
+                        extra.append(p)
+            steps += extra
+        ax = fig.add_subplot(111)
+        if not steps:
+            ax.text(0.5, 0.5, "Pick steps in the list", ha="center", transform=ax.transAxes,
+                    color="#888")
+            ax.set_axis_off()
+            return
+        t0, t1 = self._shots_range(d)
+        cmap = matplotlib.colormaps[ANGLE_CMAP]
+        scale = 1e3
+        n_drawn, info = 0, []
+        self._shots_drawing = True
+        for s in steps:
+            if s["kind"] in ("dark", "background"):
+                col = "k"
+            else:
+                col = cmap((s.get("landed", s.get("target", 0)) % 360) / 360)
+            lab = self._step_short(s)
+            sub = 0.0
+            if o["dark"] and role == "PD":
+                sub = an.dark_level(d, an._scale_of(d, s)[0])[0]
+            if o["single"] or o["env"] or o["dropped"]:
+                t, sh, files = self._shots_of(d, s)
+                y_all = sh.get(role)
+                if y_all is not None and len(y_all):
+                    m = (t >= t0) & (t <= t1)
+                    pick = self._pick_shots(self.shots_pick.get(), len(y_all))
+                    kept = s.get("kept") if role == "PD" else None
+                    shown = []
+                    for i in pick:
+                        dropped = kept is not None and i < len(kept) and not kept[i]
+                        if dropped and not o["dropped"]:
+                            continue
+                        y = y_all[i][m] - sub
+                        shown.append(y)
+                        if o["single"] or dropped:
+                            tt, yy = self._decimate(t[m], y)
+                            ax.plot(tt * 1e3, yy * scale, lw=0.5,
+                                    color="#d62728" if dropped else col,
+                                    ls="--" if dropped else "-",
+                                    alpha=0.9 if dropped else 0.55,
+                                    label=(f"{lab}: shot {i + 1} (dropped)" if dropped
+                                           else (f"{lab}: shots" if not n_drawn or i == pick[0]
+                                                 else None)))
+                            n_drawn += 1
+                    if o["env"] and shown:
+                        A = np.array(shown)
+                        tt, lo = self._decimate(t[m], A.min(axis=0))
+                        _, hi = self._decimate(t[m], A.max(axis=0))
+                        ax.fill_between(tt * 1e3, lo * scale, hi * scale, color=col, alpha=0.15,
+                                        lw=0)
+                    info.append(f"{lab}: {len(y_all)} shots ({len(files)} files)")
+            if o["avg"] and role in s.get("v", {}):
+                m = (d.t >= t0) & (d.t <= t1)
+                y = s["v"][role][m] - sub
+                tt, yy = self._decimate(d.t[m], y)
+                ax.plot(tt * 1e3, yy * scale, lw=1.4, color=col,
+                        label=f"{lab}: average of {s.get('nb', 0)} kept")
+                if o["sem"]:
+                    e = s["sem"][role][m]
+                    tt, lo = self._decimate(d.t[m], y - e)
+                    _, hi = self._decimate(d.t[m], y + e)
+                    ax.fill_between(tt * 1e3, lo * scale, hi * scale, color=col, alpha=0.25, lw=0)
+        if self.cursor_t is not None and t0 <= self.cursor_t <= t1:
+            ax.axvline(self.cursor_t * 1e3, color="0.4", lw=0.6, ls=":")
+        ax.set_xlim(t0 * 1e3, t1 * 1e3)
+        ax.set_xlabel("time from trigger (ms)")
+        ax.set_ylabel(f"{role} (mV)" + (" - dark/background" if o["dark"] and role == "PD" else ""))
+        ax.set_title(f"{d.name}: single shots from the files; averages as the fit "
+                     f"uses them", fontsize=8)
+        ax.grid(alpha=0.3)
+        h, l = ax.get_legend_handles_labels()
+        if l:
+            ax.legend(fontsize=7, loc="best", ncol=1 + len(l) // 8)
+        self.shots_info.configure(text="\n".join(info[:6]) + (
+            "\nZoom with the toolbar; the view re-reads full resolution." if info else ""))
+        ax.callbacks.connect("xlim_changed", self._shots_zoomed)
+        self._shots_drawing = False
+
+    def _shots_zoomed(self, ax):
+        if self._shots_drawing:
+            return
+        a, b = ax.get_xlim()
+        self.shots_t0.set(f"{a:.4f}")
+        self.shots_t1.set(f"{b:.4f}")
+        if getattr(self, "_shots_after", None):
+            self.root.after_cancel(self._shots_after)
+        self._shots_after = self.root.after(150, lambda: self.redraw(self.fig_shots))
+
+    def _shots_click(self, ev):
+        if ev.inaxes is None or ev.xdata is None or self.fig_shots._toolbar.mode:
+            return
+        self.cursor_t = ev.xdata * 1e-3
+        self.cursor_var.set(f"{ev.xdata:.3f}")
+
+    def shots_whole(self):
+        self.shots_t0.set("")
+        self.shots_t1.set("")
+        self.redraw(self.fig_shots)
+
+    def shots_crossed(self):
+        """Select the scan angle closest to crossed at the cursor time, and
+        the one 90 deg from it, around the cursor: the view a direct ER
+        reading is made from."""
+        res = self.result
+        if not res or res.get("pol") is None or self.cursor_t is None:
+            self.log("Set a cursor time (click a plot) on a scan with a fit first.")
+            return
+        pol, d = res["pol"], res["d"]
+        j = int(np.argmin(np.abs(d.t - self.cursor_t)))
+        want = (pol["psi"][j] + 90) % 180
+        idx = [i for i, s in enumerate(d.steps) if s["kind"] == "scan" and "landed" in s]
+        best = min(idx, key=lambda i: abs((d.steps[i]["landed"] - want + 90) % 180 - 90))
+        self.shots_lb.selection_clear(0, "end")
+        self.shots_lb.selection_set(best)
+        self.shots_lb.see(best)
+        self.sv_shots["partner"].set(True)
+        self.shots_t0.set(f"{(self.cursor_t - 0.4e-3) * 1e3:.4f}")
+        self.shots_t1.set(f"{(self.cursor_t + 0.4e-3) * 1e3:.4f}")
+        self.log(f"Crossed at {self.cursor_t*1e3:.3f} ms: azimuth {pol['psi'][j]:.2f} deg, "
+                 f"nearest crossed analyzer {d.steps[best]['landed']:.2f} deg")
+        self.nb.select(self.fig_shots._frame)
+        self.redraw(self.fig_shots)
+
+    # -- build: how the angles add up -------------------------------------------------
+    def build_build_tab(self):
+        self.fig_build = self._fig_tab("Build", self.draw_build)
+        ctl = self.fig_build._ctl
+        ttk.Label(ctl, text="time").pack(side="left")
+        self.build_t = tk.DoubleVar(value=0.0)
+        self.build_scale = ttk.Scale(ctl, from_=0, to=1, orient="horizontal", length=360,
+                                     variable=self.build_t, command=lambda _v: self._build_move())
+        self.build_scale.pack(side="left", padx=4)
+        self.build_lbl = ttk.Label(ctl, text="", width=12)
+        self.build_lbl.pack(side="left")
+        self.build_raw = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ctl, text="show before corrections", variable=self.build_raw,
+                        command=lambda: self._build_move()).pack(side="left", padx=8)
+        ttk.Label(ctl, foreground="#666", text="drag: every angle's average (top) gives one "
+                  "point per time; the points fit to a0 + B cos 2(theta - psi)").pack(side="left")
+        self._build = None
+
+    def draw_build(self, fig):
+        res = self.result
+        pol, d = res["pol"], res["d"]
+        t = d.t
+        gs = fig.add_gridspec(2, 2, height_ratios=[1.1, 1])
+        ax_t = fig.add_subplot(gs[0, :])
+        ax_m = fig.add_subplot(gs[1, 0])
+        ax_r = fig.add_subplot(gs[1, 1], sharex=ax_t)
+        cmap = matplotlib.colormaps[ANGLE_CMAP]
+        for th, y in zip(pol["theta"], pol["I"]):
+            tt, yy = self._decimate(t, y, 2000)
+            ax_t.plot(tt * 1e3, yy, lw=0.5, color=cmap((th % 360) / 360))
+        ax_t.set_ylabel("PD, corrected (V)")
+        ax_t.set_title(f"{d.name}: the {pol['n_angles']} analyzer angles' averaged traces, "
+                       f"as fitted", fontsize=9)
+        ax_t.grid(alpha=0.3)
+        vl_t = ax_t.axvline(0, color="k", lw=0.8)
+        tt, rr = self._decimate(t, pol["rotation"], 2000)
+        ax_r.plot(tt * 1e3, rr, lw=0.8, color="#1f77b4")
+        mk, = ax_r.plot([], [], "o", color="#d62728", ms=6)
+        vl_r = ax_r.axvline(0, color="k", lw=0.6)
+        ax_r.set_xlabel("time from trigger (ms)")
+        ax_r.set_ylabel("rotation from rest (deg)")
+        ax_r.grid(alpha=0.3)
+        g = np.linspace(-5, 185, 381)
+        corr, = ax_m.plot([], [], "o", ms=5, color="#1f77b4", label="as fitted (corrected)")
+        raw, = ax_m.plot([], [], "o", ms=5, mfc="none", color="0.5", label="raw step average")
+        fitl, = ax_m.plot([], [], color="k", lw=0.9, label="a0 + B cos 2(theta - psi)")
+        vmax = ax_m.axvline(0, color="#2ca02c", lw=0.8, ls="--", label="psi (max)")
+        vmin = ax_m.axvline(0, color="#9467bd", lw=0.8, ls=":", label="psi + 90 (null)")
+        txt = ax_m.set_title("", fontsize=7, family="monospace", loc="left")
+        ax_m.set_xlim(-5, 185)
+        ax_m.set_xlabel("analyzer angle (deg, mod 180)")
+        ax_m.set_ylabel("PD (V)")
+        ax_m.legend(fontsize=6, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=3,
+                    frameon=False)
+        ax_m.grid(alpha=0.3)
+        self._build = dict(fig=fig, ax_m=ax_m, ax_r=ax_r, vl_t=vl_t, vl_r=vl_r, mk=mk,
+                           corr=corr, raw=raw, fitl=fitl, vmax=vmax, vmin=vmin, txt=txt,
+                           g=g, res=res)
+        self.build_scale.configure(from_=t[0] * 1e3, to=t[-1] * 1e3)
+        if self.cursor_t is not None:
+            self.build_t.set(self.cursor_t * 1e3)
+        elif not (t[0] * 1e3 <= self.build_t.get() <= t[-1] * 1e3):
+            self.build_t.set(t[len(t) // 3] * 1e3)
+        self._build_move(draw=False)
+
+    def _build_move(self, draw=True):
+        b = self._build
+        if not b or b["res"] is not self.result or self.result.get("pol") is None:
+            return
+        pol, d = self.result["pol"], self.result["d"]
+        t = d.t
+        j = int(np.argmin(np.abs(t - self.build_t.get() * 1e-3)))
+        tj = t[j] * 1e3
+        self.build_lbl.configure(text=f"{tj:8.3f} ms")
+        th = np.asarray(pol["theta"]) % 180
+        y = pol["I"][:, j]
+        b["corr"].set_data(th, y)
+        if self.build_raw.get():
+            b["raw"].set_data(th, [s["v"]["PD"][j] for s in pol["steps"]])
+        else:
+            b["raw"].set_data([], [])
+        gr = np.deg2rad(b["g"])
+        model = pol["a0"][j] + pol["c2"][j] * np.cos(2 * gr) + pol["s2"][j] * np.sin(2 * gr)
+        b["fitl"].set_data(b["g"], model)
+        psi = pol["psi"][j] % 180
+        b["vmax"].set_xdata([psi, psi])
+        b["vmin"].set_xdata([(psi + 90) % 180] * 2)
+        ys = np.r_[y, model]
+        pad = 0.05 * (ys.max() - ys.min() + 1e-6)
+        b["ax_m"].set_ylim(ys.min() - pad, ys.max() + pad)
+        b["txt"].set_text(f"t = {tj:.3f} ms  psi {pol['psi'][j]:+.3f} deg  rotation "
+                          f"{pol['rotation'][j]:+.2f} deg\nImax {pol['imax'][j]:.4f} V  "
+                          f"Imin {pol['imin'][j]*1e3:.2f} mV  ER_fit {pol['er'][j]:.0f}")
+        for vl in (b["vl_t"], b["vl_r"]):
+            vl.set_xdata([tj, tj])
+        b["mk"].set_data([tj], [pol["rotation"][j]])
+        if draw:
+            b["fig"]._canvas.draw_idle()
+
+    # -- corrections up front -------------------------------------------------------
+    def draw_corrections(self, fig):
+        res = self.result
+        d, pol = res["d"], res["pol"]
+        cs = res.get("corr") or an.corrections_summary(d, pol)
+        ax = fig.add_subplot(221)
+        t = d.t * 1e3
+        lv = an.offset_levels(d, an._pd_vdiv(d, "scan"))
+        for kind, col in (("dark", "k"), ("background", "#ff7f0e")):
+            e = lv.get(kind)
+            if not e:
+                continue
+            if e.get("step") is not None:
+                tt, yy = self._decimate(d.t, e["step"]["v"]["PD"], 2000)
+                ax.plot(tt * 1e3, yy * 1e3, lw=0.6, color=col, alpha=0.7)
+            ax.axhline(e["level"] * 1e3, color=col, lw=1.0, ls="--",
+                       label=f"{kind}: {e['level']*1e3:+.2f} mV ({e['source']}, {e['what']})")
+        ax.set_xlabel("time (ms)")
+        ax.set_ylabel("PD (mV)")
+        k = cs.get("subtracted_kind")
+        ax.set_title(f"Subtracted from every PD trace: "
+                     + (f"{k} {cs['subtracted']*1e3:+.2f} mV" if k else "nothing"), fontsize=9)
+        if ax.get_legend_handles_labels()[1]:
+            ax.legend(fontsize=6, loc="best")
+        ax.grid(alpha=0.3)
+        ax = fig.add_subplot(222)
+        if pol is not None and len(pol.get("ref_levels", [])) >= 2:
+            c = np.asarray(pol["ref_clocks"])
+            L = np.asarray(pol["ref_levels"])
+            c0 = c.min()
+            ax.plot((c - c0) / 60, (L / L.mean() - 1) * 100, "o-", ms=4)
+            ax.set_xlabel("minutes into the scan")
+            ax.set_ylabel("reference level - mean (%)")
+            ax.set_title("Intensity drift from the reference returns"
+                         + ("" if self.drift_on.get() else " (NOT applied)"), fontsize=9)
+        else:
+            ax.text(0.5, 0.5, "fewer than 2 reference returns: no drift correction",
+                    ha="center", transform=ax.transAxes, color="#888")
+        ax.grid(alpha=0.3)
+        ax = fig.add_subplot(223)
+        if pol is not None and pol.get("angle_gain") is not None:
+            g = pol["angle_gain"]
+            o = np.argsort(np.asarray(pol["theta"]) % 360)
+            ax.plot(np.asarray(pol["theta"])[o] % 360, (g[o] - 1) * 100, "o-", ms=4)
+            ax.set_title("Per-angle transmission, divided out", fontsize=9)
+        else:
+            ax.text(0.5, 0.5, "per-angle transmission not fitted (off, or < 8 angles)",
+                    ha="center", transform=ax.transAxes, color="#888")
+        ax.set_xlabel("analyzer angle (deg)")
+        ax.set_ylabel("transmission - mean (%)")
+        ax.grid(alpha=0.3)
+        ax = fig.add_subplot(224)
+        st = [s for s in d.steps if s["kind"] not in an.OFFSET_KINDS]
+        x = np.arange(len(st))
+        kept = [s.get("nb", 0) for s in st]
+        drop = [s.get("rejected", 0) for s in st]
+        ax.bar(x, kept, color="#1f77b4", label="kept")
+        ax.bar(x, drop, bottom=kept, color="#d62728", label="dropped (lock missed)")
+        off = [i for i, s in enumerate(st)
+               if any(np.any(v) for v in s.get("offscreen", {}).values())]
+        if off:
+            ax.plot(off, [kept[i] + drop[i] + 0.5 for i in off], "v", color="k",
+                    label="samples off screen")
+        ax.set_xlabel("step, in measuring order")
+        ax.set_ylabel("shots")
+        ax.set_title(f"{cs['dropped'][0]} of {cs['dropped'][1]} shots dropped", fontsize=9)
+        ax.legend(fontsize=6)
+        ax.grid(alpha=0.3, axis="y")
+
+    # -- find the min / max transmission angle --------------------------------------
+    def build_find(self, f):
+        self.fv = {}
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        ttk.Label(rr, text="Find").pack(side="left")
+        self.find_kind = tk.StringVar(value="min")
+        ttk.Combobox(rr, textvariable=self.find_kind, values=("min", "max"), width=5,
+                     state="readonly").pack(side="left", padx=4)
+        ttk.Label(rr, text="transmission in window (ms)").pack(side="left")
+        self.fv["window"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.fv["window"], width=12).pack(side="left", padx=4)
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        self.find_bias_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rr, text="hold with the AWG at", variable=self.find_bias_on).pack(side="left")
+        self.fv["bias"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.fv["bias"], width=6).pack(side="left", padx=2)
+        ttk.Label(rr, text="deg").pack(side="left")
+        for label, key, w in (("+-deg", "half", 4), ("points", "points", 3), ("shots", "shots", 3)):
+            ttk.Label(rr, text=label).pack(side="left", padx=(8, 2))
+            self.fv[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.fv[key], width=w).pack(side="left")
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=(3, 1))
+        self._btn(rr, "Find and go there", self.do_find_angle)
+        self.find_zero_btn = ttk.Button(rr, text="Make it analyzer 0", state="disabled",
+                                        command=self.do_find_zero)
+        self.find_zero_btn.pack(side="left", padx=6)
+        self.find_lbl = ttk.Label(f, text="", foreground="#060", wraplength=330)
+        self.find_lbl.pack(anchor="w", padx=6)
+        ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
+            "The light as it is in a window of the record - the rest before the ramp "
+            "(e.g. -10:-0.5), a hold of the sequence (from the shown scan's segments) - "
+            "or, ticked, held by the AWG at a bias (plateau window, like Bias points). "
+            "4 angles give the azimuth; then the analyzer steps +-deg around the "
+            "crossed (min, at the most sensitive V/div that holds it) or the "
+            "aligned (max) position, the dip is fitted and the analyzer is left "
+            "there. 'Make it analyzer 0' sets the zero so crossed reads 0 deg - the "
+            "campaign's convention at rest.")).pack(anchor="w", padx=6, pady=(2, 4))
+
+    def do_find_angle(self):
+        if not self.need():
+            return
+        c = self.gather()
+        self.save_settings()
+        fcfg = c["find"]
+        roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
+        kind = self.find_kind.get()
+        try:
+            win = None
+            txt = str(fcfg.get("window", "")).strip()
+            if txt:
+                a, b = (float(x) * 1e-3 for x in txt.split(":"))
+                win = (min(a, b), max(a, b))
+            bias_deg = float(fcfg["bias"]) if self.find_bias_on.get() else None
+        except ValueError:
+            self.log("Find: window as from:to in ms (e.g. -10:-0.5), bias in deg")
+            return
+        plan = {"shots": int(fcfg.get("shots") or 8)}
+        sim_mode = self.bench is not None
+
+        def go():
+            from . import bias as biasmod
+            awg = eom = ib = None
+            if bias_deg is not None:
+                if sim_mode:
+                    awg = sim.FakeAWG(self.bench)
+                else:
+                    eom = hw.load_eomilc(c["eomilc_path"])
+                    mod = hw.load_module(c["awg_path"], "bk4063b")
+                    import ilc_bench as ib
+                    ib._AWGMOD = mod
+                    awg = mod.BK4063B(connect=False,
+                                      resource_manager=getattr(self.link.scope, "rm", None))
+                    self.log(f"AWG: {awg.connect()}")
+            try:
+                return biasmod.find_extremum(
+                    self.link, self.rot, roles, kind, window_s=win, bias_deg=bias_deg,
+                    awg=awg, plan=plan,
+                    half_deg=float(fcfg["half"]) if str(fcfg.get("half", "")).strip() else None,
+                    points=int(fcfg["points"]) if str(fcfg.get("points", "")).strip() else None,
+                    log=self.log, cancelled=self.stop_flag.is_set, ask=self.ask_main,
+                    eomilc=eom, ilc_bench=ib)
+            finally:
+                if awg is not None and not sim_mode:
+                    awg.close()
+
+        def done(out):
+            self.find_result = out
+            self.find_lbl.configure(
+                text=f"{out['kind']} at analyzer {out['angle']:.3f} +- "
+                     f"{out['sig']*1e3:.0f} mdeg ({out['level']*1e3:.2f} mV raw); "
+                     f"the analyzer is there now")
+            self.find_zero_btn.configure(state="normal" if out["kind"] == "min" else "disabled")
+            self.show_pos(out["angle"])
+            self.plot_dirty.add(self.fig_find._frame)
+            self.nb.select(self.fig_find._frame)
+            self.draw_visible()
+        self.worker(go, done=done)
+
+    def do_find_zero(self):
+        out = getattr(self, "find_result", None)
+        if not out or out["kind"] != "min" or self.rot is None:
+            return
+        z = (self.rot.zero + out["angle"]) % 360.0
+        if not messagebox.askyesno(
+                "Analyzer zero", f"Crossed was found at analyzer {out['angle']:.3f} deg. "
+                f"Set zero = mount {z:.3f} deg so that it reads 0?", parent=self.root):
+            return
+        self.zero_var.set(f"{z:.3f}")
+        self.do_apply_zero()
+        self.show_pos(self.rot.position())
+
+    def draw_find(self, fig):
+        out = getattr(self, "find_result", None)
+        ax = fig.add_subplot(111)
+        if not out:
+            ax.text(0.5, 0.5, "Nothing found yet - Find angle tab", ha="center",
+                    transform=ax.transAxes, color="#888")
+            ax.set_axis_off()
+            return
+        th = np.array(out["theta"])
+        I = np.array(out["I"])
+        ax.errorbar(th, I * 1e3, np.array(out["sem"]) * 1e3, fmt="o", ms=4)
+        f_ = out["fit"]
+        xx = np.linspace(th.min(), th.max(), 300)
+        model = f_["imin"] + f_["k"] * np.sin(np.deg2rad(xx - f_["theta_n"])) ** 2
+        ax.plot(xx, (model if out["kind"] == "min" else -model) * 1e3, color="k", lw=0.9)
+        ax.axvline(out["angle"] if abs(out["angle"] - th.mean()) < 90 else out["angle"] + 180,
+                   color="#d62728", lw=0.8, ls="--")
+        ax.set_xlabel("analyzer angle (deg)")
+        ax.set_ylabel(f"PD (mV, raw, at {out['vdiv']*1e3:g} mV/div)")
+        w = out.get("window")
+        where = (f"held at {out['bias']:g} deg by the AWG" if out.get("bias") is not None
+                 else ("whole record" if not w else f"window {w[0]*1e3:.2f}..{w[1]*1e3:.2f} ms"))
+        ax.set_title(f"{out['kind']} transmission at {out['angle']:.3f} +- "
+                     f"{out['sig']*1e3:.0f} mdeg ({where})", fontsize=9)
+        ax.grid(alpha=0.3)
+
     # -- ILC target ----------------------------------------------------------------
     def do_ilc_compare(self):
         if not self.result:
@@ -836,6 +1650,12 @@ class App:
         s = c["scan"]
         for k, v in self.sv.items():
             v.set(str(s.get(k, "")))
+        self.dark_mode.set(s.get("dark_mode", "none"))
+        self.bg_mode.set(s.get("bg_mode", "measure"))
+        for k, v in self.fv.items():
+            v.set(str(c["find"].get(k, "")))
+        self.find_kind.set(c["find"].get("kind", "min"))
+        self.find_bias_on.set(bool(c["find"].get("bias_on", False)))
         self.order.set(s["order"])
         self.mode.set(s["mode"])
         self.preset.set(c["preset"])
@@ -871,6 +1691,11 @@ class App:
             except ValueError:
                 pass
         s["order"], s["mode"] = self.order.get(), self.mode.get()
+        s["dark_mode"], s["bg_mode"] = self.dark_mode.get(), self.bg_mode.get()
+        fd = c["find"]
+        for k, v in self.fv.items():
+            fd[k] = v.get().strip()
+        fd["kind"], fd["bias_on"] = self.find_kind.get(), bool(self.find_bias_on.get())
         c["preset"] = self.preset.get()
         c["outdir"] = self.outdir.get().strip()
         c["scan_name"] = self.scan_name.get().strip()
@@ -1406,56 +2231,49 @@ class App:
         c = self.cfg
         run = self._new_run(c["scan_name"])
         if run.exists():
-            ans = messagebox.askyesnocancel(
-                "Scan exists", f"{run.name} already exists in this folder.\n\n"
-                "Yes = resume it (measure the steps not done)\nNo = pick a new "
-                "name\nCancel = do nothing", parent=self.root)
-            if not ans:
+            man = run.load()
+            new = scanmod.next_free_name(c["outdir"], run.name)
+            unfinished = [x for x in man["steps"] if x.get("status") != "done"]
+            ans = False
+            if unfinished:
+                ans = messagebox.askyesnocancel(
+                    "Scan exists", f"{run.name} already exists with {len(unfinished)} "
+                    f"step(s) not measured.\n\nYes = resume it\nNo = new scan "
+                    f"{new}\nCancel = do nothing", parent=self.root)
+                if ans is None:
+                    return
+            if ans:
+                self.run = run
+                self.worker(lambda: self._run_scan(run), done=self.scan_done)
                 return
-            run.load()
-            self.run = run
-            self.worker(lambda: self._run_scan(run), done=self.scan_done)
-            return
+            self.log(f"{run.name} exists - this scan is {new}")
+            self.scan_name.set(new)
+            c["scan_name"] = new
+            run = self._new_run(new)
         s = c["scan"]
         angles = scanmod.ordered(scanmod.angle_list(s["start"], s["stop"], s["step"]),
                                  s["order"])
         steps = scanmod.build_steps(angles, int(s["ref_every"]), s["ref_angle"])
-        if self.with_dark.get():
-            steps = [{"kind": "dark", "target": 0.0}] + steps
-        plan = dict(s, preset=c["preset"], software=f"rampol {__version__}")
+        dm, bm = self.dark_mode.get(), self.bg_mode.get()
+        pre = [k for k, m in (("dark", dm), ("background", bm)) if m == "measure"]
+        steps = [{"kind": k, "target": 0.0} for k in pre] + steps
+        plan = dict(s, preset=c["preset"], software=f"rampol {__version__}",
+                    dark_mode=dm, bg_mode=bm)
         run.new(plan, steps, extra={"zero_deg": float(c["ell_zero_deg"]),
                                     "precheck": getattr(self, "last_check", None)})
         self.run = run
         self.log(f"Scan {run.name}: {len(angles)} angles, {len(steps)} steps -> {run.folder}")
-        if self.with_dark.get():
-            self.dark_then(run, lambda: self.worker(lambda: self._run_scan(run),
-                                                    done=self.scan_done))
-        else:
+        reuse = [k for k, m in (("dark", dm), ("background", bm)) if m == "reuse latest"]
+
+        def start():
             self.worker(lambda: self._run_scan(run), done=self.scan_done)
 
-    def dark_then(self, run, after, vdiv_note=""):
-        """Ask for the beam to be blocked, take the dark steps, ask for it to be
-        unblocked, then call after()."""
-        if not messagebox.askokcancel(
-                "Dark capture", f"Block the beam before the analyzer{vdiv_note}, "
-                "then press OK.", parent=self.root):
-            self.log("Dark skipped - the analysis will use 0 V for the dark level.")
-            for s in run.manifest["steps"]:
-                if s["kind"] == "dark" and s["status"] != "done":
-                    s["status"] = "skipped"
-            run.save()
-            after()
-            return
-        if self.bench is not None:
-            self.bench._imax_saved, self.bench.imax = self.bench.imax, 0.0
-
-        def unblock(_):
-            if self.bench is not None:
-                self.bench.imax = self.bench._imax_saved
-            messagebox.showinfo("Dark capture", "Dark done. Unblock the beam, then press OK.",
-                                parent=self.root)
-            after()
-        self.worker(lambda: run.run(kinds={"dark"}), done=unblock)
+        def after_offsets():
+            if reuse:
+                self.borrow_latest(run, reuse, start)
+            else:
+                start()
+        self.offsets_then(run, pre, after_offsets)
 
     def scan_done(self, n):
         self.log(f"Scan {self.run.name}: {n} steps measured.")
@@ -1503,11 +2321,11 @@ class App:
         scale = {"ch": pd_ch, "vdiv": vdiv, "offset": 3.0 * vdiv}
         run = self._new_run(d.name)
         run.load()
-        n_dark = sum(1 for s in run.manifest["steps"] if s["kind"] == "dark"
+        n_dark = sum(1 for s in run.manifest["steps"] if s["kind"] in an.OFFSET_KINDS
                      and s.get("pd_scale", {}).get("vdiv") == vdiv)
         steps = []
         if not n_dark:
-            steps.append({"kind": "dark", "target": 0.0, "pd_scale": scale})
+            steps.append({"kind": "background", "target": 0.0, "pd_scale": scale})
         rs = c["refine"]
         for p in plans:
             for a in p["angles"]:
@@ -1520,7 +2338,7 @@ class App:
         self.log(f"Refine: {len(plans)} windows, {len(steps)} steps at PD {vdiv:g} V/div")
         go = lambda: self.worker(lambda: self._run_scan(run, {"null"}), done=self.scan_done)
         if not n_dark:
-            self.dark_then(run, go, vdiv_note=f" (dark at {vdiv:g} V/div)")
+            self.offsets_then(run, ["background"], go)
         else:
             go()
 
@@ -1555,15 +2373,19 @@ class App:
             self.show_scan.set(os.path.dirname(p))
             self.do_load_shown()
 
-    def analyse(self, path, correct_drift=True):
-        """Worker thread: everything it needs from the window is passed in."""
+    def analyse(self, path, correct_drift=True, opts=None):
+        """Worker thread: everything it needs from the window is passed in
+        (opts: the plot bar's Apply switches, read on the Tk thread)."""
         sg = self.load_sg()
         if sg is None:
             raise RuntimeError("Scope Grab is not loaded, so captures cannot be read")
         a = self.cfg["analysis"]
+        opts = opts or {"sub_dark": True, "gains": True, "lock": True}
         cache = self.scan_cache.setdefault(os.path.normcase(os.path.abspath(path)), {})
         d = an.load_scan(path, sg.load_capture, trim=int(a["trim"]),
-                         lock_tol=float(a.get("lock_tol", 0.0)), cache=cache)
+                         lock_tol=float(a.get("lock_tol", 0.0)) if opts["lock"] else 0.0,
+                         cache=cache)
+        d.subtract_dark = opts["sub_dark"]
         steps = d.manifest.get("steps", [])
         res = {"d": d, "path": path, "pol": None, "dips": [], "refine": [], "mon": None,
                "raw": an.scan_matrix(d, "scan", correct_drift),
@@ -1572,9 +2394,12 @@ class App:
                                 and x.get("files")),
                "n_total": sum(1 for x in steps if x.get("status") != "skipped")}
         try:
-            pol = an.polarization(d, correct_drift=correct_drift)
+            pol = an.polarization(d, correct_drift=correct_drift,
+                                  angle_gain=None if opts["gains"] else False)
         except ValueError:
+            res["corr"] = an.corrections_summary(d, None)
             return res                    # fewer than 3 angles so far: traces only
+        res["corr"] = an.corrections_summary(d, pol)
         res.update(pol=pol, dips=an.dip_er(pol, polarizer_er=a["polarizer_er"]),
                    refine=an.refine_result(d, pol, polarizer_er=a["polarizer_er"]),
                    mon=an.monitor_prediction(d, pol, a["deg_per_mon_v"]))
@@ -1590,6 +2415,7 @@ class App:
             return
         self.live_pending = None
         drift = bool(self.drift_on.get())
+        opts = self._opts()
         name = os.path.basename(folder)
         if name not in self.scan_box["values"]:
             self.refresh_scan_list()
@@ -1600,7 +2426,7 @@ class App:
 
         def bg():
             try:
-                res = self.analyse(folder, drift)
+                res = self.analyse(folder, drift, opts)
             except Exception as exc:
                 res = None
                 self.log(f"  live view: {exc}")
@@ -1611,6 +2437,7 @@ class App:
     def _live_done(self, res):
         if res is not None:
             self.result = res
+            self.show_corrections()
             n = res["pol"]["n_angles"] if res["pol"] else len(res["raw"][0])
             part = " + 1 in progress" if res.get("n_partial") else ""
             self.plot_status.configure(
@@ -1650,12 +2477,14 @@ class App:
             self.live_refresh(path)
             return
         drift = bool(self.drift_on.get())
+        opts = self._opts()
 
         def go():
-            return self.analyse(path, drift)
+            return self.analyse(path, drift, opts)
 
         def done(res):
             self.result = res
+            self.show_corrections()
             pol, d = res["pol"], res["d"]
             self.plot_status.configure(text=PLOT_HINT, foreground="#666")
             for n in d.notes:
@@ -1716,7 +2545,8 @@ class App:
             self.compare = res
             self.mark_dirty()
         drift = bool(self.drift_on.get())
-        self.worker(lambda: self.analyse(path, drift), done=done)
+        opts = self._opts()
+        self.worker(lambda: self.analyse(path, drift, opts), done=done)
 
     def do_clear_compare(self):
         self.compare = None
@@ -1839,8 +2669,8 @@ class App:
         for th, y in zip(pol["theta"], pol["I"]):
             ax.plot(t, y, lw=0.6, color=cmap((th % 360) / 360))
         for s in d.steps:
-            if s["kind"] == "dark" and "PD" in s["v"]:
-                ax.plot(t, s["v"]["PD"], lw=0.6, color="k", ls="--", label="dark")
+            if s["kind"] in an.OFFSET_KINDS and "PD" in s["v"]:
+                ax.plot(t, s["v"]["PD"], lw=0.6, color="k", ls="--", label=s["kind"])
         sm = matplotlib.cm.ScalarMappable(cmap=cmap, norm=matplotlib.colors.Normalize(0, 360))
         ax.set_ylabel("PD - dark, drift corrected (V)")
         ax.set_title(f"Analyzer photodiode at {pol['n_angles']} analyzer angles ({d.name})")

@@ -41,6 +41,9 @@ class ScanData:
         self.steps = []               # dicts: the manifest step + arrays
         self.roles = {}               # role -> ch
         self.notes = []
+        # what the analysis subtracts from the PD (see pd_offset): turn it off
+        # here to look at the light as the scope read it
+        self.subtract_dark = True
 
 
 def _role_columns(columns, channels):
@@ -180,12 +183,13 @@ def load_scan(path, load_capture, trim=10, lock_tol=0.0, cache=None):
     keep = {}
     if lock_tol > 0:
         levels = [np.median(red["pd"][:, pre[:red["pd"].shape[1]]].mean(axis=1))
-                  for s, red in loaded if red["pd"] is not None and s["kind"] != "dark"]
+                  for s, red in loaded if red["pd"] is not None
+                  and s["kind"] not in OFFSET_KINDS]
         top = max([abs(x) for x in levels] or [0.0])
         dropped = 0
         for i, (s, red) in enumerate(loaded):
             sh = red["pd"]
-            if sh is None or s["kind"] == "dark" or len(sh) < 4 or top <= 0:
+            if sh is None or s["kind"] in OFFSET_KINDS or len(sh) < 4 or top <= 0:
                 continue
             base = sh[:, pre[:sh.shape[1]]].mean(axis=1)
             ok = np.abs(base - np.median(base)) <= lock_tol * top
@@ -201,6 +205,9 @@ def load_scan(path, load_capture, trim=10, lock_tol=0.0, cache=None):
         step["partial"] = s.get("status") == "partial"
         ok = keep.get(i)
         step["rejected"] = 0 if ok is None else int((~ok).sum())
+        # which shots (files, in order) the PD average kept: the shot view
+        # draws the dropped ones differently
+        step["kept"] = None if ok is None else [bool(x) for x in ok]
         step["v"], step["sem"], step["offscreen"] = {}, {}, {}
         for role, a in red["acc"].items():
             if role == "PD" and ok is not None:
@@ -242,20 +249,209 @@ def _pd(step, d, norm_ref=True):
     return y
 
 
+# Steps that measure what the PD reads without the experiment's light:
+#   dark        the photodiode covered - no light at all: the PD's own offset
+#               plus the scope's offset error at that V/div and offset (-34 mV
+#               on 5 Oct, all of it the scope's at a 2.65 V offset)
+#   background  the laser beam blocked, the room as during the scan: the dark
+#               plus whatever stray light reaches the PD
+# What is subtracted is the background when there is one (it contains the
+# dark), else the dark. Scans before 6 Oct 2026 have only 'dark' steps, and
+# those were taken with the beam blocked before the analyzer - so they were
+# backgrounds in this sense; the numbers subtracted are the same either way.
+OFFSET_KINDS = ("dark", "background")
+OFFSET_WHAT = {"dark": "PD covered (no light)",
+               "background": "beam blocked (stray light included)"}
+
+
+def _scale_of(d, s):
+    return s.get("scales", {}).get(str(d.roles.get("PD")), [np.nan, np.nan])
+
+
+def offset_levels(d, vdiv=None):
+    """{'dark': info, 'background': info} for what this scan has - its own
+    steps first (the one taken at the V/div closest to `vdiv`), else what its
+    manifest borrowed from another scan. info: level (V), sem (V), n (shots),
+    vdiv, offset, source ('this scan' or the lending scan's name), measured
+    (time), what. Missing kinds are absent."""
+    out = {}
+    for kind in OFFSET_KINDS:
+        own = [s for s in d.steps if s["kind"] == kind and "PD" in s["v"]]
+        if own:
+            if vdiv is None:
+                s = own[0]
+            else:
+                def sc(s):
+                    v = _scale_of(d, s)[0]
+                    return abs(np.log(v / vdiv)) if v and np.isfinite(v) else 99
+                s = min(own, key=sc)
+            y = s["v"]["PD"]
+            v, off = _scale_of(d, s)
+            what = OFFSET_WHAT[kind]
+            if kind == "dark" and d.manifest.get("format") == "rampol-scan/1" and \
+                    not d.manifest.get("offsets_v2"):
+                what = "beam blocked before the analyzer (scan before 6 Oct 2026)"
+            out[kind] = {"level": float(np.mean(y)),
+                         "sem": float(np.mean(s["sem"]["PD"]) / np.sqrt(len(y) / 20)),
+                         "n": int(s.get("nb", 0)), "vdiv": v, "offset": off,
+                         "source": "this scan", "measured": s.get("t_start", ""),
+                         "what": what, "step": s}
+            continue
+        b = (d.manifest.get("borrowed") or {}).get(kind)
+        if b:
+            out[kind] = dict(b, what=OFFSET_WHAT[kind], step=None)
+    return out
+
+
 def dark_level(d, vdiv=None):
-    """Mean PD of the dark capture taken at (closest to) `vdiv`. 0 with a note
-    if none was taken."""
-    darks = [s for s in d.steps if s["kind"] == "dark" and "PD" in s["v"]]
-    if not darks:
+    """What is subtracted from the PD: (level V, info) - the background if
+    there is one, else the dark, own steps before borrowed ones; (0.0, None)
+    when there is neither or d.subtract_dark is off."""
+    if not getattr(d, "subtract_dark", True):
         return 0.0, None
-    if vdiv is None:
-        s = darks[0]
+    lv = offset_levels(d, vdiv)
+
+    def dist(info):
+        # a measurement at another V/div is the wrong one (the scope's offset
+        # error moves with it): the V/div match comes before the kind
+        v = info.get("vdiv")
+        if vdiv is None or not v or not np.isfinite(v):
+            return 0.0
+        return round(abs(np.log(v / vdiv)), 6)
+    # then a background before a dark (it includes the stray light the dark
+    # misses), whether measured here or reused from another scan - reusing
+    # one was asked for (offset_levels already prefers this scan's own of
+    # each kind)
+    cands = [(dist(lv[k]), r, k) for r, k in enumerate(("background", "dark")) if k in lv]
+    if cands:
+        _, _, kind = min(cands)
+        info = dict(lv[kind], kind=kind)
+        return float(info["level"]), info
+    return 0.0, None
+
+
+def corrections_summary(d, pol=None):
+    """Every correction the analysis applies to this scan, with its size:
+    dict(dark, background, light, subtracted, drift, gains, dropped,
+    offscreen, text). 'text' is the one line the window shows."""
+    vdiv = _pd_vdiv(d, "scan")
+    lv = offset_levels(d, vdiv)
+    sub, info = dark_level(d, vdiv)
+    out = {"dark": lv.get("dark"), "background": lv.get("background"),
+           "subtracted": sub, "subtracted_kind": info and info["kind"],
+           "subtracted_source": info and info["source"]}
+    parts = []
+    if not getattr(d, "subtract_dark", True):
+        parts.append("NOTHING subtracted (off)")
+    elif info is None:
+        parts.append("no dark or background: 0 V subtracted")
     else:
-        def sc(s):
-            v = s.get("scales", {}).get(str(d.roles.get("PD")), [np.nan])[0]
-            return abs(np.log(v / vdiv)) if v and np.isfinite(v) else 99
-        s = min(darks, key=sc)
-    return float(np.mean(s["v"]["PD"])), s
+        src = "" if info["source"] == "this scan" else f" from {info['source']}"
+        old = " (beam blocked: a scan before 6 Oct 2026)" if "before 6 Oct" in info["what"] else ""
+        parts.append(f"subtract {info['kind']}{old} {sub*1e3:+.2f} mV{src}")
+    if "dark" in lv and "background" in lv:
+        out["light"] = lv["background"]["level"] - lv["dark"]["level"]
+        parts.append(f"(dark {lv['dark']['level']*1e3:+.2f} + stray light "
+                     f"{out['light']*1e3:+.2f} mV)")
+    clocks, levels, _ = drift(d, sub)
+    if len(levels) >= 2 and np.all(levels > 0):
+        rel = levels / levels.mean() - 1
+        out["drift"] = {"n": len(levels), "pp": float(np.ptp(rel)),
+                        "resid": drift_residual(clocks, levels)}
+        parts.append(f"drift {np.ptp(rel)*100:.2f} % p-p over {len(levels)} refs")
+    g = pol.get("angle_gain") if pol else None
+    if g is not None:
+        out["gains"] = {"min": float(g.min()), "max": float(g.max())}
+        parts.append(f"angle gains {(g.min()-1)*100:+.1f}..{(g.max()-1)*100:+.1f} %")
+    drop = sum(s.get("rejected", 0) for s in d.steps)
+    tot = sum(s.get("nb", 0) + s.get("rejected", 0) for s in d.steps
+              if s["kind"] not in OFFSET_KINDS)
+    out["dropped"] = (drop, tot)
+    if drop:
+        parts.append(f"{drop} of {tot} shots dropped (lock)")
+    off = [s for s in d.steps if any(np.any(v) for v in s.get("offscreen", {}).values())]
+    out["offscreen"] = len(off)
+    if off:
+        parts.append(f"{len(off)} steps with samples off screen")
+    out["text"] = "; ".join(parts)
+    return out
+
+
+def step_shots(d, step, load_capture, trim=10):
+    """Every shot of a step straight from its files, nothing averaged:
+    (t, {role: array (shots, samples)}, files). t on the file's own grid."""
+    chans = d.manifest["channels"]
+    t, out, files = None, {}, []
+    for f in step.get("files", []):
+        fp = os.path.join(d.folder, f)
+        if not os.path.exists(fp):
+            continue
+        columns, data = load_capture(fp)
+        data = data[trim:, :]
+        cm = _role_columns(columns, chans)
+        if t is None:
+            t = data[:, 0].copy()
+        n = min(len(t), data.shape[0])
+        t = t[:n]
+        for role, j in cm.items():
+            out.setdefault(role, []).append(data[:n, j])
+        files.append(f)
+    return t, {r: np.array([y[:len(t)] for y in v]) for r, v in out.items()}, files
+
+
+def find_offsets(outdir, vdiv, offset, load_capture, kinds=OFFSET_KINDS,
+                 exclude=None, tol_v=1e-3):
+    """Dark / background measurements in other scans under `outdir` taken
+    at this PD V/div and offset (offset within tol_v - the scope's offset
+    error moves with the offset, -34 mV at +2.65 V on 5 Oct), newest first:
+    [{kind, level, sem, n, vdiv, offset, source, folder, measured}]."""
+    found = []
+    try:
+        names = os.listdir(outdir)
+    except OSError:
+        return found
+    for name in names:
+        folder = os.path.join(outdir, name)
+        mp = os.path.join(folder, f"{name}_scan.json")
+        if not os.path.isfile(mp) or (exclude and os.path.normcase(folder) ==
+                                      os.path.normcase(exclude)):
+            continue
+        try:
+            with open(mp, encoding="utf-8") as fh:
+                man = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        pd_ch = next((k for k, v in man.get("channels", {}).items()
+                      if v.get("role") == "PD"), None)
+        for s in man.get("steps", []):
+            if s.get("kind") not in kinds or s.get("status") != "done" or not s.get("files"):
+                continue
+            v, off = (s.get("scales", {}).get(str(pd_ch)) or [np.nan, np.nan])[:2]
+            if not (np.isfinite(v) and abs(v - vdiv) <= 1e-6 * max(vdiv, 1)
+                    and abs(off - offset) <= tol_v):
+                continue
+            ys = []
+            for f in s["files"]:
+                try:
+                    cols, data = load_capture(os.path.join(folder, f))
+                except Exception:
+                    continue
+                j = next((i for i, c in enumerate(cols)
+                          if c.startswith(f"CH{pd_ch}_") or c == f"CH{pd_ch}_V"), None)
+                if j is not None:
+                    ys.append(float(np.mean(data[10:, j])))
+            if not ys:
+                continue
+            kind = s["kind"]
+            what_old = kind == "dark" and not man.get("offsets_v2")
+            found.append({"kind": "background" if what_old else kind,
+                          "level": float(np.mean(ys)),
+                          "sem": float(np.std(ys, ddof=1) / np.sqrt(len(ys))) if len(ys) > 1 else 0.0,
+                          "n": len(ys), "vdiv": float(v), "offset": float(off),
+                          "source": man.get("name", name), "folder": folder,
+                          "measured": s.get("t_start", man.get("created", ""))})
+    found.sort(key=lambda x: x["measured"], reverse=True)
+    return found
 
 
 def step_clock(s):
@@ -670,7 +866,8 @@ def refine_result(d, pol, polarizer_er=None):
                         for s in ss])
         rec = {"window": w, "label": ss[0].get("label", ""), "t0": t0, "t1": t1,
                "theta": th, "I": I, "dark": dark,
-               "dark_vdiv_matched": dstep is not None,
+               "dark_vdiv_matched": bool(dstep) and bool(dstep.get("vdiv")) and
+               abs(np.log(dstep["vdiv"] / vdiv)) < 1e-6 if vdiv else False,
                "offscreen": any(np.any(s["offscreen"].get("PD", np.zeros(1))[m])
                                 for s in ss)}
         if len(th) >= 3:

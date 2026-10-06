@@ -23,6 +23,7 @@ SANDBOX = tempfile.mkdtemp(prefix="rampol-gui-")
 cfgmod.CONFIG_PATH = os.path.join(SANDBOX, "config.json")
 
 from rampol import gui  # noqa: E402
+from rampol import analysis as an  # noqa: E402
 
 # the dark prompts answer themselves
 gui.messagebox.askokcancel = lambda *a, **k: True
@@ -177,7 +178,8 @@ def main():
         if fig is not None:
             name = app.nb.tab(frame, "text")
             fig.savefig(os.path.join(out, f"{name}.png"))
-    check("every figure tab drew", len(os.listdir(out)) == 8, sorted(os.listdir(out)))
+    nfig = sum(1 for f, _d in app.plot_tabs.values() if f is not None)
+    check("every figure tab drew", len(os.listdir(out)) == nfig, sorted(os.listdir(out)))
     check("table has rows", len(app.tv.get_children()) > 5, len(app.tv.get_children()))
 
     print("\ncursor and compare")
@@ -205,7 +207,8 @@ def main():
 
     print("\nstopping part-way: what was measured is loaded and drawn")
     app.scan_name.set("stopped part way")
-    app.with_dark.set(False)
+    app.bg_mode.set("none")
+    app.dark_mode.set("none")
     app.check_first.set(False)
     app._sim_parts[0].realtime = 0.05        # slow enough to stop mid-scan
     app.nb.select(app.fig_traces._frame)      # draw the live traces as they come
@@ -248,7 +251,7 @@ def main():
     print("\nbias points: AWG plateaus into the simulated bench")
     tabs = [app.modes.tab(f, "text") for f in app.modes.tabs()]
     check("measurement modes are tabs", tabs == ["Ramp scan", "Null refine", "Bias points",
-                                                "ILC target"], tabs)
+                                                "ILC target", "Find angle"], tabs)
     app.bv["biases"].set("0:90:45")
     app.bv["shots"].set("4")
     app.bv["name"].set("gui-bias")
@@ -271,6 +274,105 @@ def main():
     root.update()
     check("ILC tab says what to do with no comparison yet",
           any("Compare shown scan" in t.get_text() for ax in app.fig_ilc.axes for t in ax.texts))
+
+    print("\nnames count up; dark and background: measured, reused, shown up front")
+    import numpy as np
+    app.scan_name.set("gui test")            # taken (and finished) above
+    app.bg_mode.set("reuse latest")
+    app.dark_mode.set("measure")
+    for k, v in {"start": "0", "stop": "150", "step": "30", "ref_every": "0",
+                 "shots": "8", "blocks": "4"}.items():
+        app.sv[k].set(v)
+    app.bench.ambient = 0.004                # 4 mV of stray light on the PD
+    app.check_first.set(False)
+    app.do_start_scan()
+    settle(root, app, timeout=300)
+    check("a used name counts up", app.scan_name.get() == "gui-test-2", app.scan_name.get())
+    res = app.result
+    man = res["d"].manifest if res else {}
+    check("background reused from the earlier scan",
+          man.get("borrowed", {}).get("background", {}).get("source") == "gui-test",
+          man.get("borrowed"))
+    lv = an.offset_levels(res["d"], 1.0) if res else {}
+    check("dark (PD covered) measured in this scan",
+          lv.get("dark", {}).get("source") == "this scan",
+          lv.get("dark", {}).get("level"))
+    txt = app.corr_label.cget("text")
+    check("corrections shown up front", "subtract background" in txt and "gui-test" in txt,
+          txt[:150])
+    app.sub_dark.set(False)
+    app.reanalyse()
+    settle(root, app)
+    check("subtraction can be switched off and says so",
+          "NOTHING subtracted" in app.corr_label.cget("text"))
+    app.sub_dark.set(True)
+    app.reanalyse()
+    settle(root, app)
+
+    print("\nshots: single traces and averages")
+    app.nb.select(app.fig_shots._frame)
+    root.update()
+    d = app.result["d"]
+    i45 = next(i for i, st in enumerate(d.steps) if st["kind"] == "scan")
+    app.shots_lb.selection_clear(0, "end")
+    app.shots_lb.selection_set(i45)
+    app.sv_shots["partner"].set(True)
+    app.redraw(app.fig_shots)
+    lines = app.fig_shots.axes[0].lines if app.fig_shots.axes else []
+    labels = [ln.get_label() for ln in lines]
+    check("a step and its 90-deg partner, shots and averages",
+          sum("average" in x for x in labels) == 2 and sum("shots" in x for x in labels) == 2,
+          labels[:6])
+    app.shots_t0.set("1.0")
+    app.shots_t1.set("1.5")
+    app.redraw(app.fig_shots)
+    xl = app.fig_shots.axes[0].get_xlim()
+    check("a time window, read at full resolution", abs(xl[0] - 1.0) < 1e-6 and abs(xl[1] - 1.5) < 1e-6)
+    app.fig_shots.savefig(os.path.join(out, "Shots_window.png"))
+    app.cursor_t = 2.0e-3
+    app.shots_crossed()
+    root.update()
+    sel = app.shots_lb.curselection()
+    check("'crossed at cursor' picks one step and a window", len(sel) == 1
+          and app.shots_t0.get() != "")
+
+    print("\nbuild: the angles adding up")
+    app.nb.select(app.fig_build._frame)
+    root.update()
+    app.build_t.set(3.0)
+    app._build_move()
+    b = app._build
+    xs, ys = b["corr"].get_data()
+    check("the slider moves the Malus points and the fit", len(xs) == len(app.result["pol"]["theta"])
+          and "t = 3.0" in b["txt"].get_text(), b["txt"].get_text().splitlines()[0])
+    app.fig_build.savefig(os.path.join(out, "Build.png"))
+    app.nb.select(app.fig_corr._frame)
+    root.update()
+    app.fig_corr.savefig(os.path.join(out, "Corrections.png"))
+    check("corrections tab drew four panels", len(app.fig_corr.axes) >= 4)
+
+    print("\nfind the min / max transmission angle")
+    t0 = app.result["d"].t[0] * 1e3
+    app.fv["window"].set(f"{t0 + 0.2:.2f}:-0.1")
+    app.fv["shots"].set("4")
+    for kind, truth in (("min", (23.7 + 90) % 180), ("max", 23.7)):
+        app.find_kind.set(kind)
+        app.find_bias_on.set(False)
+        app.do_find_angle()
+        settle(root, app, timeout=300)
+        fr = getattr(app, "find_result", None) or {}
+        err = abs((fr.get("angle", 999) - truth + 90) % 180 - 90)
+        check(f"{kind} found at rest", err < 0.1, f"{fr.get('angle')} vs {truth}")
+    app.find_kind.set("min")
+    app.find_bias_on.set(True)
+    app.fv["bias"].set("60")
+    app.do_find_angle()
+    settle(root, app, timeout=300)
+    fr = app.find_result
+    err = abs((fr["angle"] - (23.7 + 90 + 60) % 180 + 90) % 180 - 90)
+    check("min found with the AWG holding 60 deg", err < 0.1 and not any(app.bench.awg_on.values()),
+          f"{fr['angle']:.3f}")
+    app.fig_find.savefig(os.path.join(out, "Find_angle.png"))
     print(f"\nfigures in {out}")
     app.on_close()
     check("settings saved to the sandbox", os.path.exists(cfgmod.CONFIG_PATH))

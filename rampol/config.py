@@ -135,6 +135,9 @@ DEFAULTS = {
     "bias": {"biases": "0:180:15", "order": "up", "split": 0.5, "shots": 8,
              "null_half_deg": 3.0, "null_points": 9, "hold_ms": 8.0,
              "settle_ms": 4.0, "name": "bias"},
+    # Find angle: min/max transmission in a window, or held by the AWG
+    "find": {"kind": "min", "window": "-10:-0.5", "bias_on": False, "bias": "45",
+             "half": "", "points": "", "shots": "8"},
     # the ILC target comparison (rampol.ilc_target)
     "ilc": {"x1": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX1H.state.npz"),
             "x2": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX2A.state.npz"),
@@ -153,6 +156,10 @@ DEFAULTS = {
         "dither_codes": 3,
         "ref_every": 6,           # return to ref_angle after every N angles (0 = never)
         "ref_angle": 45.0,
+        # before the angles: measure / reuse latest (same PD V/div and offset,
+        # from another scan) / none. Background = beam blocked (subtracted when
+        # there is one); dark = PD covered (shows the stray light apart)
+        "dark_mode": "none", "bg_mode": "measure",
         "backoff_deg": 3.0,       # approach every angle from below by this much
         "points": 100000,         # single-shot readout points
         "wait_s": 30.0,           # trigger stall limit (> the repetition period)

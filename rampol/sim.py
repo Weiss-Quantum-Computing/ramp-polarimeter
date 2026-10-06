@@ -34,7 +34,7 @@ class Bench:
                  ramp_up_ms=4.61, hold_ms=1.24, swing_deg=180.0,
                  memory_deg=0.15, memory_tau_ms=35.0, deg_per_mon_v=(17.550, 17.519),
                  legs_ms=(0.0,), lock_miss=0.0, rotator_err_deg=0.0,
-                 rotator_err_period_deg=90.0):
+                 rotator_err_period_deg=90.0, ambient=0.0):
         self.rng = np.random.default_rng(seed)
         self.mount_of_rest_pol = mount_of_rest_pol
         self.imax, self.dark = imax, dark
@@ -55,6 +55,10 @@ class Bench:
         self.awg_drive = {}
         self.awg_on = {1: False, 2: False}
         self.awg_gain = {1: 0.5594, 2: 0.5924}     # AWG V -> monitor V
+        # stray light on the PD that does not come through the analyzer (V),
+        # there with the beam blocked; only covering the PD removes it
+        self.ambient = ambient
+        self.covered = False
 
     # -- the ramp ---------------------------------------------------------
     def monitors(self, t):
@@ -121,6 +125,10 @@ class Bench:
         if shots == 1 and self.lock_miss and self.rng.random() < self.lock_miss:
             imax *= 0.975            # the lock did not catch on this shot
         pd = self.dark + imax * (np.cos(d) ** 2 + inv_er * np.sin(d) ** 2)
+        if self.covered:
+            pd = np.full_like(t, self.dark)
+        elif self.ambient:
+            pd = pd + self.ambient
         n = np.sqrt(max(shots, 1))
         pd = pd + self.rng.normal(0, self.pd_noise / n, t.size)
         x1 = m1 + self.rng.normal(0, 1e-3 / n, t.size)
