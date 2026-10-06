@@ -68,6 +68,14 @@ for k in range(len(th)):
                         rotation=float(rot[m]), rate=float(abs(np.gradient(rot, t)[m]) * 1e-3),
                         imin_mV=imin * 1e3, sig_mV=s_min * 1e3, imax_V=imax,
                         er=imax / (2 * s_min) if lower else imax / imin, lower=bool(lower)))
+# one crossing can show up as several sign flips of the azimuth where it creeps
+# through crossed slowly (noise): keep one per angle per 0.1 ms
+kept = []
+for p in sorted(pts, key=lambda p: (p["theta"], p["t_ms"])):
+    if kept and abs(kept[-1]["theta"] - p["theta"]) < 1e-6 and p["t_ms"] - kept[-1]["t_ms"] < 0.1:
+        continue
+    kept.append(p)
+pts = kept
 # static stretches: the measured angle nearest crossed
 for s in segs:
     if s["kind"].startswith(("up", "down")) or s["t0"] > t_end:
