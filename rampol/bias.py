@@ -253,8 +253,9 @@ class BiasRun:
 
     def __init__(self, folder, name, link, rot, awg, roles, plan=None, log=print,
                  cancelled=None, ask=None, on_point=None, progress=None,
-                 eomilc=None, ilc_bench=None):
+                 eomilc=None, ilc_bench=None, provenance=None):
         self.folder = os.path.join(folder, name)
+        self.provenance = provenance
         self.name = name
         self.link, self.rot, self.awg = link, rot, awg
         self.roles = dict(roles)
@@ -372,7 +373,8 @@ class BiasRun:
         self.manifest = {"format": FORMAT, "name": self.name, "plan": p,
                          "created": datetime.datetime.now().isoformat(timespec="seconds"),
                          "roles": self.roles, "window_s": w, "biases": biases,
-                         "limit_checks": [c[2] for c in checks], "points": []}
+                         "limit_checks": [c[2] for c in checks], "points": [],
+                         "provenance": self.provenance}
         self._save()
         self.log(f"Bias run {self.name}: {len(biases)} points, record "
                  f"{period*1e3:.2f} ms, window {w[0]*1e3:.2f}-{w[1]*1e3:.2f} ms")

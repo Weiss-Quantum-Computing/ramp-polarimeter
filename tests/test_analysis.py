@@ -110,6 +110,30 @@ def scan_checks(sg):
     rel = [abs(x["er"] / np.interp(x["t"], d.t, erl) - 1) for x in dips if not x["er_lower"]]
     check("dip ER within 15 % of the model (median)", np.median(rel) < 0.15,
           f"median {np.median(rel) * 100:.1f} %, 90th pct {np.percentile(rel, 90) * 100:.0f} %")
+    print("\ndirect ER: Imin and Imax both measured, no fit in the values")
+    dr = an.direct_er(d, pol, gains=pol.get("angle_gain"))
+    cr = [x for x in dr if x["kind"] == "crossing"]
+    check("a crossing per angle per ramp, about", len(cr) >= 100, len(cr))
+    rel = [abs(x["er"] / np.interp(x["t_ms"] * 1e-3, d.t, erl) - 1) for x in cr if not x["lower"]]
+    check("direct ER within 20 % of the model (median)", len(rel) > 20 and np.median(rel) < 0.2,
+          f"{len(rel)} resolved, median {np.median(rel) * 100:.1f} %")
+    imax_fit = [np.interp(x["t_ms"] * 1e-3, d.t, pol["imax"]) for x in cr]
+    check("direct Imax (the angle 90 deg away) matches the fitted Imax to 3 %",
+          np.median([abs(x["imax_V"] / f - 1) for x, f in zip(cr, imax_fit)]) < 0.03)
+    st = [x for x in dr if x["kind"] == "static"]
+    check("static stretches measured (rest, hold, after)", len(st) >= 3, [x["seg"] for x in st])
+    print("\nMalus residual map and the polarization state")
+    th_r, resid, z = an.malus_residual(pol)
+    zr = float(np.sqrt(np.nanmean(z ** 2)))
+    check("residual / standard error is about 1 for the simulated bench", 0.5 < zr < 3, f"{zr:.2f}")
+    sk = an.stokes(pol)
+    erf = (1 + sk["p"]) / (1 - sk["p"])
+    chi_er = np.rad2deg(np.arctan(1 / np.sqrt(erf)))
+    check("ellipticity from p equals atan(1/sqrt(ER))", np.allclose(sk["chi_deg"], chi_er, atol=1e-6))
+    j = int(np.argmax(np.abs(pol["rotation"])))
+    az = sk["azimuth_deg"][j] - np.median(sk["azimuth_deg"][rest])
+    check("Stokes azimuth in the rest frame = rotation", abs(az - pol["rotation"][j]) < 1e-6,
+          f"{az:.4f} vs {pol['rotation'][j]:.4f}")
     segs = [s["kind"] for s in an.segments(d.t, pol["rotation"])]
     check("segments rest/up/hold/down/after", segs == ["rest", "up", "hold", "down", "after"], segs)
     mon = an.monitor_prediction(d, pol, config.DEG_PER_MON_V)
@@ -278,8 +302,51 @@ def time_map_checks():
           f"gain {g:.4f}, offset {o:+.4f} V, rms {rms * 1e3:.1f} mV")
 
 
+def records_checks():
+    print("\nprovenance and the lab log")
+    from rampol import lablog, provenance
+    g = provenance.git_info(os.path.join(HERE, "..", "rampol"))
+    check("this repository's commit is found", bool(g.get("commit")) and len(g["commit"]) == 12,
+          g)
+    tmp = tempfile.mkdtemp(prefix="rampol-prov-")
+    sp = os.path.join(tmp, "drive_X.state.npz")
+    tt = np.arange(0, 1e-3, 2e-6)
+    np.savez(sp, t=tt, target=np.sin(tt * 3e3), u=np.cos(tt * 3e3), dt=2e-6, name="X",
+             channel="EO1", iteration=7)
+    st = provenance.ilc_state(sp)
+    check("ILC state: iteration, fingerprint, drive hash",
+          st.get("iteration") == 7 and st.get("target_n") == len(tt)
+          and st.get("target_dt_us") == 2.0 and len(st.get("drive_sha1", "")) == 12, st)
+    check("a missing ILC state file is reported, not raised",
+          "error" in provenance.ilc_state(os.path.join(tmp, "nope.npz")))
+    cfg = dict(config.DEFAULTS, ilc={"x1": sp})
+    prov = provenance.collect(cfg)
+    check("collect: software and ILC", "ramp-polarimeter" in prov["software"]
+          and prov["ilc_state_files"]["x1"]["iteration"] == 7)
+    check("one-line summary names the ILC iteration", "it 7" in provenance.short(prov),
+          provenance.short(prov))
+    row = {"kind": "ramp scan", "name": "a", "measured": "2026-10-06T10:00:00",
+           "direct_er_min": 16.4}
+    lablog.upsert(tmp, row)
+    rows = lablog.read(tmp)
+    rows[0]["notes"] = "typed by hand"
+    import csv
+    with open(lablog.path(tmp), "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.DictWriter(fh, fieldnames=lablog.COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+    lablog.upsert(tmp, dict(row, direct_er_min=17.0))
+    lablog.upsert(tmp, dict(row, name="b"))
+    rows = lablog.read(tmp)
+    check("a re-analysed scan updates its row, keeps the hand note, adds no duplicate",
+          len(rows) == 2 and rows[0]["direct_er_min"] == "17"
+          and rows[0]["notes"] == "typed by hand", [(r["name"], r["direct_er_min"], r["notes"])
+                                                    for r in rows])
+
+
 def main():
     sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
+    records_checks()
     angle_gain_checks()
     time_map_checks()
     few_angles_checks()

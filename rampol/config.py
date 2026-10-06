@@ -178,7 +178,11 @@ DEFAULTS = {
         # step's median by more than this fraction of the brightest level -
         # the intensity lock missed 11 of 60 records on 1 Oct 2026 (0 = keep all)
         "lock_tol": 0.006,
-        "polarizer_er": 1.0e4,    # analyzer's own extinction ratio (LPVIS100 spec floor)
+        # the analyzer's own extinction ratio at 843 nm: Thorlabs' LPVIS100
+        # data (lpvis_te_xls.xls) gives 1.37e8 at 840 nm and 1.46e8 at 844 nm,
+        # transmission 80.6 %. The 1e4 used before 6 Oct 2026 was the sheet's
+        # minimum over 550-1500 nm, not the value at our wavelength.
+        "polarizer_er": 1.4e8,
         "deg_per_mon_v": dict(DEG_PER_MON_V),
     },
 }
@@ -199,9 +203,13 @@ def load():
     unreadable file gives the defaults."""
     try:
         with open(CONFIG_PATH, encoding="utf-8") as fh:
-            return _merge(DEFAULTS, json.load(fh))
+            cfg = _merge(DEFAULTS, json.load(fh))
     except (OSError, ValueError):
         return copy.deepcopy(DEFAULTS)
+    # a config saved before 6 Oct 2026 carries the old wide-band floor
+    if cfg["analysis"].get("polarizer_er") == 1.0e4:
+        cfg["analysis"]["polarizer_er"] = DEFAULTS["analysis"]["polarizer_er"]
+    return cfg
 
 
 def replace_retrying(tmp, path, tries=20, wait=0.05):

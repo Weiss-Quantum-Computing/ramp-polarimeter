@@ -29,6 +29,8 @@ from rampol import analysis as an  # noqa: E402
 gui.messagebox.askokcancel = lambda *a, **k: True
 gui.messagebox.showinfo = lambda *a, **k: None
 gui.messagebox.askyesno = lambda *a, **k: True
+# Export brief and Lab log open Explorer / Excel: not from a test
+os.startfile = lambda *a, **k: None
 
 FAILS = []
 
@@ -167,6 +169,17 @@ def main():
     check("12 angles fitted", pol["n_angles"] == 12, pol["n_angles"])
     check("the pre-run check is kept in the manifest",
           bool(app.result["d"].manifest.get("precheck")))
+    prov = app.result["d"].manifest.get("provenance") or {}
+    check("the manifest records the software versions",
+          (prov.get("software", {}).get("ramp-polarimeter") or {}).get("commit"),
+          gui.provenance.short(prov))
+    from rampol import lablog
+    rows = lablog.read(app.outdir.get())
+    check("the scan has its row in the lab log",
+          any(r["kind"] == "ramp scan" and r["name"] == "gui-test" for r in rows),
+          [(r["kind"], r["name"]) for r in rows])
+    check("direct ER computed with the load", len(app.result["direct"]) >= 10,
+          len(app.result["direct"]))
     check("rest azimuth recovered", abs(pol["psi_rest"] - 23.7) < 0.1,
           f"{pol['psi_rest']:.3f}")
     check("dip ER points found", len(app.result["dips"]) >= 20, len(app.result["dips"]))
@@ -250,8 +263,8 @@ def main():
 
     print("\nbias points: AWG plateaus into the simulated bench")
     tabs = [app.modes.tab(f, "text") for f in app.modes.tabs()]
-    check("measurement modes are tabs", tabs == ["Ramp scan", "Null refine", "Bias points",
-                                                "ILC target", "Find angle"], tabs)
+    check("measurement modes are tabs (find and refine share Analyzer)",
+          tabs == ["Ramp scan", "Analyzer", "Bias points", "ILC target"], tabs)
     app.bv["biases"].set("0:90:45")
     app.bv["shots"].set("4")
     app.bv["name"].set("gui-bias")
@@ -270,6 +283,9 @@ def main():
     root.update()
     app.fig_bias.savefig(os.path.join(out, "Bias_points.png"))
     check("bias tab drew four panels", len(app.fig_bias.axes) >= 4, len(app.fig_bias.axes))
+    check("the bias run is in the lab log and its manifest has provenance",
+          any(r["kind"] == "bias points" for r in lablog.read(app.outdir.get()))
+          and bool((br or {}).get("provenance")))
     app.nb.select(app.fig_ilc._frame)
     root.update()
     check("ILC tab says what to do with no comparison yet",
@@ -308,6 +324,58 @@ def main():
     app.sub_dark.set(True)
     app.reanalyse()
     settle(root, app)
+
+    print("\nextinction with the direct points, residual map, Poincare")
+    app.nb.select(app.fig_ext._frame)
+    root.update()
+    labels = [ln.get_label() for ln in app.fig_ext.axes[0].lines]
+    check("Extinction shows the direct points", any(x.startswith("direct: crossing") for x in labels),
+          labels)
+    app.ext_show["direct"].set(False)
+    app.redraw(app.fig_ext)
+    labels = [ln.get_label() for ln in app.fig_ext.axes[0].lines]
+    check("and hides them when unticked", not any(x.startswith("direct") for x in labels))
+    app.ext_show["direct"].set(True)
+    app.nb.select(app.fig_map._frame)
+    app.map_show.set(gui.MAP_MODES[2])
+    app.redraw(app.fig_map)
+    root.update()
+    check("Map: residual / standard error with a per-angle rms panel",
+          len(app.fig_map.axes) >= 3 and "residual" in app.fig_map.axes[0].get_title().lower(),
+          [a.get_title()[:30] for a in app.fig_map.axes])
+    app.fig_map.savefig(os.path.join(out, "Map_residual.png"))
+    app.map_show.set(gui.MAP_MODES[0])
+    app.nb.select(app.fig_poin._frame)
+    root.update()
+    check("Poincare: a 3-d sphere, the ellipticity and the ellipse",
+          any(getattr(a, "name", "") == "3d" for a in app.fig_poin.axes)
+          and len(app.fig_poin.axes) >= 3)
+    app.fig_poin.savefig(os.path.join(out, "Poincare.png"))
+
+    print("\ncompare scans")
+    i = list(app.cmp_lb.get(0, "end")).index("gui-test")
+    app.cmp_lb.selection_clear(0, "end")
+    app.cmp_lb.selection_set(i)
+    app.do_compare_load()
+    settle(root, app)
+    root.update()
+    ax = app.fig_cmp.axes
+    names = [ln.get_label() for ln in ax[0].lines] if ax else []
+    check("Compare: rotation of both scans, their difference and the ER",
+          len(ax) == 3 and "gui-test" in names and "gui-test-2 (shown)" in names, names)
+    app.fig_cmp.savefig(os.path.join(out, "Compare.png"))
+
+    print("\nbrief export")
+    app.do_export_brief()
+    bdir = os.path.join(app.result["d"].folder, "analysis", "brief")
+    made = sorted(os.listdir(bdir)) if os.path.isdir(bdir) else []
+    check("brief: 8 figures, summary.json and summary.md",
+          sum(m.endswith(".png") for m in made) == 8 and "summary.json" in made
+          and "summary.md" in made, made)
+    import json as _json
+    summ = _json.load(open(os.path.join(bdir, "summary.json"), encoding="utf-8"))
+    check("summary has the direct ER and the provenance",
+          summ.get("direct_er_min") and summ.get("provenance"), summ.get("direct_er_min"))
 
     print("\nshots: single traces and averages")
     app.nb.select(app.fig_shots._frame)
@@ -373,6 +441,8 @@ def main():
     check("min found with the AWG holding 60 deg", err < 0.1 and not any(app.bench.awg_on.values()),
           f"{fr['angle']:.3f}")
     app.fig_find.savefig(os.path.join(out, "Find_angle.png"))
+    check("found angles go to the lab log",
+          sum(r["kind"].startswith("find") for r in lablog.read(app.outdir.get())) >= 3)
     print(f"\nfigures in {out}")
     app.on_close()
     check("settings saved to the sandbox", os.path.exists(cfgmod.CONFIG_PATH))

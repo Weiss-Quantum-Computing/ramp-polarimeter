@@ -26,75 +26,18 @@ sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
 d = an.load_scan(SCAN, sg.load_capture, lock_tol=0.006)
 pol = an.polarization(d)
 t = d.t
-dt = float(np.median(np.diff(t)))
-th, I, sem_s, steps = an.scan_matrix(d, "scan", correct_drift=False)
-sem = np.array([np.asarray(s["sem"]["PD"], float) for s in steps])
-nb = max(1, int(round(4e-6 / dt)))            # 4 us boxcar
-box = np.ones(nb) / nb
-Is = np.array([np.convolve(x, box, mode="same") for x in I])
-sems = sem / np.sqrt(nb)
-psi = pol["psi_u"]
-rot = -pol["rotation"]                       # target sense (test-4: light turns negative)
-wrap = lambda x: (x + 90.0) % 180.0 - 90.0
-orth = [[j for j in range(len(th)) if abs(wrap(th[j] - th[k] - 90)) < 1.0] for k in range(len(th))]
+pts = an.direct_er(d, pol)
+# plotted in the target's sense: positive away from rest (test-4's light
+# turns negative in the analyzer frame)
+moving = [p["rotation"] for p in pts if p["kind"] == "crossing"]
+sign = -1.0 if moving and np.median(moving) < 0 else 1.0
+for p in pts:
+    p["rotation"] *= sign
+rot = sign * pol["rotation"]
+th = an.scan_matrix(d, "scan", correct_drift=False)[0]
 segs = an.segments(t, pol["rotation"])
-moving = np.zeros(len(t), bool)
-for s in segs:
-    if s["kind"].startswith(("up", "down")):
-        moving |= (t >= s["t0"]) & (t <= s["t1"])
-t_end = max(s["t1"] for s in segs if s["kind"].startswith("down")) + 1e-3   # lock off after leg 2
-
-pts = []
-for k in range(len(th)):
-    if not orth[k]:
-        continue
-    delta = wrap(psi - th[k] - 90)
-    cross = np.flatnonzero((np.sign(delta[:-1]) != np.sign(delta[1:])) & moving[:-1]
-                           & (np.abs(delta[:-1]) < 5))
-    for c in cross:
-        a, b = c, c
-        while a > 0 and abs(delta[a - 1]) < 4 and moving[a - 1]:
-            a -= 1
-        while b < len(t) - 1 and abs(delta[b + 1]) < 4 and moving[b + 1]:
-            b += 1
-        if b - a < 3 * nb:
-            continue
-        m = a + nb + int(np.argmin(Is[k, a + nb:b - nb + 1]))
-        imin, s_min = Is[k, m], sems[k, m]
-        imax = float(np.mean([Is[j, m] for j in orth[k]]))
-        seg = next(s["kind"] for s in segs if s["t0"] <= t[m] <= s["t1"])
-        lower = imin < 2 * s_min
-        pts.append(dict(kind="crossing", seg=seg, t_ms=t[m] * 1e3, theta=float(th[k]),
-                        rotation=float(rot[m]), rate=float(abs(np.gradient(rot, t)[m]) * 1e-3),
-                        imin_mV=imin * 1e3, sig_mV=s_min * 1e3, imax_V=imax,
-                        er=imax / (2 * s_min) if lower else imax / imin, lower=bool(lower)))
-# one crossing can show up as several sign flips of the azimuth where it creeps
-# through crossed slowly (noise): keep one per angle per 0.1 ms
-kept = []
-for p in sorted(pts, key=lambda p: (p["theta"], p["t_ms"])):
-    if kept and abs(kept[-1]["theta"] - p["theta"]) < 1e-6 and p["t_ms"] - kept[-1]["t_ms"] < 0.1:
-        continue
-    kept.append(p)
-pts = kept
-# static stretches: the measured angle nearest crossed
-for s in segs:
-    if s["kind"].startswith(("up", "down")) or s["t0"] > t_end:
-        continue
-    w = (t > s["t0"] + 0.2e-3) & (t < min(s["t1"], t_end) - 0.2e-3)
-    if w.sum() < 100:
-        continue
-    means = I[:, w].mean(axis=1)
-    k = int(np.argmin(means))
-    if not orth[k]:
-        continue
-    imax = float(np.mean([means[j] for j in orth[k]]))
-    s_min = float(np.mean(sem[k, w]) / np.sqrt(w.sum() / max(1, int(1e-6 / dt))))
-    off = float(np.median(wrap(psi[w] - th[k] - 90)))
-    pts.append(dict(kind="static", seg=s["kind"], t_ms=float(t[w].mean() * 1e3),
-                    theta=float(th[k]), rotation=float(np.median(rot[w])), rate=0.0,
-                    imin_mV=float(means[k] * 1e3), sig_mV=s_min * 1e3, imax_V=imax,
-                    er=imax / means[k], lower=False, off_deg=off,
-                    imin_from_offset_mV=float(imax * np.sin(np.deg2rad(off)) ** 2 * 1e3)))
+downs = [s["t1"] for s in segs if s["base"] == "down"]
+t_end = (max(downs) + 1e-3) if downs else t[-1]
 
 out = os.path.join(SCAN, "analysis", "direct_er")
 os.makedirs(out, exist_ok=True)
@@ -104,7 +47,7 @@ cr = [p for p in pts if p["kind"] == "crossing"]
 st = [p for p in pts if p["kind"] == "static"]
 print(f"{d.name}: {len(cr)} crossings, {len(st)} static stretches; PD at "
       f"{an._pd_vdiv(d, 'scan')} V/div")
-lo = min(pts, key=lambda p: p["er"])
+lo = min([p for p in pts if not p.get("offset_limited")] or pts, key=lambda p: p["er"])
 print(f"LOWEST direct ER {lo['er']:.1f}: {lo['kind']} {lo['seg']}, t {lo['t_ms']:.3f} ms, rotation "
       f"{lo['rotation']:.1f} deg, analyzer {lo['theta']:g}, Imin {lo['imin_mV']:.1f} +- {lo['sig_mV']:.2f} mV, Imax {lo['imax_V']:.3f} V")
 ers = np.array([p["er"] for p in cr])

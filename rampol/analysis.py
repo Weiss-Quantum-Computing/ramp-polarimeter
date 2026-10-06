@@ -746,6 +746,207 @@ def dip_er(pol, window_deg=8.0, min_samples=6, polarizer_er=None):
     return out
 
 
+# -- 2b. extinction ratio measured directly, no fit in the values -------------
+
+def direct_er(d, pol, box_us=4.0, correct_drift=False, gains=None):
+    """Extinction ratios with both intensities MEASURED, at every time the ramp
+    sweeps the light through crossed for one of the scan's analyzer angles:
+    Imin = that angle's trace at its minimum (`box_us` boxcar), Imax = the
+    trace of the angle 90 deg away at the same instant. The fit's azimuth
+    only says WHEN a crossing happens. Static stretches (rest, holds, between
+    legs): the angle nearest crossed against the one 90 deg from it, averaged
+    over the stretch, with how far from crossed that angle sat (Imax sin^2 of
+    it is the Imin that offset alone gives).
+
+    Defaults reproduce tools/direct_er.py as first run (5 Oct 2026): raw
+    traces, no drift correction, no per-angle transmission. gains: the
+    per-angle factors to divide out (pol['angle_gain']), or None. Returns
+    dicts: kind (crossing | static), seg, t_ms, theta, rotation (pol's sense),
+    rate (deg/ms), imin_mV, sig_mV, imax_V, er, lower (Imin < 2 sigma: er is
+    Imax / 2 sigma), and for static ones off_deg, imin_from_offset_mV and
+    offset_limited (the offset alone gives over half the measured Imin: with
+    coarse angle steps the nearest angle sits degrees from crossed, and the
+    point says how far the angle was, not what the light's ER is)."""
+    t = d.t
+    dt = float(np.median(np.diff(t)))
+    th, I, _sem, steps = scan_matrix(d, "scan", correct_drift=correct_drift)
+    if len(th) < 2:
+        return []
+    sem = np.array([np.asarray(s["sem"]["PD"], float) for s in steps])
+    if gains is not None and len(gains) == len(th):
+        I = I / np.asarray(gains)[:, None]
+        sem = sem / np.asarray(gains)[:, None]
+    nb = max(1, int(round(box_us * 1e-6 / dt)))
+    box = np.ones(nb) / nb
+    Is = np.array([np.convolve(x, box, mode="same") for x in I])
+    sems = sem / np.sqrt(nb)
+    psi = pol["psi_u"]
+    rot = pol["rotation"]
+    rate_all = np.abs(np.gradient(rot, t)) * 1e-3          # deg/ms
+
+    def wrap(x):
+        return (x + 90.0) % 180.0 - 90.0
+    orth = [[j for j in range(len(th)) if abs(wrap(th[j] - th[k] - 90)) < 1.0]
+            for k in range(len(th))]
+    segs = segments(t, rot)
+    moving = np.zeros(len(t), bool)
+    for s in segs:
+        if s["base"] in ("up", "down"):
+            moving |= (t >= s["t0"]) & (t <= s["t1"])
+    downs = [s["t1"] for s in segs if s["base"] == "down"]
+    # the intensity lock switches off after the last leg: nothing past it
+    t_end = (max(downs) + 1e-3) if downs else t[-1]
+
+    def seg_of(tm):
+        return next((s["kind"] for s in segs if s["t0"] <= tm <= s["t1"]), "")
+    pts = []
+    for k in range(len(th)):
+        if not orth[k]:
+            continue
+        delta = wrap(psi - th[k] - 90)
+        cross = np.flatnonzero((np.sign(delta[:-1]) != np.sign(delta[1:])) & moving[:-1]
+                               & (np.abs(delta[:-1]) < 5))
+        for c in cross:
+            a, b = c, c
+            while a > 0 and abs(delta[a - 1]) < 4 and moving[a - 1]:
+                a -= 1
+            while b < len(t) - 1 and abs(delta[b + 1]) < 4 and moving[b + 1]:
+                b += 1
+            if b - a < 3 * nb:
+                continue
+            m = a + nb + int(np.argmin(Is[k, a + nb:b - nb + 1]))
+            imin, s_min = float(Is[k, m]), float(sems[k, m])
+            imax = float(np.mean([Is[j, m] for j in orth[k]]))
+            lower = bool(imin < 2 * s_min)
+            pts.append(dict(kind="crossing", seg=seg_of(t[m]), t_ms=float(t[m] * 1e3),
+                            theta=float(th[k]), rotation=float(rot[m]),
+                            rate=float(rate_all[m]), imin_mV=imin * 1e3, sig_mV=s_min * 1e3,
+                            imax_V=imax, er=imax / (2 * s_min) if lower else imax / imin,
+                            lower=lower))
+    # one crossing can show up as several sign flips of the azimuth where it
+    # creeps through crossed slowly (noise): keep one per angle per 0.1 ms
+    kept = []
+    for p in sorted(pts, key=lambda p: (p["theta"], p["t_ms"])):
+        if kept and abs(kept[-1]["theta"] - p["theta"]) < 1e-6 and \
+                p["t_ms"] - kept[-1]["t_ms"] < 0.1:
+            continue
+        kept.append(p)
+    pts = kept
+    for s in segs:
+        if s["base"] in ("up", "down") or s["t0"] > t_end:
+            continue
+        w = (t > s["t0"] + 0.2e-3) & (t < min(s["t1"], t_end) - 0.2e-3)
+        if w.sum() < 100:
+            continue
+        means = I[:, w].mean(axis=1)
+        k = int(np.argmin(means))
+        if not orth[k]:
+            continue
+        imax = float(np.mean([means[j] for j in orth[k]]))
+        s_min = float(np.mean(sem[k, w]) / np.sqrt(w.sum() / max(1, int(1e-6 / dt))))
+        off = float(np.median(wrap(psi[w] - th[k] - 90)))
+        imin = float(means[k])
+        lower = bool(imin < 2 * s_min)
+        from_off = float(imax * np.sin(np.deg2rad(off)) ** 2)
+        pts.append(dict(kind="static", seg=s["kind"], t_ms=float(t[w].mean() * 1e3),
+                        theta=float(th[k]), rotation=float(np.median(rot[w])), rate=0.0,
+                        imin_mV=imin * 1e3, sig_mV=s_min * 1e3, imax_V=imax,
+                        er=imax / (2 * s_min) if lower else imax / imin, lower=lower,
+                        off_deg=off, imin_from_offset_mV=from_off * 1e3,
+                        offset_limited=bool(from_off > 0.5 * max(imin, 0.0))))
+    return pts
+
+
+# -- the fit's residual, and the polarization state ---------------------------
+
+def malus_residual(pol):
+    """What the Malus law does not explain, per angle and sample: (theta [K],
+    resid [K, N] in V, z [K, N] = resid / that step's standard error). The
+    model is a0 + c2 cos 2theta + s2 sin 2theta (the 1- and 4-theta
+    diagnostics are left IN the residual, so they show). Bad angles, clipping,
+    a missed lock or slow drift show up as rows or patches."""
+    th = np.asarray(pol["theta"], float)
+    r = np.deg2rad(th)[:, None]
+    model = pol["a0"][None, :] + pol["c2"][None, :] * np.cos(2 * r) \
+        + pol["s2"][None, :] * np.sin(2 * r)
+    resid = pol["I"] - model
+    g = pol.get("angle_gain")
+    sem = np.array([np.asarray(s["sem"]["PD"], float) for s in pol["steps"]])
+    if g is not None:
+        sem = sem / np.asarray(g)[:, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = np.where(sem > 0, resid / sem, np.nan)
+    return th, resid, z
+
+
+def stokes(pol, a0=None, c2=None, s2=None):
+    """The polarization state the rotating analyzer measures, per sample, in
+    the REST frame (azimuth measured from the rest azimuth). s1, s2: the
+    normalised linear Stokes parameters; p: their length (the degree of
+    LINEAR polarization, B / a0); chi_deg: the ellipticity angle a FULLY
+    polarized beam with this p would have (tan chi = sqrt(Imin / Imax)); s3:
+    sqrt(1 - p^2) under the same assumption, sign unknown. A linear analyzer
+    alone cannot tell ellipticity from depolarization, nor the handedness:
+    s3 and chi are upper bounds on the circular part. a0/c2/s2 may be passed
+    pre-smoothed."""
+    a0 = pol["a0"] if a0 is None else a0
+    c2 = pol["c2"] if c2 is None else c2
+    s2 = pol["s2"] if s2 is None else s2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p = np.clip(np.hypot(c2, s2) / a0, 0.0, 1.0)
+    two_psi = np.arctan2(s2, c2) - np.deg2rad(2 * pol["psi_rest"])
+    s3 = np.sqrt(np.maximum(1 - p * p, 0.0))
+    chi = 0.5 * np.rad2deg(np.arcsin(s3))
+    return {"s1": p * np.cos(two_psi), "s2": p * np.sin(two_psi), "s3": s3, "p": p,
+            "chi_deg": chi, "azimuth_deg": 0.5 * np.rad2deg(np.unwrap(two_psi))}
+
+
+def scan_summary(res, direct=None):
+    """The key numbers of an analysed scan (GUI result dict) for the lab log
+    and the brief: plain values, JSON-able."""
+    d, pol = res["d"], res.get("pol")
+    man = d.manifest
+    out = {"name": d.name, "created": man.get("created", ""),
+           "updated": man.get("updated", ""), "folder": d.folder,
+           "steps_done": res.get("n_done"), "steps_total": res.get("n_total"),
+           "complete": res.get("n_done") == res.get("n_total"),
+           "pd_vdiv": _pd_vdiv(d, "scan"),
+           "shots_per_angle": man.get("plan", {}).get("shots"),
+           "preset": man.get("plan", {}).get("preset", "")}
+    cs = res.get("corr") or {}
+    out["subtracted"] = cs.get("subtracted_kind")
+    out["subtracted_mV"] = None if cs.get("subtracted") is None else cs["subtracted"] * 1e3
+    out["corrections"] = cs.get("text", "")
+    if cs.get("dropped"):
+        out["shots_dropped"], out["shots_total"] = cs["dropped"]
+    if pol is not None:
+        rot = pol["rotation"]
+        out.update(n_angles=int(pol["n_angles"]), psi_rest_deg=float(pol["psi_rest"]),
+                   rotation_max_deg=float(np.max(rot)), rotation_min_deg=float(np.min(rot)),
+                   drift_resid=pol.get("drift_resid"),
+                   fit_residual_mV_median=float(np.nanmedian(pol["rms"]) * 1e3)
+                   if np.any(np.isfinite(pol["rms"])) else None)
+        segs = segments(pol["t"], rot)
+        out["segments"] = []
+        for s in segs:
+            m = (pol["t"] >= s["t0"]) & (pol["t"] <= s["t1"])
+            out["segments"].append({"kind": s["kind"], "t0_ms": s["t0"] * 1e3,
+                                    "t1_ms": s["t1"] * 1e3,
+                                    "rotation_deg": float(np.median(rot[m])),
+                                    "er_fit_median": float(np.median(pol["er"][m]))})
+    if direct:
+        res_pts = [p for p in direct if not p["lower"] and not p.get("offset_limited")]
+        if res_pts:
+            lo = min(res_pts, key=lambda p: p["er"])
+            out["direct_er_min"] = {k: lo[k] for k in ("er", "kind", "seg", "t_ms", "theta",
+                                                       "rotation", "imin_mV", "imax_V")}
+        out["direct_er_n"] = len(direct)
+        out["direct_er_lower_bounds"] = sum(p["lower"] for p in direct)
+        out["direct_er_offset_limited"] = sum(bool(p.get("offset_limited")) for p in direct)
+    out["provenance"] = man.get("provenance")
+    return out
+
+
 # -- 3. null refinement ------------------------------------------------------
 
 def parse_windows(text):

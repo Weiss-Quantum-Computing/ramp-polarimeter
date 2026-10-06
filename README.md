@@ -46,6 +46,20 @@ angle - and three measurements come out of it:
    where the polarization does not sweep through any null: a few analyzer
    angles within a few degrees of crossed, at a sensitive V/div, fitted for
    Imin. The same scan folder grows the extra steps.
+4. **Direct ER, no fit in the values** (`analysis.direct_er`, also
+   `tools/direct_er.py`). At every crossing, Imin is the crossed angle's own
+   trace at its minimum (4 us boxcar) and Imax is the trace of the analyzer
+   90 deg away at the same instant: both measured. Static stretches use the
+   angle nearest crossed; a point where that angle sat so far from crossed
+   that the offset alone gives over half the Imin is marked offset-limited
+   and left out of the minimum. In the window it follows the Apply switches
+   (drift and per-angle transmission corrected); the command-line tool keeps
+   the raw traces, as first run (test-4: 16.4 raw, 16.7 corrected - the
+   per-angle transmission is the +-2 % between them).
+
+Imax everywhere is the transmission 90 deg from the minimum at the same
+instant (measured for direct and bias points, fitted for ER_fit, dips and
+refine), never the overall maximum of the record.
 
 **Which ER to believe.** `ER_fit` needs the light level to be the same at
 every angle, so slow intensity drift between angles limits it: a 1e-3 gain
@@ -55,8 +69,18 @@ to a reference angle every N angles (default 6), corrects the drift from
 those returns, and reports how well they predict each other (leave-one-out);
 the Extinction tab draws `1 / that scatter` as the limit. The dip and refine
 measurements each come from a single angle's captures and do not have this
-limit. The analyzer's own ER (LPVIS100 spec floor 1e4) caps everything; the
-table reports `ER light` with it divided out.
+limit. The analyzer's own ER is 1.4e8 at 843 nm (Thorlabs LPVIS100 data:
+1.37e8 at 840 nm, 1.46e8 at 844 nm, 80.6 % transmission); the 1e4 used before
+6 Oct 2026 was the sheet's minimum over 550-1500 nm. A config still holding
+1e4 is moved to 1.4e8 on load. The table's `ER light` divides it out.
+
+**What a linear analyzer cannot tell.** It measures S0, S1 and S2 only, so
+`ER = (1 + p) / (1 - p)` with `p = sqrt(S1^2 + S2^2) / S0` is the same for an
+elliptical beam and for a partly depolarized one, and the handedness of any
+ellipticity is not measured. The Poincare tab draws |S3| = sqrt(1 - p^2)
+and the ellipticity tan chi = sqrt(Imin / Imax) under the assumption of full
+polarization. A quarter-wave plate before the analyzer gives S3 with its
+sign (not built in yet).
 
 ## Using it
 
@@ -133,10 +157,11 @@ table reports `ER light` with it divided out.
    with the polarization at the EO zero. After a scan, this sets the zero
    (the mount angle of analyzer 0) to the scan's fitted rest azimuth. Never
    trust the engraving.
-6. **Null refine**: windows `auto` (rest, hold, after) or `t1-t2` in ms,
+6. **Analyzer** tab, two parts. *Refine the shown scan's static nulls*:
+   windows `auto` (rest, hold, after) or `t1-t2` in ms,
    offsets around crossed, the PD V/div at the null. It takes a background
    at that V/div first (block the beam when asked).
-7. **Find angle**: the analyzer angle of minimum (crossed) or maximum
+7. *Find the min / max transmission angle*: the analyzer angle of minimum (crossed) or maximum
    transmission for the light as it is in a window of the record (the rest
    before the ramp, `-10:-0.5`; a hold of the sequence), or with the AWG
    holding a bias. 4 angles give the azimuth, then the analyzer steps
@@ -155,6 +180,31 @@ from, the drift, the per-angle gains, the shots dropped. The Corrections tab
 draws them, and *Borrow dark / background from another scan...* applies an
 earlier measurement to the shown scan after the fact (written to its
 manifest; *Remove borrowed* takes it out).
+
+**What made a measurement (provenance).** Every scan and bias-run manifest
+gets a `provenance` block when it starts: the git commit of
+ramp-polarimeter, EOM-ILC and Scope Grab (with `*` where a repository had
+uncommitted changes), and the ILC state files the ILC target tab points at -
+name, channel, iteration, file time, the target's fingerprint (the fields of
+`eomilc.corrections.target_fingerprint`) and a hash of the drive. Those are
+the files configured here, not necessarily what the bench plays. Loading a
+scan logs the one-line form.
+
+**Lab log.** `<outdir>/lab_log.csv`: one row per ramp scan (key numbers:
+angles, shots, V/div, what was subtracted, rotation range, the lowest direct
+ER and where, ER_fit at rest and in the holds, drift, residual, versions),
+per bias run and per found angle. A scan's row is written when it is loaded
+with every Apply switch and the drift correction on, and replaced - not
+duplicated - when it is loaded again; a `notes` cell typed by hand is kept.
+*Lab log* on the plot bar opens it. A log open in Excel cannot be written;
+the window says so and the row goes in next time.
+
+**Export brief** (plot bar) writes the shown scan's standard figure set at
+print size into `<scan>/analysis/brief/` - traces, map, residual map,
+rotation, extinction, Poincare, corrections, diagnostics - with
+`summary.json` (the numbers, every direct ER point, the switches used, the
+provenance) and `summary.md` (the numbers, a segment table, each figure
+with a factual caption), drawn with the window's current settings.
 
 ## Per-angle transmission
 
@@ -260,11 +310,16 @@ Each scan is a folder `<outdir>/<name>/` (default outdir
 
 | file | what |
 |---|---|
-| `<name>_scan.json` | manifest: plan, channel roles, scope and mount identity, the analyzer zero, every step with target, landed angle, clock, V/div and offset, file names; rewritten after every step |
+| `<name>_scan.json` | manifest: plan, channel roles, scope and mount identity, the analyzer zero, provenance (software versions, ILC state), every step with target, landed angle, clock, V/div and offset, file names; rewritten after every step |
 | `<name>_a045.00_001.npz` + `.txt` | one dither block at analyzer 45.00 deg - Scope Grab's NPZ and sidecar, written by its own `write_capture` |
 | `<name>_ref003_001...` | reference-angle returns |
 | `<name>_dark_001...` | beam blocked |
 | `<name>_n2_a137.25_001...` | null refine, window 2 |
+| `analysis/brief/` | Export brief: figures, summary.json, summary.md |
+| `analysis/direct_er/` | `tools/direct_er.py` output |
+
+Next to the scan folders: `lab_log.csv`, one row per scan, bias run and found
+angle.
 
 The capture names split as Scope Grab expects (`prefix_NNN`), so its Compare
 box opens any angle: key `<name>_a045.00`, runs `1-4`.
@@ -274,20 +329,23 @@ box opens any angle: key `<name>_a045.00`, runs `1-4`.
 | tab | shows |
 |---|---|
 | Traces | PD at every analyzer angle (colour = angle), dark dashed; monitors below |
-| Map | I(t, theta) / Imax(t), with the fitted null psi + 90 drawn over it |
+| Map | I(t, theta) / Imax(t), with the fitted null psi + 90 drawn over it; or the Malus-fit residual (mV, or per standard error) per angle and time, with the rms per angle beside it: a bad angle, clipping, a missed lock or drift shows as a row or a patch |
 | Malus | I vs analyzer angle at the cursor time, the fit, residuals |
-| Angle | rotation from rest with +-1 SD, the monitor prediction, their difference in mdeg; compare scan overlaid |
-| Extinction | ER_fit (smoothed by the plot bar's Smooth box), dip points (rising/falling), refine points, the drift and analyzer limits; x = time or rotation |
+| Angle | rotation from rest with +-1 SD, the monitor prediction, their difference in mdeg |
+| Extinction | ER_fit (smoothed by the plot bar's Smooth box), dip points (rising/falling), the direct points (crossings, lower bounds, static, offset-limited), refine points, the drift limit; each family switchable; x = time or rotation |
+| Poincaré | the linear Stokes parameters in the rest frame on the sphere (coloured by time), |S3| and the ellipticity angle chi vs time assuming full polarization (handedness not measured), the ellipse at the cursor against the rest ellipse |
 | Diagnostics | ref returns vs time, 1-theta and 4-theta amplitudes, residual vs block SEM, landing error and off-screen samples per step |
-| Table | per-segment medians, every refine and dip ER; Save CSV |
+| Table | per-segment medians, every refine, dip and direct ER; Save CSV |
 | Shots | the data behind every number: pick steps (several with ctrl/shift), a channel, and any of single shots straight from the files, the average the fit uses, +-1 SE, the min-max over the shots, the dropped (missed-lock) shots dashed, the analyzer 90 deg away; a shot list (`1, 3-5`) and a time window - zoom with the toolbar and the view re-reads the files at full resolution. *Crossed at cursor* picks the angle nearest crossed at the cursor time with its partner: the direct-ER view |
 | Build | how the angles become the polarization: a time slider; top every angle's averaged trace as fitted, bottom left the points at that instant (and before corrections) with the Malus fit a0 + B cos 2(theta - psi), its maximum and null, bottom right the rotation with the instant marked |
 | Corrections | what is subtracted (dark / background traces and levels, borrowed ones dashed), the reference drift, the per-angle transmission, shots kept and dropped per step |
+| Compare | the shown scan against up to 6 others picked in a list: rotation, the difference from the shown scan (smoothed, with the shown scan's +-1 SD), ER_fit and the direct points; each with the window's Apply switches |
 | Find angle | the last Find angle scan and its fit |
 | Bias points | static ER vs rotation (Imax/Imin and from the null curvature), light - monitors static (and the shown scan's ramp), Imin with the V/div it was read at, the last null scan |
 | ILC target | the ILC comparison's figures for the shown scan |
 
-Click a time on Map, Angle or Extinction to move the Malus cursor.
+Click a time on Map, Angle, Extinction or the Poincaré tab's time plot to move
+the cursor (Malus, Build and Poincaré follow it).
 
 ## Traps this is built around
 
@@ -317,10 +375,10 @@ python tests/run_tests.py
 | suite | covers |
 |---|---|
 | `test_ell14.py` | the driver against a fake serial port (the real mount's IN reply), the approach-from-below wrapper |
-| `test_analysis.py` | the harmonic fit exact on noise-free data, its uncertainties checked by pulls (unit spread), lower bounds; a 72-angle simulated scan written and read back: rotation, rest azimuth, drift correction, 142 dip ERs against the model, segments, monitor prediction |
+| `test_analysis.py` | the harmonic fit exact on noise-free data, its uncertainties checked by pulls (unit spread), lower bounds; a 72-angle simulated scan written and read back: rotation, rest azimuth, drift correction, 142 dip ERs against the model, direct ERs against the model and their Imax against the fit, the residual map at unit noise, the Stokes identities, segments, monitor prediction; provenance (this repository's commit, an ILC state's fingerprint) and the lab log's update-in-place |
 | `test_checks.py` | the pre-run check against the simulator: a hand-changed scope put back by a preset and confirmed, a silently refused setting reported, and each failure it should catch (AUTO sweep, channel off, wait <= repetition, AC coupling, clipping, off screen, small signal, ramp cut off, no light, no pre-trigger) |
 | `test_bias.py` | the plan (AWG volts, plateaus, the Trek limit check), the null fit and ER, and a whole bias run on the simulated bench (AWG plateaus into the bench model): ER at 0-90 deg against the model, a 2 deg static rotator error recovered, outputs off and scope restored at the end |
-| `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER, a bias run from the Bias points tab; config sandboxed, window off screen |
+| `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER, a bias run from the Bias points tab, the direct points, residual map, Poincaré, Compare, Export brief, provenance and lab-log rows; config sandboxed, window off screen |
 
 ## What has and has not run on hardware
 
