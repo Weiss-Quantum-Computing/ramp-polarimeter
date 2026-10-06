@@ -129,6 +129,42 @@ table reports `ER light` with it divided out.
 A scan that stops can be resumed: start a scan with the same name and answer
 Yes.
 
+## Per-angle transmission
+
+The analyzer's throughput to the PD depends on the mount angle: on 5 Oct 2026
+it rose 2 % from 0 to 180 deg (mostly a 1-theta term, 1.75 %), i.e. the beam
+walking on the detector as the polarizer turns. Left in, it raised the fit
+residual from the 1.1 mV shot noise to 12.8 mV and moved the fitted angles by
+up to 0.5 deg on the ramps. With >= 8 angles over >= 150 deg the analysis now
+fits one transmission factor per angle together with the Malus law (the ramp
+sweeping the polarization through 180 deg is what separates the two) and
+divides it out; Diagnostics shows the factors. They absorb slow intensity
+drift between angles as well.
+
+## Comparing with the ILC target
+
+```
+python tools/target_compare.py SCAN_FOLDER --x1 ../EOM-ILC/run/drive_P92PX1H.state.npz --x2 ../EOM-ILC/run/drive_P92PX2A.state.npz
+```
+
+The reference is the target the ILC was given (monitor volts per crystal,
+90 deg x V/V90 each), not the rotation the monitors predict. The experiment
+plays the ILC drive time-compressed (5 Oct 2026: rise 4.61 -> 4.16 ms, hold
+1.24 -> 0.68 ms), so the tool fits that time map from the recorded command
+(CmdX1/CmdX2; the monitors without one) and maps the target the same way. It
+writes into `SCAN_FOLDER/analysis/target_compare/`:
+
+- `fig1_time_map` - recorded command against the time-mapped ILC drive
+- `fig2_rotation_vs_target` - light and target rotation, light - target and monitors - target
+- `fig3_error_structure` - the differences against target rotation; leg 2 - leg 1
+- `fig4_correction` - the proposed correction and the per-crystal target change
+- `target_<name>_played.csv` - the ILC target with the experiment's timing (what the ILC should converge to for this sequence)
+- `target_<name>_optcorr.csv` - the same plus the optical correction (minus the light's error, mean of the legs, low-passed at `--f-cut`, half per crystal, zero where the target rests)
+- `summary.json` - time map, gain/offset/delay decomposition per leg, leg 2 - leg 1
+
+Both CSVs are the ILC's target format (`time_us,voltage_V`, EOM volts, 2 us)
+and load with `run_ilc.load_target`. Nothing in EOM-ILC is modified.
+
 ## Files
 
 Each scan is a folder `<outdir>/<name>/` (default outdir

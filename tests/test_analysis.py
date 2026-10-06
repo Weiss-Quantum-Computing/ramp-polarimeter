@@ -91,14 +91,19 @@ def scan_checks(sg):
           abs(pol["psi_rest"] - bench.mount_of_rest_pol) < 0.05, f"{pol['psi_rest']:.3f}")
     # 1 % intensity drift across a shuffled scan leaks into the angle fit as
     # scatter between angles; the fitted Imin at rest is where it shows
-    pol_nd = an.polarization(d, correct_drift=False)
     rest = an.rest_index(d.t)
     imin_true = float(np.mean(bench.imax / (1 / (1 / bench.er(0) + 1 / bench.er_pol))))
-    e_on = abs(np.mean(pol["imin"][rest]) - imin_true)
-    e_off = abs(np.mean(pol_nd["imin"][rest]) - imin_true)
+    err = lambda p: abs(np.mean(p["imin"][rest]) - imin_true)
+    # without the per-angle gains, the ref returns are what corrects drift
+    e_on = err(an.polarization(d, angle_gain=False))
+    e_off = err(an.polarization(d, correct_drift=False, angle_gain=False))
     check("drift correction from the ref returns brings rest Imin closer to the model",
           e_on < e_off, f"{e_on * 1e3:.3f} vs {e_off * 1e3:.3f} mV uncorrected "
           f"(model {imin_true * 1e3:.2f} mV)")
+    # the per-angle gains absorb drift between angles on their own
+    e_gain = err(an.polarization(d, correct_drift=False))
+    check("per-angle gains alone take out the drift too", e_gain < e_on,
+          f"{e_gain * 1e3:.3f} mV")
     dips = an.dip_er(pol, polarizer_er=1e4)
     check("two dips per analyzer angle (up and down ramp)", len(dips) >= 130, len(dips))
     erl = 1 / (1 / bench.er(true) + 1 / bench.er_pol)
@@ -232,8 +237,52 @@ def few_angles_checks():
           [m for lv, m in found if lv == "WARN"])
 
 
+def angle_gain_checks():
+    print("\nper-angle transmission (test-4: +2 % from 0 to 180 deg, mostly 1-theta)")
+    th = np.arange(0.0, 181.0, 10.0)
+    t = np.linspace(0, 10e-3, 3000)
+    psi = -90.0 + 180.0 * 0.5 * (1 - np.cos(np.pi * np.clip(t / 5e-3, 0, 2)))
+    g_true = 1 + 0.0175 * np.cos(np.deg2rad(th - 170.0)) + 0.004 * np.cos(np.deg2rad(2 * th))
+    g_true /= g_true.mean()
+    rng = np.random.default_rng(8)
+    I = g_true[:, None] * malus(th, psi, 5.2, np.full(len(t), 1000.0)) + rng.normal(0, 1.1e-3, (len(th), len(t)))
+    g = an.angle_gains(th, I)
+    check("gains recovered to 0.05 %", np.max(np.abs(g - g_true)) < 5e-4,
+          f"max error {np.max(np.abs(g - g_true)) * 100:.3f} %")
+    plain = an.harmonic_fit(th, I, np.full(len(th), 1.1e-3))
+    fixed = an.harmonic_fit(th, I / g[:, None], np.full(len(th), 1.1e-3) / g)
+    check("with them divided out the residual is back to the noise",
+          np.median(fixed["rms"]) < 1.5e-3 < np.median(plain["rms"]),
+          f"{np.median(plain['rms']) * 1e3:.1f} -> {np.median(fixed['rms']) * 1e3:.2f} mV")
+    err = lambda f: np.max(np.abs((f["psi"] - psi + 90) % 180 - 90))
+    check("and the azimuth error drops", err(fixed) < 0.2 * err(plain),
+          f"{err(plain) * 1e3:.0f} -> {err(fixed) * 1e3:.0f} mdeg peak")
+
+
+def time_map_checks():
+    print("\ntime map: an ILC drive played compressed (test-4: rise x0.904, hold 1.24 -> 0.68 ms)")
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
+    import target_compare as tc
+    tt = np.arange(0, 11e-3, 2e-6)
+    rise = lambda x: 0.5 * (1 - np.cos(np.pi * np.clip(x, 0, 1)))
+    T = 5.13 * np.minimum(rise((tt - 0.27e-3) / 4.608e-3), rise((10.73e-3 - tt) / 4.608e-3))
+    u = 1.79 * T + 0.02
+    S = tc.landmarks(tt, T)
+    E_true = np.array([0.425e-3, 4.588e-3, 5.268e-3, 9.442e-3])
+    t = np.arange(-12e-3, 38e-3, 0.5e-6)
+    cmd = 1.008 * np.interp(tc.warp(S, E_true, t), tt, u) - 0.092
+    cmd = cmd + np.random.default_rng(2).normal(0, 0.01, len(t))
+    E, g, o, rms = tc.fit_timing(t, cmd, tt, u, S, 0.6e-3)
+    check("landmarks recovered to 2 us", np.max(np.abs(E - E_true)) < 2e-6,
+          f"{np.round((E - E_true) * 1e6, 2)} us")
+    check("gain and offset recovered", abs(g - 1.008) < 1e-3 and abs(o + 0.092) < 2e-3,
+          f"gain {g:.4f}, offset {o:+.4f} V, rms {rms * 1e3:.1f} mV")
+
+
 def main():
     sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
+    angle_gain_checks()
+    time_map_checks()
     few_angles_checks()
     stopped_mid_step_checks(sg)
     harmonic_checks()

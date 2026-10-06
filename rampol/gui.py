@@ -1625,7 +1625,16 @@ class App:
         ax.set_title("Reference-angle returns")
         ax.grid(alpha=0.3)
         ax = fig.add_subplot(222)
-        if "c1" in pol:
+        if pol.get("angle_gain") is not None:
+            g = pol["angle_gain"]
+            order = np.argsort(wrap_angle(pol["theta"]))
+            ax.plot(wrap_angle(pol["theta"])[order], (g[order] - 1) * 100, "o-", ms=3)
+            ax.axhline(0, color="k", lw=0.6)
+            ax.set_xlabel("analyzer angle (deg)")
+            ax.set_ylabel("transmission - mean (%)")
+            ax.set_title("Per-angle transmission (fitted, divided out)")
+            ax.grid(alpha=0.3)
+        elif "c1" in pol:
             B = np.maximum(pol["B"], 1e-9)
             sm = lambda y: self.smooth(y, d.t)
             # smooth the components, then take the amplitude: noise alone
@@ -1634,12 +1643,13 @@ class App:
             ax.plot(t, np.hypot(sm(pol["c4"]), sm(pol["s4"])) / B * 1e3, lw=0.6, label="4-theta / B")
             ax.legend(fontsize=7)
         else:
-            ax.text(0.5, 0.5, "needs >= 9 angles over >= 300 deg", ha="center",
+            ax.text(0.5, 0.5, "needs >= 8 angles over >= 150 deg", ha="center",
                     transform=ax.transAxes, color="#888")
-        ax.set_ylabel("relative amplitude (1e-3)")
-        ax.set_xlabel("time (ms)")
-        ax.set_title("Harmonics outside the Malus law")
-        ax.grid(alpha=0.3)
+        if pol.get("angle_gain") is None:
+            ax.set_ylabel("relative amplitude (1e-3)")
+            ax.set_xlabel("time (ms)")
+            ax.set_title("Harmonics outside the Malus law")
+            ax.grid(alpha=0.3)
         ax = fig.add_subplot(223)
         sem_med = np.nanmedian([np.nanmedian(s["sem"]["PD"]) for s in pol["steps"]])
         src = pol.get("err_source", "residual")

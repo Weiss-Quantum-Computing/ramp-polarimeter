@@ -423,13 +423,53 @@ def rest_index(t, frac=0.04):
     return m
 
 
-def polarization(d, correct_drift=True, diagnostics=None):
+def angle_gains(theta_deg, I, iters=30):
+    """Per-angle transmission factors g_k, fitted jointly with the Malus law:
+    I_k(t) = g_k (a0(t) + c2(t) cos 2theta_k + s2(t) sin 2theta_k), mean g = 1.
+
+    MEASURED 5 Oct 2026 (16-ms-spin-echo-test-4, 19 angles over 0-180): the
+    analyzer's throughput to the PD depends on the mount angle - +2 % from 0
+    to 180 deg, mostly a 1-theta term (1.75 %), i.e. the beam walking on the
+    detector as the polarizer turns. Left in, it raised the fit residual from
+    1.1 mV (shot noise) to 12.8 mV and tilted psi and Imin during the ramps;
+    with it fitted the residual is 1.65 mV. The factors are identifiable
+    because the ramp sweeps the polarization through 180 deg; the overall
+    scale is not (mean fixed at 1). Also absorbs any intensity drift between
+    angles. Returns g (K,)."""
+    r = np.deg2rad(np.asarray(theta_deg, float))
+    A = np.column_stack([np.ones_like(r), np.cos(2 * r), np.sin(2 * r)])
+    g = np.ones(len(r))
+    for _ in range(iters):
+        coef, *_ = np.linalg.lstsq(A, I / g[:, None], rcond=None)
+        M = A @ coef
+        g_new = np.sum(I * M, axis=1) / np.maximum(np.sum(M * M, axis=1), 1e-30)
+        g_new /= g_new.mean()
+        if np.max(np.abs(g_new - g)) < 1e-7:
+            g = g_new
+            break
+        g = g_new
+    return g
+
+
+def polarization(d, correct_drift=True, diagnostics=None, angle_gain=None):
     """The full per-sample result for a scan: harmonic_fit plus psi_u
     (unwrapped azimuth), rotation (psi_u minus its rest value), t, and the
-    drift record."""
+    drift record.
+
+    angle_gain: fit a transmission factor per analyzer angle (angle_gains) and
+    divide it out first. Default: on when there are >= 8 angles covering
+    >= 150 deg - with fewer the factors trade off against the polarization."""
     th, I, sem, steps = scan_matrix(d, "scan", correct_drift)
     if len(th) < 3:
         raise ValueError(f"{len(th)} analyzer angles measured - need at least 3")
+    if angle_gain is None:
+        span = harmonic_fit(th, I[:, :2], None)["theta_span"] if len(th) >= 3 else 0
+        angle_gain = len(th) >= 8 and span >= 150
+    gains = None
+    if angle_gain:
+        gains = angle_gains(th, I)
+        I = I / gains[:, None]
+        sem = sem / gains
     fit = harmonic_fit(th, I, sem, diagnostics)
     psi_u = unwrap_psi(fit["psi"])
     rest = rest_index(d.t)
@@ -443,7 +483,7 @@ def polarization(d, correct_drift=True, diagnostics=None):
     fit.update(t=d.t, theta=th, I=I, steps=steps, psi_u=psi_u,
                psi_rest=psi_rest, rotation=psi_u - psi_rest,
                dark=dark, ref_clocks=clocks, ref_levels=levels,
-               drift_resid=drift_residual(clocks, levels))
+               drift_resid=drift_residual(clocks, levels), angle_gain=gains)
     return fit
 
 
