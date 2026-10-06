@@ -261,8 +261,7 @@ def angle_gain_checks():
 
 def time_map_checks():
     print("\ntime map: an ILC drive played compressed (test-4: rise x0.904, hold 1.24 -> 0.68 ms)")
-    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
-    import target_compare as tc
+    from rampol import ilc_target as tc
     tt = np.arange(0, 11e-3, 2e-6)
     rise = lambda x: 0.5 * (1 - np.cos(np.pi * np.clip(x, 0, 1)))
     T = 5.13 * np.minimum(rise((tt - 0.27e-3) / 4.608e-3), rise((10.73e-3 - tt) / 4.608e-3))

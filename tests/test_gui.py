@@ -177,7 +177,7 @@ def main():
         if fig is not None:
             name = app.nb.tab(frame, "text")
             fig.savefig(os.path.join(out, f"{name}.png"))
-    check("every figure tab drew", len(os.listdir(out)) == 6, sorted(os.listdir(out)))
+    check("every figure tab drew", len(os.listdir(out)) == 8, sorted(os.listdir(out)))
     check("table has rows", len(app.tv.get_children()) > 5, len(app.tv.get_children()))
 
     print("\ncursor and compare")
@@ -244,6 +244,33 @@ def main():
     check("no fit yet: the fit tabs say they need 3 angles",
           any("needs 3" in t.get_text() for ax in app.fig_angle.axes for t in ax.texts))
     app.result = res
+
+    print("\nbias points: AWG plateaus into the simulated bench")
+    tabs = [app.modes.tab(f, "text") for f in app.modes.tabs()]
+    check("measurement modes are tabs", tabs == ["Ramp scan", "Null refine", "Bias points",
+                                                "ILC target"], tabs)
+    app.bv["biases"].set("0:90:45")
+    app.bv["shots"].set("4")
+    app.bv["name"].set("gui-bias")
+    app._sim_parts[0].realtime = 0.0
+    app.do_start_bias()
+    settle(root, app, timeout=300)
+    br = app.bias_result
+    pts = (br or {}).get("points", [])
+    check("bias run measured and loaded", len(pts) == 3,
+          ", ".join(f"{p['bias']:g}: ER {p.get('er') or 0:.0f}" for p in pts))
+    check("ER at rest near the bench's 3333", bool(pts) and bool(pts[0].get("er"))
+          and abs(pts[0]["er"] / 3333 - 1) < 0.2, pts and pts[0].get("er"))
+    check("AWG outputs off afterwards", not any(app.bench.awg_on.values()))
+    check("the beam is back (dark unblocked)", app.bench.imax > 0)
+    app.nb.select(app.fig_bias._frame)
+    root.update()
+    app.fig_bias.savefig(os.path.join(out, "Bias_points.png"))
+    check("bias tab drew four panels", len(app.fig_bias.axes) >= 4, len(app.fig_bias.axes))
+    app.nb.select(app.fig_ilc._frame)
+    root.update()
+    check("ILC tab says what to do with no comparison yet",
+          any("Compare shown scan" in t.get_text() for ax in app.fig_ilc.axes for t in ax.texts))
     print(f"\nfigures in {out}")
     app.on_close()
     check("settings saved to the sandbox", os.path.exists(cfgmod.CONFIG_PATH))

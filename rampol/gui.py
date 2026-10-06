@@ -74,8 +74,17 @@ class App:
         self.build_hardware(left)
         self.build_analyzer(left)
         self.build_channels(left)
-        self.build_scan(left)
-        self.build_refine(left)
+        # the measurement modes share the column below the hardware as tabs
+        # (selected by frame); Stop and progress sit under them, for all
+        self.modes = ttk.Notebook(left)
+        self.modes.pack(fill="x", padx=8, pady=3)
+        self.build_scan(self._mode_tab("Ramp scan"))
+        self.build_refine(self._mode_tab("Null refine"))
+        self.build_bias(self._mode_tab("Bias points"))
+        self.build_ilc(self._mode_tab("ILC target"))
+        self.build_runbar(left)
+        self.bias_result = None
+        self.ilc_summary = None
         self.build_right(right)
         self.load_settings()
         self.refresh_scan_list()
@@ -247,8 +256,8 @@ class App:
                        "Ref = pick-off before the analyzer.").pack(anchor="w", padx=6, pady=(0, 4))
 
     def build_scan(self, left):
-        f = ttk.LabelFrame(left, text="Scan")
-        f.pack(fill="x", padx=8, pady=3)
+        f = ttk.Frame(left)
+        f.pack(fill="x", padx=2, pady=3)
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=2)
         ttk.Label(r, text="Preset").pack(side="left")
@@ -303,21 +312,14 @@ class App:
         rr.pack(fill="x", padx=6, pady=(4, 2))
         self._btn(rr, "Check scope", self.do_check_scope)
         self._btn(rr, "Start scan", self.do_start_scan, padx=(4, 0))
-        self.stop_btn = ttk.Button(rr, text="Stop", command=self.do_stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=6)
         self.est_label = ttk.Label(rr, text="", foreground="#666")
-        self.est_label.pack(side="left")
-        self.progress_bar = ttk.Progressbar(f, mode="determinate", maximum=1)
-        self.progress_bar.pack(fill="x", padx=6, pady=(2, 1))
-        self.progress_text = ttk.Label(f, text="", foreground="#060", width=48,
-                                       wraplength=330)
-        self.progress_text.pack(anchor="w", padx=6, pady=(0, 4))
+        self.est_label.pack(side="left", padx=6)
         for v in list(self.sv.values()) + [self.order, self.mode]:
             v.trace_add("write", lambda *_: self.update_estimate())
 
     def build_refine(self, left):
-        f = ttk.LabelFrame(left, text="Null refine (static parts)")
-        f.pack(fill="x", padx=8, pady=3)
+        f = ttk.Frame(left)
+        f.pack(fill="x", padx=2, pady=3)
         self.rv = {}
         for label, key, w in (("Windows (ms)", "windows", 22),
                               ("Offsets (deg)", "offsets", 22),
@@ -399,6 +401,19 @@ class App:
         cb.bind("<<ComboboxSelected>>", lambda _e: self.redraw(self.fig_ext))
         self.fig_diag = self._fig_tab("Diagnostics", self.draw_diagnostics)
         self.build_table_tab()
+        # these two draw without a ramp scan loaded
+        self.fig_bias = self._fig_tab("Bias points", self.draw_bias)
+        self.fig_ilc = self._fig_tab("ILC target", self.draw_ilc)
+        self.free_tabs = {self.fig_bias._frame, self.fig_ilc._frame}
+        ttk.Label(self.fig_ilc._ctl, text="figure:").pack(side="left")
+        self.ilc_fig = tk.StringVar(value="fig2_rotation_vs_target.png")
+        cb = ttk.Combobox(self.fig_ilc._ctl, textvariable=self.ilc_fig, width=28,
+                          state="readonly",
+                          values=("fig1_time_map.png", "fig2_rotation_vs_target.png",
+                                  "fig3_error_structure.png", "fig4_correction.png",
+                                  "fig5_line_ripple.png"))
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda _e: self.redraw(self.fig_ilc))
         self.nb.bind("<<NotebookTabChanged>>", lambda _e: self.draw_visible())
 
     def _fig_tab(self, name, draw, click=False):
@@ -441,6 +456,360 @@ class App:
         self.plot_tabs[frame] = (None, self.fill_table)
         self.plot_dirty.add(frame)
 
+    # -- measurement-mode tabs ---------------------------------------------------
+    def _mode_tab(self, name):
+        frame = ttk.Frame(self.modes)
+        self.modes.add(frame, text=name)
+        return frame
+
+    def build_runbar(self, left):
+        """Stop and progress, under the mode tabs: every mode uses them."""
+        f = ttk.Frame(left)
+        f.pack(fill="x", padx=8, pady=(0, 4))
+        r = ttk.Frame(f)
+        r.pack(fill="x")
+        self.stop_btn = ttk.Button(r, text="Stop", command=self.do_stop, state="disabled")
+        self.stop_btn.pack(side="left")
+        self.progress_bar = ttk.Progressbar(r, mode="determinate", maximum=1)
+        self.progress_bar.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.progress_text = ttk.Label(f, text="", foreground="#060", width=48,
+                                       wraplength=330)
+        self.progress_text.pack(anchor="w", pady=(0, 2))
+
+    def build_bias(self, f):
+        """Bias points: the AWG holds the EOMs at fixed rotations, the analyzer
+        steps around each null at a sensitive V/div (rampol.bias)."""
+        self.bv = {}
+        for items in ((("Biases (deg)", "biases", 13), ("split on X1", "split", 5)),
+                      (("Shots", "shots", 4), ("null +-deg", "null_half_deg", 4),
+                       ("null points", "null_points", 3)),
+                      (("Hold ms", "hold_ms", 5), ("settle ms", "settle_ms", 4),
+                       ("Name", "name", 11))):
+            rr = ttk.Frame(f)
+            rr.pack(fill="x", padx=6, pady=1)
+            for label, key, w in items:
+                ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
+                self.bv[key] = tk.StringVar()
+                ttk.Entry(rr, textvariable=self.bv[key], width=w).pack(side="left", padx=(0, 6))
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        ttk.Label(rr, text="Order").pack(side="left")
+        self.bias_order = tk.StringVar()
+        ttk.Combobox(rr, textvariable=self.bias_order, values=("up", "updown"),
+                     width=8, state="readonly").pack(side="left", padx=4)
+        self._btn(rr, "Start bias points", self.do_start_bias, padx=(8, 0))
+        self._btn(rr, "Load...", self.do_load_bias, padx=(4, 0))
+        ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
+            "Biases: start:stop:step or a list, in target rotation degrees. The "
+            "4063B (close its GUI) plays plateaus on the bench trigger (EXT), CH1 "
+            "-> X1, CH2 -> X2, checked against the Trek limits first. Per bias: 4 "
+            "angles find the azimuth, then the analyzer steps +-null deg around the "
+            "crossed position at the most sensitive V/div that holds it (Imin), and "
+            "once to the bright angle (Imax). The window opens 'settle' ms into the "
+            "hold (scope overdrive recovery). The beam is blocked once, for the "
+            "darks at every V/div used.")).pack(anchor="w", padx=6, pady=(2, 4))
+
+    def build_ilc(self, f):
+        """The ILC target comparison and correction files (rampol.ilc_target)."""
+        self.iv = {}
+        for label, key, w, browse in (("X1 ILC state", "x1", 30, "state"),
+                                      ("X2 ILC state", "x2", 30, "state"),
+                                      ("Line ref scan", "line_ref", 30, "scan")):
+            rr = ttk.Frame(f)
+            rr.pack(fill="x", padx=6, pady=1)
+            ttk.Label(rr, text=label, width=12).pack(side="left")
+            self.iv[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.iv[key], width=w).pack(side="left", padx=2)
+            ttk.Button(rr, text="...", width=3,
+                       command=lambda k=key, b=browse: self.pick_ilc_file(k, b)).pack(side="left")
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        for label, key, w in (("band Hz", "f_cut", 6), ("PD delay us", "pd_delay_us", 5),
+                              ("split X1", "split", 4)):
+            ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
+            self.iv[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.iv[key], width=w).pack(side="left", padx=(0, 6))
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=(3, 1))
+        self._btn(rr, "Compare shown scan", self.do_ilc_compare)
+        ttk.Button(rr, text="Open output folder", command=self.open_ilc_folder).pack(
+            side="left", padx=4)
+        ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
+            "Light against the target the ILC was given (P92PX1H/P92PX2A), time-"
+            "mapped onto the experiment's waveform. Writes target_<name>_played.csv "
+            "(run the ILC on it) and corr_<name>_optical.csv per crystal for the "
+            "ILC panel's Corrections tab: minus (light - monitors), so the loop does "
+            "not count the monitors' own error twice. Line ref: the same sequence "
+            "with the ramps off, so the 60 Hz ripple is not baked into the "
+            "correction. PD delay: the photodiode chain's own (an RC filter: 3.1 "
+            "us).")).pack(anchor="w", padx=6, pady=(2, 4))
+
+    def pick_ilc_file(self, key, kind):
+        if kind == "state":
+            p = filedialog.askopenfilename(
+                title="ILC state", parent=self.root, filetypes=[("ILC state", "*.state.npz")],
+                initialdir=os.path.dirname(self.iv[key].get()) or None)
+        else:
+            p = filedialog.askdirectory(title="Drive-off scan of the same sequence",
+                                        parent=self.root, initialdir=self.outdir.get())
+        if p:
+            self.iv[key].set(p)
+
+    # -- bias points ---------------------------------------------------------------
+    def ask_main(self, title, text):
+        """A yes/no from the worker thread, asked on the Tk thread. In simulate
+        mode it also blocks/unblocks the simulated beam."""
+        if self.stop_flag.is_set():
+            return False
+        ans, ev = [], threading.Event()
+
+        def ui():
+            try:
+                ans.append(messagebox.askokcancel(title, text, parent=self.root))
+            finally:
+                ev.set()
+        self.call(ui)
+        while not ev.wait(0.2):
+            if self.stop_flag.is_set():
+                return False
+        ok = bool(ans and ans[0])
+        if ok and self.bench is not None:
+            if "Block the beam" in text:
+                self.bench._imax_saved, self.bench.imax = self.bench.imax, 0.0
+            elif "Unblock" in text and hasattr(self.bench, "_imax_saved"):
+                self.bench.imax = self.bench._imax_saved
+        return ok
+
+    def do_start_bias(self):
+        if not self.need():
+            return
+        c = self.gather()
+        self.save_settings()
+        roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(c).items()}
+        if "PD" not in roles:
+            self.log("No channel has the PD role.")
+            return
+        plan = dict(c["bias"])
+        name = plan.pop("name", "bias") or "bias"
+        sim_mode = self.bench is not None
+
+        def go():
+            from . import bias as biasmod
+            eom = ib = None
+            if sim_mode:
+                awg = sim.FakeAWG(self.bench)
+            else:
+                eom = hw.load_eomilc(c["eomilc_path"])
+                mod = hw.load_module(c["awg_path"], "bk4063b")
+                import ilc_bench as ib
+                ib._AWGMOD = mod
+                awg = mod.BK4063B(connect=False,
+                                  resource_manager=getattr(self.link.scope, "rm", None))
+                self.log(f"AWG: {awg.connect()}")
+            self.bias_live = {"points": [], "name": name, "plan": plan}
+            run = biasmod.BiasRun(c["outdir"], name, self.link, self.rot, awg, roles,
+                                  plan=plan, log=self.log, cancelled=self.stop_flag.is_set,
+                                  ask=self.ask_main, progress=self._progress,
+                                  on_point=lambda p: self.call(self._bias_point, p),
+                                  eomilc=eom, ilc_bench=ib)
+            try:
+                run.run()
+            finally:
+                if not sim_mode:
+                    awg.close()
+            return run.folder
+
+        def done(folder):
+            self.load_bias(folder)
+        self.worker(go, done=done)
+
+    def _bias_point(self, p):
+        self.bias_live.setdefault("points", []).append(p)
+        from . import bias as biasmod
+        self.bias_result = dict(self.bias_live, transfer=biasmod.transfer(
+            self.bias_live["points"]))
+        self.plot_dirty.add(self.fig_bias._frame)
+        self.nb.select(self.fig_bias._frame)
+        self.draw_visible()
+
+    def do_load_bias(self):
+        d = filedialog.askdirectory(title="A bias run folder (holds bias.json)",
+                                    parent=self.root, initialdir=self.outdir.get())
+        if d:
+            self.load_bias(d)
+
+    def load_bias(self, folder):
+        from . import bias as biasmod
+        try:
+            self.bias_result = biasmod.load(folder)
+        except (OSError, ValueError) as exc:
+            self.log(f"Bias run not loaded: {exc}")
+            return
+        tf = self.bias_result.get("transfer")
+        n = len(self.bias_result.get("points", []))
+        self.log(f"Bias run {self.bias_result['name']}: {n} points"
+                 + (f"; light / monitors gain {tf['gain']:.4f}, residual "
+                    f"{tf['rms_resid']*1e3:.0f} mdeg rms" if tf else ""))
+        self.plot_dirty.add(self.fig_bias._frame)
+        self.nb.select(self.fig_bias._frame)
+        self.draw_visible()
+
+    def _ramp_lm(self):
+        """The shown scan's light - monitors against target rotation, from its
+        ILC comparison (analysis/target_compare), if there is one."""
+        if not self.result:
+            return None
+        p = os.path.join(self.result["d"].folder, "analysis", "target_compare",
+                         "target_compare.npz")
+        if not os.path.exists(p):
+            return None
+        z = np.load(p)
+        return z["phi_target"], z["leg1_d_lm"]
+
+    def draw_bias(self, fig):
+        r = getattr(self, "bias_result", None)
+        if not r or not r.get("points"):
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "No bias run yet - Bias points tab: Start, or Load",
+                    ha="center", va="center", transform=ax.transAxes, color="#888")
+            ax.set_axis_off()
+            return
+        pts = r["points"]
+        cols = {"up": "#1f77b4", "down": "#d62728"}
+        ax = fig.add_subplot(221)
+        for d_ in ("up", "down"):
+            ps = [p for p in pts if p.get("dir", "up") == d_]
+            if not ps:
+                continue
+            x = [p["phi_mon"] if p.get("phi_mon") is not None else p["bias"] for p in ps]
+            ok = [i for i, p in enumerate(ps) if p.get("er")]
+            ax.errorbar([x[i] for i in ok], [ps[i]["er"] for i in ok],
+                        [ps[i].get("sig_er") or 0 for i in ok], fmt="o", ms=4,
+                        color=cols[d_], label=f"Imax / Imin ({d_})")
+            lb = [i for i, p in enumerate(ps) if not p.get("er") and p.get("er_lower")]
+            if lb:
+                ax.plot([x[i] for i in lb], [ps[i]["er_lower"] for i in lb], "^",
+                        color=cols[d_], label="lower bound (Imin unresolved)")
+            cv = [i for i in ok if ps[i].get("malus_ratio")]
+            ax.plot([x[i] for i in cv],
+                    [(ps[i]["imin"] + ps[i]["fit"]["k"]) / ps[i]["imin"] for i in cv],
+                    "x", color=cols[d_], alpha=0.6, label="from the null's curvature")
+        ax.set_yscale("log")
+        ax.set_xlabel("rotation, monitors (deg)")
+        ax.set_ylabel("extinction ratio")
+        ax.set_title(f"Static extinction ratio ({r['name']})")
+        ax.legend(fontsize=7)
+        ax.grid(alpha=0.3, which="both")
+
+        ax = fig.add_subplot(222)
+        tf = r.get("transfer")
+        if tf:
+            phi = np.array(tf["phi_mon"])
+            dev = (np.array(tf["rot_light"]) - phi) * 1e3
+            dirs = tf.get("dir", ["up"] * len(phi))
+            for d_ in ("up", "down"):
+                m = np.array([x == d_ for x in dirs])
+                if m.any():
+                    ax.plot(phi[m], dev[m], "o-", ms=4, color=cols[d_],
+                            label=f"static, {d_}")
+            ramp = self._ramp_lm()
+            if ramp is not None:
+                act = ramp[0] > 0.5
+                ax.plot(ramp[0][act], ramp[1][act] * 1e3, ",", color="0.5", alpha=0.5,
+                        label=f"ramp {self.result['d'].name}, leg 1")
+            ax.set_xlabel("rotation, monitors (deg)")
+            ax.set_ylabel("light - monitors (mdeg)")
+            ax.set_title(f"Light - monitors, static: gain {tf['gain']:.4f}, "
+                         f"{tf['rms_resid']*1e3:.0f} mdeg rms left", fontsize=8)
+            ax.legend(fontsize=7)
+            ax.grid(alpha=0.3)
+
+        ax = fig.add_subplot(223)
+        x = [p["phi_mon"] if p.get("phi_mon") is not None else p["bias"] for p in pts]
+        ax.errorbar(x, [p["imin"] * 1e3 for p in pts], [p["sig_imin"] * 1e3 for p in pts],
+                    fmt="o", ms=4, label="Imin (dark-subtracted)")
+        for xi, p in zip(x, pts):
+            if p.get("scan"):
+                ax.annotate(f"{p['scan']['vdiv']*1e3:g}", (xi, p["imin"] * 1e3), fontsize=6,
+                            xytext=(3, 3), textcoords="offset points", color="#666")
+        ax.set_yscale("log")
+        ax.set_xlabel("rotation, monitors (deg)")
+        ax.set_ylabel("Imin (mV); labels: mV/div")
+        ax.grid(alpha=0.3, which="both")
+
+        ax = fig.add_subplot(224)
+        p = pts[-1]
+        sc = p.get("scan")
+        if sc:
+            th = np.array(sc["theta"])
+            ax.errorbar(th - p["theta_n"], np.array(sc["I"]) * 1e3,
+                        np.array(sc["sem"]) * 1e3, fmt="o", ms=4)
+            xx = np.linspace(th.min(), th.max(), 200)
+            f_ = p["fit"]
+            ax.plot(xx - p["theta_n"], (f_["imin"] + f_["k"] * np.sin(np.deg2rad(
+                xx - f_["theta_n"])) ** 2) * 1e3, color="k", lw=0.8)
+            ax.set_xlabel("analyzer - null (deg)")
+            ax.set_ylabel("PD (mV)")
+            ax.set_title(f"Null scan at {p['bias']:g} deg: null {p['theta_n']:.3f} "
+                         f"+- {p['sig_theta_n']*1e3:.0f} mdeg", fontsize=8)
+            ax.grid(alpha=0.3)
+
+    # -- ILC target ----------------------------------------------------------------
+    def do_ilc_compare(self):
+        if not self.result:
+            self.log("Load the ramp scan to compare first (Plot data: Scan).")
+            return
+        c = self.gather()
+        self.save_settings()
+        i = c["ilc"]
+        folder = self.result["d"].folder
+
+        def go():
+            from . import ilc_target
+            return ilc_target.compare(
+                folder, i["x1"], i["x2"], f_cut=float(i["f_cut"]),
+                lock_tol=float(c["analysis"].get("lock_tol", 0.006)),
+                pd_delay_us=float(i["pd_delay_us"]), split=float(i["split"]),
+                line_ref=i.get("line_ref") or None,
+                scope_grab_path=c["scope_grab_path"], eomilc_path=c["eomilc_path"],
+                log=self.log)
+
+        def done(summary):
+            self.ilc_summary = summary
+            for f_ in summary["correction"]["files"]:
+                self.log(f"  wrote {f_}")
+            self.log("  ILC panel: Init on target_<name>_played.csv, converge, then "
+                     "Corrections -> Add corr_<name>_optical.csv -> Preview -> Apply")
+            self.plot_dirty.add(self.fig_ilc._frame)
+            self.nb.select(self.fig_ilc._frame)
+            self.draw_visible()
+        self.worker(go, done=done)
+
+    def open_ilc_folder(self):
+        s = getattr(self, "ilc_summary", None)
+        out = s["out"] if s else (os.path.join(self.result["d"].folder, "analysis",
+                                               "target_compare") if self.result else None)
+        if out and os.path.isdir(out):
+            os.startfile(out) if hasattr(os, "startfile") else self.log(out)
+        else:
+            self.log("Nothing written yet for the shown scan.")
+
+    def draw_ilc(self, fig):
+        s = getattr(self, "ilc_summary", None)
+        out = s["out"] if s else (os.path.join(self.result["d"].folder, "analysis",
+                                               "target_compare") if self.result else None)
+        name = self.ilc_fig.get()
+        p = os.path.join(out, name) if out else None
+        ax = fig.add_subplot(111)
+        ax.set_axis_off()
+        if not p or not os.path.exists(p):
+            ax.text(0.5, 0.5, "No ILC comparison for the shown scan yet - ILC target "
+                              "tab: Compare shown scan", ha="center", va="center",
+                    transform=ax.transAxes, color="#888")
+            return
+        import matplotlib.image as mpimg
+        ax.imshow(mpimg.imread(p))
+
     # -- settings -------------------------------------------------------------
     def load_settings(self):
         # Setting a variable fires update_estimate, which gathers the window
@@ -474,6 +843,11 @@ class App:
         self.scan_name.set(c["scan_name"])
         for k, v in self.rv.items():
             v.set(str(c["refine"].get(k, "")))
+        for k, v in self.bv.items():
+            v.set(str(c["bias"].get(k, "")))
+        self.bias_order.set(c["bias"].get("order", "up"))
+        for k, v in self.iv.items():
+            v.set(str(c["ilc"].get(k, "")))
 
     def gather(self):
         """The window's values into self.cfg (validated where it matters)."""
@@ -502,6 +876,21 @@ class App:
         c["scan_name"] = self.scan_name.get().strip()
         for k, v in self.rv.items():
             c["refine"][k] = float(v.get()) if k == "pd_vdiv" and _isnum(v.get()) else v.get().strip()
+        b = c["bias"]
+        for k, v in self.bv.items():
+            txt = v.get().strip()
+            if k in ("biases", "name"):
+                b[k] = txt
+            elif _isnum(txt):
+                b[k] = int(float(txt)) if k in ("shots", "null_points") else float(txt)
+        b["order"] = self.bias_order.get() or "up"
+        i = c["ilc"]
+        for k, v in self.iv.items():
+            txt = v.get().strip()
+            if k in ("x1", "x2", "line_ref"):
+                i[k] = txt
+            elif _isnum(txt):
+                i[k] = float(txt)
         return c
 
     def save_settings(self):
@@ -575,6 +964,9 @@ class App:
             scope, ell, self.bench = sim.make(sg, roles=roles,
                                               zero_offset_deg=float(self.cfg["ell_zero_deg"]))
             scope.realtime = 0.05
+            # noise that scales with V/div, so a null read at mV/div looks like
+            # the bench (see SimScope.noise_per_div)
+            self.bench.pd_noise, scope.noise_per_div = 0.2e-3, 0.012
             self._sim_parts = (scope, ell)
         return self._sim_parts
 
@@ -1352,7 +1744,16 @@ class App:
     def redraw(self, fig, draw=None):
         draw = draw or self.plot_tabs[fig._frame][1]
         fig.clear()
-        if not self.result:
+        if fig._frame in getattr(self, "free_tabs", ()):
+            try:
+                draw(fig)
+            except Exception as exc:
+                fig.clear()
+                ax = fig.add_subplot(111)
+                ax.text(0.02, 0.5, f"Could not draw: {exc}", transform=ax.transAxes)
+                ax.set_axis_off()
+                self.log(f"draw: {exc}")
+        elif not self.result:
             ax = fig.add_subplot(111)
             ax.text(0.5, 0.5, "No scan loaded", ha="center", va="center",
                     transform=ax.transAxes, color="#888")

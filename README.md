@@ -141,29 +141,90 @@ sweeping the polarization through 180 deg is what separates the two) and
 divides it out; Diagnostics shows the factors. They absorb slow intensity
 drift between angles as well.
 
-## Comparing with the ILC target
+## Comparing with the ILC target (ILC target tab)
+
+The *ILC target* tab (or the same thing from the command line):
 
 ```
-python tools/target_compare.py SCAN_FOLDER --x1 ../EOM-ILC/run/drive_P92PX1H.state.npz --x2 ../EOM-ILC/run/drive_P92PX2A.state.npz
+python tools/target_compare.py SCAN_FOLDER --x1 ../EOM-ILC/run/drive_P92PX1H.state.npz --x2 ../EOM-ILC/run/drive_P92PX2A.state.npz [--line-ref DRIVE_OFF_SCAN] [--pd-delay-us 3.1]
 ```
 
 The reference is the target the ILC was given (monitor volts per crystal,
 90 deg x V/V90 each), not the rotation the monitors predict. The experiment
 plays the ILC drive time-compressed (5 Oct 2026: rise 4.61 -> 4.16 ms, hold
-1.24 -> 0.68 ms), so the tool fits that time map from the recorded command
-(CmdX1/CmdX2; the monitors without one) and maps the target the same way. It
-writes into `SCAN_FOLDER/analysis/target_compare/`:
+1.24 -> 0.68 ms), so the comparison fits that time map from the recorded
+command (CmdX1/CmdX2; the monitors without one) and maps the target the same
+way. It writes into `SCAN_FOLDER/analysis/target_compare/`:
 
 - `fig1_time_map` - recorded command against the time-mapped ILC drive
 - `fig2_rotation_vs_target` - light and target rotation, light - target and monitors - target
 - `fig3_error_structure` - the differences against target rotation; leg 2 - leg 1
-- `fig4_correction` - the proposed correction and the per-crystal target change
-- `target_<name>_played.csv` - the ILC target with the experiment's timing (what the ILC should converge to for this sequence)
-- `target_<name>_optcorr.csv` - the same plus the optical correction (minus the light's error, mean of the legs, low-passed at `--f-cut`, half per crystal, zero where the target rests)
-- `summary.json` - time map, gain/offset/delay decomposition per leg, leg 2 - leg 1
+- `fig4_correction` - the correction and the per-crystal target change
+- `fig5_line_ripple` - the undriven stretches with the 60 Hz family (fitted in the line-reference scan, or here only for show)
+- `target_<name>_played.csv` - the ILC target with the experiment's timing: what the ILC should converge to for this sequence (`time_us,voltage_V`, EOM volts, 2 us; loads with `run_ilc.load_target`)
+- `corr_<name>_optical.csv` - the target correction for that crystal, in EOM-ILC's correction format (`eomilc/corrections.py`), for the ILC panel's **Corrections** tab
+- `summary.json` - time map, gain/offset/delay decomposition per leg, leg 2 - leg 1, line ripple, correction sizes
 
-Both CSVs are the ILC's target format (`time_us,voltage_V`, EOM volts, 2 us)
-and load with `run_ilc.load_target`. Nothing in EOM-ILC is modified.
+**The correction is minus (light - monitors)**, low-passed (2 kHz), split
+between the crystals (half each by default), zero where the target rests.
+Not minus (light - target): the ILC removes the monitors' own error by itself
+once it runs on the played target, and a target change built on light -
+target removes it a second time (the first version of this tool wrote such
+`*_optcorr.csv` files on 5 Oct; it now deletes them). Each file carries the
+statistical sigma per sample and the target it was measured against, so the
+ILC panel can refuse noise, refuse the wrong campaign and check the Trek
+limits.
+
+**Line ripple.** The experiment's trigger is line-synchronous, so 60 Hz and
+its harmonics sit at a fixed phase in every record and survive averaging
+(about 1 V per crystal, ~25 mdeg on the light). A correction formed from such
+a record would carry an anti-ripple tied to this sequence's phase. The ramp
+record cannot measure it - its undriven stretches are short and carry the
+Trek settling and the crystal memory (on test-4 the 60 Hz estimate moved
+2-5x with 0.3 ms changes of the windows) - so give a **line reference**: a
+scan of the same sequence with the ramps disabled (8 angles is plenty). It is
+fitted over the whole record and subtracted before the correction is formed.
+Without one the file says `line_removed: false` and the ILC panel warns.
+
+**PD delay.** The photodiode chain's own delay (an anti-alias RC: 3.1 us) is
+measurement, not light. Give it, and the light is read that much later
+before it is compared; otherwise the 7 us light-monitor lag seen on test-4 is
+partly the filter, and correcting it would put a real error on the light.
+
+## Bias points (Bias points tab)
+
+A ramp scan reads every angle at the V/div the brightest needs, so near a
+null the scope resolves ~1 code: on test-4 the rest/hold minima (2.6-3 mV)
+were one step at 1 V/div - ER ~1800 there is the scope's floor. Mid-ramp
+(166-281 mV, ER 18-31) they were well resolved.
+
+Bias points hold the EOMs at fixed rotations with the AWG (4063B; close its
+GUI; CH1 -> X1, CH2 -> X2; plateaus on the bench trigger, EXT, each checked
+with EOM-ILC's limit check before upload) and, per bias:
+
+1. 4 analyzer angles at the normal V/div: the azimuth and Imax;
+2. the analyzer stepped +-`null` deg around the crossed position at the most
+   sensitive V/div that keeps the scan on screen (the ladder goes up a step
+   when a reading clips): I = Imin + K sin^2(theta - theta_n) -> theta_n,
+   Imin;
+3. the bright angle at the normal V/div: Imax.
+
+ER = Imax / Imin, both measured and dark-subtracted at the V/div each was
+taken at (the beam is blocked once, at the start, for every V/div the run
+can use). An unresolved Imin gives a lower bound. K / (Imax - Imin) checks
+the Malus shape. The window starts `settle` ms into the hold: the plateau's
+edges overdrive the scope at mV/div and the MSO-X needs ~3 ms to recover.
+
+theta_n - 90 is the static polarization azimuth, so the run is also the
+rotator's **static transfer curve**: light against the monitors' prediction,
+over 0-180 deg. The tab draws it with the shown scan's ramp light - monitors
+(from its ILC comparison) on the same axes: if the ramps' +-2-3 deg, ~90 deg
+pattern is also there statically, it is the optics (QWP alignment or
+retardance), not the dynamics. `updown` order repeats the list downwards
+(hysteresis). Results: `<outdir>/<name>/bias.json` + `point_NN.npz` (mean
+traces, decimated). The beam itself is not measured for depolarization vs
+ellipticity - that needs a QWP in front of the analyzer (a second scan gives
+S3).
 
 ## Files
 
@@ -192,6 +253,8 @@ box opens any angle: key `<name>_a045.00`, runs `1-4`.
 | Extinction | ER_fit (smoothed by the plot bar's Smooth box), dip points (rising/falling), refine points, the drift and analyzer limits; x = time or rotation |
 | Diagnostics | ref returns vs time, 1-theta and 4-theta amplitudes, residual vs block SEM, landing error and off-screen samples per step |
 | Table | per-segment medians, every refine and dip ER; Save CSV |
+| Bias points | static ER vs rotation (Imax/Imin and from the null curvature), light - monitors static (and the shown scan's ramp), Imin with the V/div it was read at, the last null scan |
+| ILC target | the ILC comparison's figures for the shown scan |
 
 Click a time on Map, Angle or Extinction to move the Malus cursor.
 
@@ -225,19 +288,21 @@ python tests/run_tests.py
 | `test_ell14.py` | the driver against a fake serial port (the real mount's IN reply), the approach-from-below wrapper |
 | `test_analysis.py` | the harmonic fit exact on noise-free data, its uncertainties checked by pulls (unit spread), lower bounds; a 72-angle simulated scan written and read back: rotation, rest azimuth, drift correction, 142 dip ERs against the model, segments, monitor prediction |
 | `test_checks.py` | the pre-run check against the simulator: a hand-changed scope put back by a preset and confirmed, a silently refused setting reported, and each failure it should catch (AUTO sweep, channel off, wait <= repetition, AC coupling, clipping, off screen, small signal, ramp cut off, no light, no pre-trigger) |
-| `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER; config sandboxed, window off screen |
+| `test_bias.py` | the plan (AWG volts, plateaus, the Trek limit check), the null fit and ER, and a whole bias run on the simulated bench (AWG plateaus into the bench model): ER at 0-90 deg against the model, a 2 deg static rotator error recovered, outputs off and scope restored at the end |
+| `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER, a bias run from the Bias points tab; config sandboxed, window off screen |
 
 ## What has and has not run on hardware
 
 - **Verified, 5 Oct 2026:** the ELL14 (S/N 11400318, firmware 13, COM3)
   answered `in`, `gs` and `gp` through this driver: 143360 pulses/rev, status
   OK.
-- **Not yet run on hardware:** ELL14 motion (home, absolute and relative
-  moves, the approach), any scan, the null refine at a sensitive V/div, the
-  preset writes. Everything else is tested against the simulator only. The
-  first bench session should home the mount, check `Go to` lands within
-  0.05 deg in both directions, then run a short scan (0-350 step 30, 16
-  shots) before a full one.
+- **Run on hardware 5 Oct 2026:** ELL14 motion and full ramp scans
+  (16-ms-spin-echo-test-1..5).
+- **Not yet run on hardware:** bias points (AWG control from this program),
+  the null refine at a sensitive V/div, and an optical correction applied
+  through the ILC. These are tested against the simulator only. A first bias
+  session: a short list (`0, 90`), 4 shots, watching the first plateau on
+  the scope before the full 0-180.
 
 ## Provenance
 

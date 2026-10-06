@@ -32,6 +32,35 @@ def load_scope_grab(path):
     return mod
 
 
+def load_eomilc(path):
+    """Put the EOM-ILC repo on sys.path and import its eomilc package (the
+    correction format, the line-ripple fit, the Trek channels and limits)."""
+    path = os.path.abspath(path)
+    if not os.path.isdir(os.path.join(path, "eomilc")):
+        raise FileNotFoundError(f"no eomilc package in {path} - set eomilc_path "
+                                f"to the EOM-ILC checkout")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import eomilc  # noqa: F401
+    from eomilc import corrections  # noqa: F401  (5 Oct 2026 or later)
+    return eomilc
+
+
+def load_module(path, name):
+    """Import a single-file module by path (the AWG driver), cached."""
+    mod = sys.modules.get(name)
+    if mod is not None and os.path.normcase(os.path.abspath(
+            getattr(mod, "__file__", ""))) == os.path.normcase(os.path.abspath(path)):
+        return mod
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{name}: {path} not found")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class Cancelled(Exception):
     pass
 

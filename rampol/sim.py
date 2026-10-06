@@ -33,7 +33,8 @@ class Bench:
                  pd_noise=0.012, drift=3e-3, drift_period_s=600.0,
                  ramp_up_ms=4.61, hold_ms=1.24, swing_deg=180.0,
                  memory_deg=0.15, memory_tau_ms=35.0, deg_per_mon_v=(17.550, 17.519),
-                 legs_ms=(0.0,), lock_miss=0.0):
+                 legs_ms=(0.0,), lock_miss=0.0, rotator_err_deg=0.0,
+                 rotator_err_period_deg=90.0):
         self.rng = np.random.default_rng(seed)
         self.mount_of_rest_pol = mount_of_rest_pol
         self.imax, self.dark = imax, dark
@@ -46,14 +47,42 @@ class Bench:
         self.lock_miss = lock_miss                  # fraction of shots 2.5 % dim
         self.clock = 0.0               # virtual seconds since the bench started
         self.mount = 300.0             # mechanical angle of the analyzer (deg)
+        # a static error of the rotator: the light turns by rot + this, the
+        # monitors report rot (the 5 Oct ramps' +-2-3 deg, ~90 deg period)
+        self.rot_err, self.rot_err_period = rotator_err_deg, rotator_err_period_deg
+        # the AWG, when a FakeAWG plays into the bench: {ch: (period s, u V)}
+        # and which outputs are on. While any is on it replaces the legs.
+        self.awg_drive = {}
+        self.awg_on = {1: False, 2: False}
+        self.awg_gain = {1: 0.5594, 2: 0.5924}     # AWG V -> monitor V
 
     # -- the ramp ---------------------------------------------------------
+    def monitors(self, t):
+        """(X1, X2) monitor volts at t: the AWG's plateaus when it is playing,
+        otherwise the ramp legs shared equally."""
+        t = np.asarray(t, float)
+        if any(self.awg_on.values()) and self.awg_drive:
+            out = []
+            for ch in (1, 2):
+                if not self.awg_on.get(ch) or ch not in self.awg_drive:
+                    out.append(np.zeros_like(t))
+                    continue
+                period, u = self.awg_drive[ch]
+                tu = np.arange(len(u)) * period / len(u)
+                v = np.interp(t, tu, u, left=u[0], right=u[-1])
+                out.append(v * self.awg_gain[ch])
+            return out[0], out[1]
+        rot = sum(self._leg(t - t0) for t0 in self.legs)
+        m = rot / (self.k1 + self.k2)
+        return m, m
+
     def rotation(self, t):
         """Rotation from the rest polarization (deg) at time t (s) after the
-        trigger: one transport per leg (raised-cosine up, hold, raised-cosine
-        down), each followed by a decaying memory term."""
-        t = np.asarray(t, float)
-        return sum(self._leg(t - t0) for t0 in self.legs)
+        trigger, as the monitors report it: one transport per leg
+        (raised-cosine up, hold, raised-cosine down), each followed by a
+        decaying memory term - or the AWG's plateau."""
+        m1, m2 = self.monitors(t)
+        return self.k1 * m1 + self.k2 * m2
 
     def _leg(self, t):
         up, hold, sw = self.up, self.hold, self.swing
@@ -82,9 +111,11 @@ class Bench:
     def signals(self, t, shots):
         """Noise-free-ish channel voltages for one acquisition of `shots`
         triggers at the current mount angle: {role: volts}."""
-        rot = self.rotation(t)
+        m1, m2 = self.monitors(t)
+        rot = self.k1 * m1 + self.k2 * m2
+        light = rot + self.rot_err * np.sin(2 * np.pi * rot / self.rot_err_period)
         # analyzer angle relative to the polarization
-        d = np.deg2rad(self.mount - self.mount_of_rest_pol - rot)
+        d = np.deg2rad(self.mount - self.mount_of_rest_pol - light)
         inv_er = 1 / self.er(rot) + 1 / self.er_pol
         imax = self.imax * self.intensity_gain()
         if shots == 1 and self.lock_miss and self.rng.random() < self.lock_miss:
@@ -92,15 +123,14 @@ class Bench:
         pd = self.dark + imax * (np.cos(d) ** 2 + inv_er * np.sin(d) ** 2)
         n = np.sqrt(max(shots, 1))
         pd = pd + self.rng.normal(0, self.pd_noise / n, t.size)
-        mon = rot / (self.k1 + self.k2)
-        x1 = mon + self.rng.normal(0, 1e-3 / n, t.size)
-        x2 = mon + self.rng.normal(0, 1e-3 / n, t.size)
+        x1 = m1 + self.rng.normal(0, 1e-3 / n, t.size)
+        x2 = m2 + self.rng.normal(0, 1e-3 / n, t.size)
         marker = np.where((t >= 0) & (t < 20e-6), 5.0, 0.0)
         ref = 2.0 * self.intensity_gain() + self.rng.normal(0, 2e-3 / n, t.size)
         # the command into each Trek: ~8.5 V for 5.15 kV on the bench (2 Oct
         # 2026), i.e. ~1.65 x the monitor
-        c1 = 1.65 * mon + self.rng.normal(0, 1e-3 / n, t.size)
-        c2 = 1.62 * mon + self.rng.normal(0, 1e-3 / n, t.size)
+        c1 = m1 / self.awg_gain[1] * 0.92 + self.rng.normal(0, 1e-3 / n, t.size)
+        c2 = m2 / self.awg_gain[2] * 0.96 + self.rng.normal(0, 1e-3 / n, t.size)
         return {"PD": pd, "MonX1": x1, "MonX2": x2, "CmdX1": c1, "CmdX2": c2,
                 "Marker": marker, "Ref": ref, "Other": np.zeros_like(t)}
 
@@ -158,6 +188,52 @@ class FakeELL14:
         pass
 
 
+class FakeAWG:
+    """The BK4063B calls a bias run makes, playing into a Bench: uploads
+    become the bench's drive, outputs switch it, the burst plays on every
+    trigger from the record's start."""
+
+    def __init__(self, bench):
+        self.bench = bench
+        self.idn = "SIMULATED,4063B,SIM,0"
+        self.frq = {1: 1000.0, 2: 1000.0}
+        self.amp = {1: 20.0, 2: 20.0}
+        self.stored = {}
+        self.selected = {}
+
+    def connect(self, resource=None):
+        return self.idn
+
+    def close(self):
+        pass
+
+    def is_on(self, ch):
+        return bool(self.bench.awg_on.get(ch))
+
+    def set_output(self, ch, on):
+        self.bench.awg_on[ch] = bool(on)
+
+    def apply_channel(self, ch, blocks, log=lambda s: None):
+        b = blocks.get("BSWV", {})
+        if "FRQ" in b:
+            self.frq[ch] = float(b["FRQ"])
+        if "AMP" in b:
+            self.amp[ch] = float(b["AMP"])
+        return []
+
+    def upload_arb(self, ch, name, samples, freq=None, amp=None, offset=None,
+                   phase=None, normalize=True):
+        x = np.clip(np.asarray(samples, float), -1, 1)
+        self.stored[name] = x
+        self.selected[ch] = name
+        self.bench.awg_drive[ch] = (1.0 / self.frq[ch], x * self.amp[ch] / 2)
+        self.bench.clock += 0.8
+        return len(x)
+
+    def list_waveforms(self, user_only=False):
+        return list(self.stored)
+
+
 class FakeInst:
     """The VISA session under the fake scope: settings as a dict."""
 
@@ -195,6 +271,13 @@ def make_scope_class(sg):
             self._acq = None
             self._pending = None
             self.realtime = 0.0         # seconds actually slept per acquisition (demo)
+            # the scope front end's noise on the PD channel, divisions rms per
+            # shot. 0 here: Bench.pd_noise (12 mV) stands for all of it, which
+            # is right at 1 V/div and what the analysis tests are tuned on. A
+            # bench read at sensitive V/div wants the split - pd_noise 0.2 mV
+            # (the PD) and 0.012 div here (12 uV at 1 mV/div) - which the
+            # window's simulator uses (gui.ensure_sim) and test_bias sets.
+            self.noise_per_div = 0.0
 
         def connect(self, addr=None):
             p = self.prof
@@ -286,6 +369,11 @@ def make_scope_class(sg):
             scale = float(self.inst.state[p.ch_scale.format(ch=channel)])
             off = float(self.inst.state[p.ch_offset.format(ch=channel)])
             code = p.adc_code_per_vdiv * scale or 0.04 * scale
+            # the front end's own noise, a fraction of a division (0 by
+            # default: the bench model's pd_noise stands for it at 1 V/div)
+            if self.noise_per_div and self.roles.get(channel) == "PD":
+                v = v + self.bench.rng.normal(0, self.noise_per_div * scale
+                                              / math.sqrt(max(shots, 1)), v.size)
             # per-code error pattern, smeared by noise when averaged
             smear = math.exp(-0.5 * (2 * math.pi * 0.012 / code) ** 2) if shots > 1 else 1.0
             v = v + 0.0017 * scale * smear * np.sin(2 * np.pi * (v - off) / code)

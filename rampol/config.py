@@ -110,6 +110,11 @@ def all_presets(cfg):
 
 DEFAULTS = {
     "scope_grab_path": os.path.join(PROJECTS, "scope-grab-multi", "scope_grab.py"),
+    # EOM-ILC: the target-correction format, the Trek limits and the line-
+    # ripple fit come from its eomilc package; the AWG driver from the 4063B
+    # repo (bias-point measurements). Both loaded by path, like Scope Grab.
+    "eomilc_path": os.path.join(PROJECTS, "EOM-ILC"),
+    "awg_path": os.path.join(PROJECTS, "BK4063B-AWG-GUI", "bk4063b.py"),
     "scope_model": "msox2014a",
     "scope_addr": "",
     "ell_port": "COM3",
@@ -126,6 +131,14 @@ DEFAULTS = {
         "4": {"role": "MonX2", "name": "Trek monitor X2"},
     },
     "outdir": os.path.join(PROJECTS, "scope_data", "polarimetry"),
+    # bias points (rampol.bias): the AWG holds the EOMs at fixed rotations
+    "bias": {"biases": "0:180:15", "order": "up", "split": 0.5, "shots": 8,
+             "null_half_deg": 3.0, "null_points": 9, "hold_ms": 8.0,
+             "settle_ms": 4.0, "name": "bias"},
+    # the ILC target comparison (rampol.ilc_target)
+    "ilc": {"x1": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX1H.state.npz"),
+            "x2": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX2A.state.npz"),
+            "f_cut": 2000.0, "pd_delay_us": 0.0, "split": 0.5, "line_ref": ""},
     "scan_name": "scan",
     "preset": "Spin echo 16.7 ms (2 legs)",
     "user_presets": {},
