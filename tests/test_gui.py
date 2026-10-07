@@ -999,6 +999,7 @@ def main():
     app.dark_mode.set("reuse latest")
     app.bg_mode.set("reuse latest")
     app.scan_name.set("seq reuse")
+    app.link.scope.put(":TIMebase:SCALe", "0.0005")   # a preset's span, too short
     app.do_seq_start()
     settle(root, app, timeout=600)
     mans = {}
@@ -1011,6 +1012,14 @@ def main():
           "second scan borrowing what the first borrowed",
           all(m and all(x["status"] == "done" for x in m["steps"]) for m in mans.values())
           and srcs[0] == srcs[1] and all(srcs[0].values()), srcs)
+    _c = app.gather()
+    _e, waves_, _f = app._seq_waves(_c)
+    span_ = app._scope_span()
+    longest_ = max(w.period for w in waves_)
+    b_, a_ = float(_c["awg"]["scope_before_ms"]) * 1e-3, float(_c["awg"]["scope_after_ms"]) * 1e-3
+    check("the sequence set the scope to the AWG tab's span around the longest record",
+          span_ is not None and span_[0] <= -b_ + 1e-9 and span_[1] >= longest_ + a_ - 1e-9,
+          (span_, longest_))
     app.dark_mode.set("none")
     app.bg_mode.set("none")
     # nothing loaded, scans compared: the Compare tab and the overlay tabs draw them

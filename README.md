@@ -449,8 +449,11 @@ The order, each step its own button:
      EOM volts is refused), checked against their own state's target.
    **The scope's span** is set apart from the AWG record (*scope from
    `before` ms before the trigger to `after` ms past the record*,
-   rounded up to two figures), on Load and for Find in the hold. The dry run
-   always shows the whole record.
+   rounded up to two figures), on Load, for Find in the hold and at the
+   start of a Sequence (around its longest record; unticked, the Sequence
+   warns when the screen misses part of a ramp - on 7 Oct the AWG bench
+   ramp preset's 1.5 ms/div, set for the ILC's 11 ms, cut the fall off a
+   14 ms ramp). The dry run always shows the whole record.
 
    **With a ramp scan.** The scan does not touch the AWG: Load, dry run,
    Outputs ON, then start a ramp scan in its tab - it records on the same

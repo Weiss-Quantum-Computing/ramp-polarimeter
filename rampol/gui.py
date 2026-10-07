@@ -1468,6 +1468,30 @@ class App:
         self.a_record.configure(text=f"record {rec:g} ms = {n} points at {p['dt_us']:g} us"
                                      + note)
 
+    def _fit_scope(self, c, wave):
+        """Worker: the scope's timebase from the AWG tab's span around
+        `wave`'s record (scope_before_ms / scope_after_ms)."""
+        div, pos = self._awg_scope_tb(c, wave)
+        sc = self.link.scope
+        sc.put(":TIMebase:REFerence", "LEFT")
+        sc.put(":TIMebase:SCALe", f"{div:.6g}")
+        sc.put(":TIMebase:POSition", f"{pos:.6g}")
+        self.log(f"  scope timebase {div*1e3:g} ms/div from {(pos - div)*1e3:+.2f} ms "
+                 f"to {(pos + 9 * div)*1e3:+.2f} ms (the record is {wave.period*1e3:.3f} ms)")
+
+    def _scope_span(self):
+        """Worker: (left, right) s of the scope's screen, or None."""
+        try:
+            sc = self.link.scope
+            div = float(sc.get(":TIMebase:SCALe"))
+            pos = float(sc.get(":TIMebase:POSition"))
+            ref = (sc.get(":TIMebase:REFerence") or "").strip().upper()
+        except (TypeError, ValueError, AttributeError):
+            return None
+        left = pos - (div if ref.startswith("LEFT") else 5 * div if ref.startswith("CENT")
+                      else 9 * div)
+        return left, left + 10 * div
+
     def _awg_scope_tb(self, c, wave):
         a = c["awg"]
         return awgmod.timebase_for(wave, float(a.get("scope_before_ms", 0.2) or 0),
@@ -1814,6 +1838,17 @@ class App:
         the ramp changes; parked at the end, whatever happens."""
         sess = self._awg_session(c)
         a = c["awg"]
+        # the scope spans the longest record (7 Oct: the preset's 1.5 ms/div,
+        # set for the ILC's 11 ms, cut a 14 ms ramp's fall off every capture)
+        longest = max(waves, key=lambda w: w.period)
+        if a.get("fit_timebase"):
+            self._fit_scope(c, longest)
+        else:
+            span = self._scope_span()
+            if span and (span[0] > 0 or span[1] < longest.period):
+                self.log(f"  WARNING: the scope shows {span[0]*1e3:+.2f} to {span[1]*1e3:+.2f} ms "
+                         f"and the record is {longest.period*1e3:.3f} ms - part of every ramp "
+                         f"is off screen (tick 'set the scope from' in AWG Settings...)")
         self._seq_share_offsets(runs)
         steps = [[x for x in r.manifest["steps"] if x["kind"] in ("scan", "ref")] for r in runs]
         n = min(len(x) for x in steps)
@@ -2084,14 +2119,7 @@ class App:
             sess = self._awg_session(c)
             names = sess.load(wave)
             if fit_tb and self.link is not None:
-                div, pos = self._awg_scope_tb(c, wave)
-                sc = self.link.scope
-                sc.put(":TIMebase:REFerence", "LEFT")
-                sc.put(":TIMebase:SCALe", f"{div:.6g}")
-                sc.put(":TIMebase:POSition", f"{pos:.6g}")
-                self.log(f"  scope timebase {div*1e3:g} ms/div from {(pos - div)*1e3:+.2f} ms "
-                         f"to {(pos + 9 * div)*1e3:+.2f} ms (the record is "
-                         f"{wave.period*1e3:.3f} ms)")
+                self._fit_scope(c, wave)
             return names
 
         def done(names):
