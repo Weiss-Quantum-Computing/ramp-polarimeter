@@ -1279,7 +1279,7 @@ def scan_summary(res, direct=None):
            "shots_per_angle": man.get("plan", {}).get("shots"),
            "preset": man.get("plan", {}).get("preset", ""),
            "sequence": man.get("plan", {}).get("sequence"),
-           "notes": man.get("notes", "")}
+           "notes": man.get("notes", ""), "drive": man.get("drive")}
     cs = res.get("corr") or {}
     out["subtracted"] = cs.get("subtracted_kind")
     out["subtracted_mV"] = None if cs.get("subtracted") is None else cs["subtracted"] * 1e3

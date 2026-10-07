@@ -173,8 +173,14 @@ DEFAULTS = {
     # AWG mode (rampol.awg): the 4063B drives the Treks, CH1 -> X1, CH2 -> X2.
     # idle1/2 blank = from the ILC state files' first sample (the learned trim)
     "awg": {"source": "ramp", "rotation": 45.0, "split": 0.5, "edge": "cosine",
+            # the record is lead + rise + hold + fall + after (tail_ms): the
+            # defaults make it the ILC's own 11 ms (5501 points at 2 us)
             "lead_ms": 0.5, "rise_ms": 1.0, "hold_ms": 8.0, "fall_ms": 1.0,
-            "record_ms": 11.0, "dt_us": 2.0, "idle1": "", "idle2": "",
+            "tail_ms": 0.5, "dt_us": 2.0, "idle1": "", "idle2": "",
+            # the scope while the AWG plays (Load, Find in the hold): from
+            # scope_before_ms before the trigger to scope_after_ms after the
+            # AWG record ends - set apart from the AWG record itself
+            "scope_before_ms": 0.2, "scope_after_ms": 0.0,
             "file1": "", "file2": "", "trig_hz": 3.7,
             "settle_ms": 4.0, "fit_timebase": True, "shots": 8,
             # BOTH outputs: never switched off by the program (the X2 path's

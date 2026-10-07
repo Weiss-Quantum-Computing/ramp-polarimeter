@@ -41,7 +41,10 @@ AWG_HELP = (
     "CH2 -> Trek X2 -> EO2. 'ramp': idle -> the rotation (split between the crystals, "
     "volts from the EOM calibration) -> idle, both ends exactly at idle; idle blank = the "
     "ILC state files' first sample (the learned trim; file zero parks the EOMs at -9 / "
-    "-41 V). The default record is the ILC's (11 ms at 2 us). 'ILC drives': two "
+    "-41 V). The record is lead + rise + hold + fall + after (the defaults: the ILC's 11 "
+    "ms at 2 us); a different length is set up through idle with the outputs live, and "
+    "Park goes back to 11 ms. The scope's span is set apart: from 'before' ms before the "
+    "trigger to 'after' ms past the record. 'ILC drives': two "
     "drive_<stem>_iNN.csv, checked against their own state's target. "
     "ORDER: Preview (draws it, checks the Trek limits, length, trigger period, duty, "
     "idle cap) -> Dry run on scope (AWG outputs teed to two scope channels, Treks not "
@@ -897,9 +900,13 @@ class App:
         combo(rr, "edge", ("cosine", "linear"), 7, "cosine")
         rr = row()
         for label, key in (("lead", "lead_ms"), ("rise", "rise_ms"), ("hold", "hold_ms"),
-                           ("fall", "fall_ms"), ("record", "record_ms")):
-            entry(rr, key, 4 if key != "record_ms" else 5, label)
+                           ("fall", "fall_ms"), ("after", "tail_ms")):
+            entry(rr, key, 4, label)
         entry(rr, "dt_us", 4, "ms, dt", "us")
+        self.a_record = CopyLabel(f, text="", foreground="#666", width=60)
+        self.a_record.pack(anchor="w", padx=6)
+        for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms", "dt_us"):
+            self.av[k].trace_add("write", lambda *_: self._awg_record_text())
         rr = row()
         entry(rr, "idle1", 7, "Idle X1")
         entry(rr, "idle2", 7, "X2", "V")
@@ -916,8 +923,10 @@ class App:
         rr = row()
         entry(rr, "trig_hz", 5, "Trigger", "Hz")
         self.a_fit_tb = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="scope timebase to the record",
-                        variable=self.a_fit_tb).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(rr, text="set the scope: from", variable=self.a_fit_tb).pack(
+            side="left", padx=(8, 0))
+        entry(rr, "scope_before_ms", 4, None, "ms before the trigger to")
+        entry(rr, "scope_after_ms", 4, None, "ms after the record")
         rr = row()
         self.a_never = tk.BooleanVar(value=True)
         self.a_require = tk.BooleanVar(value=True)
@@ -1001,6 +1010,28 @@ class App:
             self.log(f"  EOM-ILC not loaded ({exc}): no Trek limit check")
             return None
 
+    def _awg_record_text(self):
+        """The ramp's record length under its fields: their sum."""
+        try:
+            p = {k: float(self.av[k].get()) for k in
+                 ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms", "dt_us")}
+        except (ValueError, KeyError):
+            self.a_record.configure(text="")
+            return
+        rec = awgmod.record_ms(p)
+        n = int(round(rec / (p["dt_us"] * 1e-3))) + 1 if p["dt_us"] > 0 else 0
+        note = (" - the ILC's own record" if abs(rec - awgmod.ILC_RECORD_MS) < 1e-9
+                and abs(p["dt_us"] - awgmod.ILC_DT_US) < 1e-9 else
+                " - not the ILC's 11 ms: with the outputs live the change goes through "
+                "idle; Park returns to 11 ms")
+        self.a_record.configure(text=f"record {rec:g} ms = {n} points at {p['dt_us']:g} us"
+                                     + note)
+
+    def _awg_scope_tb(self, c, wave):
+        a = c["awg"]
+        return awgmod.timebase_for(wave, float(a.get("scope_before_ms", 0.2) or 0),
+                                   float(a.get("scope_after_ms", 0.0) or 0))
+
     def _awg_build(self, c):
         """The waveform and its checks from the AWG tab (Tk thread)."""
         a = c["awg"]
@@ -1009,6 +1040,15 @@ class App:
         else:
             wave = awgmod.ramp_hold(float(a["rotation"]), a, idle=self._awg_idle(c))
         found = awgmod.check(wave, self._eom(c), trig_hz=float(a.get("trig_hz") or 0) or None)
+        # a spin-echo sequence triggers every leg: a record longer than the
+        # legs' spacing is still playing when leg 2's trigger comes
+        if (cfgmod.PRESETS.get(c.get("preset")) or {}).get("sequence"):
+            gap = float((c.get("sequence") or {}).get("spacing_ms", 0) or 0)
+            if gap and wave.period * 1e3 >= gap:
+                found.append(("WARN", f"record {wave.period*1e3:.2f} ms is longer than the "
+                                      f"{gap:g} ms between the spin-echo legs (Spin echo "
+                                      f"preset): leg 2's trigger comes while the burst still "
+                                      f"plays, and the 4063B ignores it - leg 2 is not driven"))
         return wave, found
 
     def do_awg_preview(self):
@@ -1053,6 +1093,26 @@ class App:
         self.awg_sess.never_float = bool(a.get("never_float", True))
         self.awg_sess.require_dry_run = bool(a.get("require_dry_run", True))
         return self.awg_sess
+
+    def _awg_drive_info(self):
+        """What this window's AWG plays into the Treks, for a scan's manifest
+        - None unless its outputs are ON with a waveform of ours (not parked)."""
+        s = self.awg_sess
+        if s is None or not s.owned or s.parked or s.wave is None:
+            return None
+        w = s.wave
+        out = {"source": "this window's AWG (rampol)", "label": w.label,
+               "names": list(awgmod.names(w)), "record_ms": w.period * 1e3,
+               "dt_us": w.dt * 1e6, "idle_V": w.idle(), "dry_run_passed": s.is_verified(w),
+               "rotation_deg": w.rotation,
+               "hold_ms": None if not w.hold else [w.hold[0] * 1e3, w.hold[1] * 1e3]}
+        if w.source == "ramp":
+            a = self.cfg.get("awg", {})
+            out["ramp"] = {k: a.get(k) for k in ("rotation", "split", "edge", "lead_ms",
+                                                 "rise_ms", "hold_ms", "fall_ms", "tail_ms")}
+        else:
+            out["files"] = dict(w.files)
+        return out
 
     def do_connect_awg(self):
         """Connect the 4063B now rather than on first use. Only *IDN? is sent:
@@ -1262,12 +1322,14 @@ class App:
             sess = self._awg_session(c)
             names = sess.load(wave)
             if fit_tb and self.link is not None:
-                div, pos = awgmod.timebase_for(wave)
+                div, pos = self._awg_scope_tb(c, wave)
                 sc = self.link.scope
                 sc.put(":TIMebase:REFerence", "LEFT")
                 sc.put(":TIMebase:SCALe", f"{div:.6g}")
                 sc.put(":TIMebase:POSition", f"{pos:.6g}")
-                self.log(f"  scope timebase {div*1e3:g} ms/div from -0.2 ms (the record)")
+                self.log(f"  scope timebase {div*1e3:g} ms/div from {(pos - div)*1e3:+.2f} ms "
+                         f"to {(pos + 9 * div)*1e3:+.2f} ms (the record is "
+                         f"{wave.period*1e3:.3f} ms)")
             return names
 
         def done(names):
@@ -1397,8 +1459,8 @@ class App:
                 with biasmod.window_timebase(self.link, (t0, t1), self.log):
                     out = post(run(), (t0, t1), "awg hold")
             else:
-                # the AWG's whole record on screen, whatever the preset's timebase
-                div, pos = awgmod.timebase_for(wave)
+                # the AWG tab's scope span, whatever the preset's timebase
+                div, pos = self._awg_scope_tb(c, wave)
                 sc = self.link.scope
                 sc.put(":TIMebase:REFerence", "LEFT")
                 sc.put(":TIMebase:SCALe", f"{div:.6g}")
@@ -1447,6 +1509,17 @@ class App:
             if w.hold[1] - w.hold[0] > settle * 1e-3 + 0.5e-3:
                 ax2.axvspan(w.hold[0] * 1e3 + settle, w.hold[1] * 1e3 - 0.2,
                             color="#9ecae1", alpha=0.5, lw=0, label="Find window")
+        try:
+            c_ = self.gather()
+            if c_["awg"].get("fit_timebase"):
+                div, pos = self._awg_scope_tb(c_, w)
+                for a_ in (ax, ax2):
+                    a_.axvline((pos - div) * 1e3, color="#d62728", lw=0.8, ls=":")
+                    a_.axvline((pos + 9 * div) * 1e3, color="#d62728", lw=0.8, ls=":")
+                ax2.plot([], [], color="#d62728", lw=0.8, ls=":", label="the scope's record")
+                ax.set_xlim((pos - div) * 1e3, (pos + 9 * div) * 1e3)
+        except (ValueError, KeyError):
+            pass
         ax2.set_xlabel("time from the trigger (ms)")
         ax2.set_ylabel("rotation (deg)")
         ax2.legend(fontsize=7, loc="upper right")
@@ -3783,9 +3856,15 @@ class App:
                     dark_mode=dm, bg_mode=bm)
         if (cfgmod.PRESETS.get(c["preset"]) or {}).get("sequence"):
             plan["sequence"] = dict(c.get("sequence") or cfgmod.DEFAULTS["sequence"])
-        run.new(plan, steps, extra={"zero_deg": float(c["ell_zero_deg"]),
-                                    "precheck": getattr(self, "last_check", None),
-                                    "provenance": self._provenance(c)})
+        extra = {"zero_deg": float(c["ell_zero_deg"]),
+                 "precheck": getattr(self, "last_check", None),
+                 "provenance": self._provenance(c)}
+        drive = self._awg_drive_info()
+        if drive:
+            extra["drive"] = drive
+            self.log(f"  the EOMs are driven by this window's AWG: {drive['label']} - recorded "
+                     f"in the scan (the ILC state files in its provenance are not what plays)")
+        run.new(plan, steps, extra=extra)
         self.run = run
         self.log(f"Scan {run.name}: {len(angles)} angles, {len(steps)} steps -> {run.folder}")
         reuse = [k for k, m in (("dark", dm), ("background", bm)) if m == "reuse latest"]

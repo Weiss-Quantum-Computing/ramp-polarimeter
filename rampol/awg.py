@@ -14,10 +14,18 @@ against EOM-ILC and bk4063b.py):
   idle + amplitude x shape with BOTH ends exactly at idle, idle capped at
   +-100 mV (EOM-ILC's Limits.idle_awg).
 * Record length. In DDS mode the whole record is resampled into one FRQ
-  period, FRQ = 1/(N dt). The default record is EOM-ILC's: 11 ms at 2 us,
-  5501 points, 90.893 Hz - so switching between an ILC drive and a ramp here
-  never needs the channel set up again, and the ILC's own FRQ check passes
-  afterwards. N <= 16384 (datasheet; 5501 is the most proven).
+  period, FRQ = 1/(N dt). A ramp's record is lead + rise + hold + fall +
+  after; the defaults make it EOM-ILC's: 11 ms at 2 us, 5501 points, 90.893
+  Hz. N <= 16384 (datasheet; 5501 is the most proven). A different length
+  needs the channels set up again for the new FRQ, and setting up stops
+  the burst for a moment (BSWV switches burst off; the mode block puts it
+  back), so the channel free-runs whatever it holds. With the outputs live
+  (never-float) the session therefore first plays a flat idle waveform on
+  the CURRENT grid - free-running, it is still idle - then sets the channels
+  up, then uploads. Park and the end of anything go back to the ILC's 11 ms
+  grid, so the ILC panel's FRQ check passes afterwards. This live change has
+  not been tried on the bench (7 Oct 2026): the dry run does it first, into
+  the scope.
 * Names. The 4063B cannot delete stored waveforms over SCPI and locks its
   panel past 11-character names. A waveform's name is a hash of its samples
   (RP<ch><8 hex>): the same waveform is selected again, not stored again.
@@ -100,26 +108,36 @@ def edge(n, kind="cosine"):
     return 0.5 - 0.5 * np.cos(np.pi * k)
 
 
+ILC_RECORD_MS, ILC_DT_US = 11.0, 2.0      # EOM-ILC's record: 5501 points, 90.893 Hz
+
+
+def record_ms(p):
+    """A ramp's record length (ms): lead + rise + hold + fall + after."""
+    p = dict(DEFAULTS, **(p or {}))
+    return sum(float(p[k]) for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms"))
+
+
 def ramp_hold(rotation_deg, p, idle=None, chan=None):
-    """Idle -> the commanded rotation -> idle: lead at idle, `rise` edge,
-    hold, `fall` edge, idle to the end of a `record_ms` record on a `dt_us`
-    grid (N = record / dt + 1, EOM-ILC's convention: 11 ms -> 5501). The
-    rotation is split split : 1 - split between EO1 and EO2 (awg_volts) and
-    is relative to idle. Both ends are exactly idle."""
+    """Idle -> the commanded rotation -> idle: `lead` at idle, `rise` edge,
+    hold, `fall` edge, `after` (tail_ms) at idle - the record is their sum,
+    on a `dt_us` grid (N = record / dt + 1, EOM-ILC's convention: 11 ms ->
+    5501). The rotation is split split : 1 - split between EO1 and EO2
+    (awg_volts) and is relative to idle. Both ends are exactly idle."""
     p = dict(DEFAULTS, **(p or {}))
     idle = idle or {"EO1": 0.0, "EO2": 0.0}
     split = float(p["split"])
     if not 0.0 <= split <= 1.0:
         raise ValueError(f"split {split:g} must be between 0 and 1")
     dt = float(p["dt_us"]) * 1e-6
-    n = int(round(float(p["record_ms"]) * 1e-3 / dt)) + 1
-    seg = [float(p[k]) * 1e-3 for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms")]
+    if dt <= 0:
+        raise ValueError("dt must be > 0")
+    seg = [float(p[k]) * 1e-3 for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms")]
     if min(seg) < 0:
-        raise ValueError("lead, rise, hold and fall must be >= 0")
-    nl, nr, nh, nf = (int(round(x / dt)) for x in seg)
-    if nl + nr + nh + nf + 1 > n:
-        raise ValueError(f"lead + rise + hold + fall = {sum(seg)*1e3:.3f} ms does not fit "
-                         f"the {p['record_ms']:g} ms record")
+        raise ValueError("lead, rise, hold, fall and after must be >= 0")
+    if seg[0] <= 0 or seg[4] <= 0:
+        raise ValueError("lead and after must be > 0: the record starts and ends at idle")
+    nl, nr, nh, nf, na = (int(round(x / dt)) for x in seg)
+    n = nl + nr + nh + nf + na + 1
     prof = np.zeros(n)
     prof[nl:nl + nr] = edge(nr, p["edge"])
     prof[nl + nr:nl + nr + nh] = 1.0
@@ -308,11 +326,27 @@ def wave_name(u, ch):
     return f"RP{ch}{hashlib.sha1(codes.tobytes()).hexdigest()[:8]}"
 
 
-def timebase_for(wave):
-    """(scale s/div, position s) for REFerence LEFT: the record from 0.2 ms
-    before the trigger, as the bias run sets it."""
-    div = biasmod._nice_up(wave.period * 1.05 / 10)
-    return div, -0.2e-3 + div
+def timebase_for(wave, before_ms=0.2, after_ms=0.0):
+    """(scale s/div, position s) for REFerence LEFT: from `before_ms` before
+    the trigger to `after_ms` after the record ends (defaults: the whole
+    record from 0.2 ms before, as the bias run sets it)."""
+    import math
+    before, after = float(before_ms) * 1e-3, float(after_ms) * 1e-3
+    # rounded UP to two significant figures, as the spin-echo preset's: a
+    # 1-2-5 step would nearly double a 29 ms span (the MSO-X takes 2.9 ms/div)
+    raw = (before + wave.period * 1.02 + after) / 10
+    e = math.floor(math.log10(raw)) - 1
+    div = math.ceil(raw / 10 ** e - 1e-9) * 10 ** e
+    return div, -before + div
+
+
+def ilc_grid(idle):
+    """The park waveform on EOM-ILC's grid (11 ms at 2 us): parked there, the
+    channels are at the ILC's FRQ again."""
+    dt = ILC_DT_US * 1e-6
+    n = int(round(ILC_RECORD_MS * 1e-3 / dt)) + 1
+    return Wave(np.arange(n) * dt, {k: np.full(n, float(idle.get(k, 0.0))) for k in CHANNELS},
+                dt, "park at idle (ILC record)", source="park")
 
 
 # ------------------------------------------------------------------- session
@@ -427,15 +461,27 @@ class Session:
             if live and not keep_on:
                 self.off(force=True)
                 live = []
-            for name, ch in CHANNELS.items():
-                if self.setup_ok(ch, wave.period):
-                    if ch in live:
-                        raise RuntimeError(
-                            f"CH{ch} needs setting up for a {wave.period*1e3:.3f} ms record "
-                            f"(FRQ), which needs its output OFF - and the never-float rule "
-                            f"keeps it on. Keep the record length (11 ms), or with the "
-                            f"stage bypassed untick the rule for this change.")
-                    self._setup(ch, wave.period)
+            need = [ch for ch in CHANNELS.values() if self.setup_ok(ch, wave.period)]
+            if need and live:
+                # Setting up stops the burst for a moment and the channel
+                # free-runs what it holds: make that a flat idle first, on
+                # the grid the channel is at now (module docstring)
+                cur = self.wave
+                if cur is None:
+                    raise RuntimeError(
+                        "the record length changes with the outputs live, and what the AWG "
+                        "holds now is unknown to this window - so it cannot be put to idle "
+                        "first. Park (or Load something) on the current record first.")
+                if cur.source != "park":
+                    flat = idle_flat(cur.idle(), cur)
+                    for name, ch in CHANNELS.items():
+                        self._put(ch, flat.u[name])
+                    self.wave, self.parked = flat, True
+                if not self.dry:
+                    self.log(f"  record {cur.period*1e3:.3f} -> {wave.period*1e3:.3f} ms with "
+                             f"the outputs live: held at idle while the channels are set up")
+            for ch in need:
+                self._setup(ch, wave.period)
             names = {}
             if live and not self.dry:
                 self.log("  outputs live: the change can land mid-burst (as EOM-ILC's uploads)")
@@ -487,14 +533,16 @@ class Session:
             self.log("AWG outputs OFF")
         return not errs
 
-    def park(self, like=None):
+    def park(self, like=None, ilc=True):
         """An idle-level waveform with the outputs ON (the X2 FPGA stage must
-        not see a floating input)."""
+        not see a floating input) - on EOM-ILC's 11 ms grid (ilc=True), so
+        the ILC panel finds its FRQ, else on `like`'s grid."""
         with self.lock:
             base = like or self.wave
             if base is None:
                 raise RuntimeError("no waveform to take the grid and idle from")
-            self.load(idle_flat(base.idle(), base), keep_on=True)
+            self.load(ilc_grid(base.idle()) if ilc else idle_flat(base.idle(), base),
+                      keep_on=True)
             if not all(self.outputs().values()):
                 self.on()
             self.log("AWG parked: idle level, outputs ON")

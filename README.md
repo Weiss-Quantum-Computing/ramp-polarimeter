@@ -391,14 +391,34 @@ CH1 -> X1 -> EO1, CH2 -> X2 -> EO2, through EOM-ILC's upload path and checks
    idle cap, <= 16384 points (5501 proven), the record under 80 % of the
    trigger period, a warning for long holds at kV.
    - **ramp**: idle -> the rotation -> idle, split between the crystals
-     (`split` on X1), cosine or linear edges, lead / rise / hold / fall in a
-     `record`-ms record on a `dt` grid - by default the ILC's (11 ms at 2 us,
-     5501 points, 90.893 Hz), so an ILC drive and a ramp share the channel
-     set-up. **Idle** blank = the ILC state files' first sample (the learned
+     (`split` on X1), cosine or linear edges, lead / rise / hold / fall /
+     after on a `dt` grid; the record is their sum (shown under the fields).
+     The defaults make it the ILC's (11 ms at 2 us, 5501 points, 90.893 Hz).
+     Another length needs the channels set up for a new FRQ, and setting up
+     stops the burst for a moment, so the channel free-runs whatever it
+     holds: with the outputs live (never-float) the session first plays a
+     flat idle on the current record, then sets up, then uploads. **Park**
+     and the end of anything go back to the ILC's 11 ms record at idle, so
+     the ILC panel's FRQ check passes afterwards. Not yet done live on the
+     bench: the dry run does the same change into the scope first. With the
+     Spin echo preset, a record longer than the legs' spacing warns: leg 2's
+     trigger would come mid-burst and be ignored. **Idle** blank = the ILC state files' first sample (the learned
      trim, X1 ~+20-26 mV, X2 ~+78-81 mV): the AWG holds the first sample
      between bursts, and file zero parks the EOMs at -9 / -41 V.
    - **ILC drives**: two `run/drive_<stem>_iNN.csv` (AWG volts; a target in
      EOM volts is refused), checked against their own state's target.
+   **The scope's span** is set apart from the AWG record (*set the scope:
+   from `before` ms before the trigger to `after` ms after the record*,
+   rounded up to two figures), on Load and for Find in the hold. The dry run
+   always shows the whole record.
+
+   **With a ramp scan.** The scan does not touch the AWG: Load, dry run,
+   Outputs ON, then start a ramp scan in its tab - it records on the same
+   bench trigger, the plots refresh after every step, and Park / Outputs
+   OFF stay usable. A scan started while this window's AWG plays (ON, not
+   parked) records it in its manifest (`drive`: the waveform, its names,
+   record, idle, whether its dry run passed), and the lab log's `ilc`
+   column says so instead of naming the ILC state files.
 2. **Dry run on scope**: the AWG's outputs go to two scope channels (`Dry
    run: AWG CH1 -> scope CH3, CH2 -> CH4` by default) - a BNC tee keeps the
    next stage's input driven - while the Treks do NOT drive the EOMs (HV

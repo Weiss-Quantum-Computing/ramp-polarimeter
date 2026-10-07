@@ -48,18 +48,23 @@ def wave_checks(eom):
     check("linear edges differ from cosine a quarter into the rise",
           abs(lin.u["EO1"][k] - w.u["EO1"][k]) > 0.01)
     check("split outside 0..1 refused", raises(awg.ramp_hold, 45.0, {"split": 1.5}) is not None)
-    check("segments longer than the record refused",
-          "does not fit" in (raises(awg.ramp_hold, 45.0, {"hold_ms": 20.0}) or ""))
+    long_ = awg.ramp_hold(45.0, {"hold_ms": 20.0, "tail_ms": 2.0})
+    check("the record is lead + rise + hold + fall + after (24.5 ms -> 12251 points)",
+          abs(long_.period - 24.502e-3) < 1e-9 and long_.n == 12251
+          and abs(awg.record_ms({"hold_ms": 20.0, "tail_ms": 2.0}) - 24.5) < 1e-9,
+          f"{long_.period*1e3:.3f} ms, {long_.n} points")
+    check("lead and after must be > 0 (both ends at idle)",
+          raises(awg.ramp_hold, 45.0, {"tail_ms": 0.0}) is not None)
 
     print("\nthe checks")
     f = awg.check(w, eom, trig_hz=3.7)
     check("45 deg ramp at 3.7 Hz passes", awg.worst(f) != "FAIL", [m for lv, m in f if lv != "INFO"])
-    big = awg.ramp_hold(45.0, {"record_ms": 40.0, "dt_us": 2.0})
+    big = awg.ramp_hold(45.0, {"hold_ms": 37.5, "dt_us": 2.0})
     check("over 16384 points fails", any(lv == "FAIL" and "points" in m
                                           for lv, m in awg.check(big, None)))
     check("a record over 80 % of the trigger period fails",
           any(lv == "FAIL" and "trigger" in m for lv, m in awg.check(w, None, trig_hz=100)))
-    hot = awg.ramp_hold(45.0, {"hold_ms": 60.0, "record_ms": 70.0, "dt_us": 20.0})
+    hot = awg.ramp_hold(45.0, {"hold_ms": 60.0, "dt_us": 20.0})
     check("long kV holds warn about the duty",
           any(lv == "WARN" and "duty" in m for lv, m in awg.check(hot, None, trig_hz=3.7)))
     off = awg.ramp_hold(45.0, {}, idle={"EO1": 0.2, "EO2": 0.0})
@@ -147,11 +152,30 @@ def session_checks():
           all(bench.awg_on.values()) and np.ptp(flat) == 0 and s.parked)
     s.off()
     check("off: both off", not any(bench.awg_on.values()))
-    s.load(awg.ramp_hold(30.0, {"record_ms": 12.0}), keep_on=False)
+    s.load(awg.ramp_hold(30.0, {"tail_ms": 1.5}), keep_on=False)
     s.on()
-    msg = raises(s.load, awg.ramp_hold(30.0, {"record_ms": 14.0}), keep_on=True)
-    check("a live record-length change (FRQ) is refused under park",
-          msg is not None and "FRQ" in msg, (msg or "")[:70])
+    seen = []
+    put0 = s._put
+
+    def spy(ch, u):
+        seen.append((ch, float(np.ptp(u)), len(u), round(1 / s.awg.frq[ch], 9)))
+        return put0(ch, u)
+    s._put = spy
+    w14 = awg.ramp_hold(30.0, {"tail_ms": 3.5})
+    s.load(w14, keep_on=True)
+    s._put = put0
+    first = seen[:2]
+    check("a live record-length change: idle on the OLD grid first, then the new record",
+          all(ptp == 0 and n == 6001 and abs(per - 12.002e-3) < 1e-9
+              for _ch, ptp, n, per in first)
+          and all(n == 7001 for _ch, _p, n, _per in seen[2:]) and len(seen) == 4
+          and all(bench.awg_on.values()), seen)
+    check("the AWG plays the new record at its own FRQ",
+          abs(1 / s.awg.frq[1] - w14.period) < 1e-12 and abs(1 / s.awg.frq[2] - w14.period) < 1e-12)
+    s.park()
+    check("park goes back to the ILC's 11 ms record (its FRQ check passes after)",
+          s.parked and abs(s.wave.period - 11.002e-3) < 1e-9 and s.wave.n == 5501
+          and abs(1 / s.awg.frq[1] - s.wave.period) < 1e-12, f"{s.wave.period*1e3:.3f} ms")
     s.off()
     fb = sim.Bench(seed=2)
     fs = awg.Session(FlakyAWG(fb), None, log=lambda *_: None, never_float=False,
@@ -208,7 +232,7 @@ def rule_checks():
     bench.awg_scope = {1: 3, 2: 4}
     s.off(force=True)
     s._period = {}
-    w12 = awg.ramp_hold(45.0, {"record_ms": 12.0})
+    w12 = awg.ramp_hold(45.0, {"tail_ms": 1.5})
     s.load(w12)
     bench.awg_drive = {ch: (w.period, d) for ch, (_p, d) in bench.awg_drive.items()}
     s.awg.frq = {1: 1 / w.period, 2: 1 / w.period}

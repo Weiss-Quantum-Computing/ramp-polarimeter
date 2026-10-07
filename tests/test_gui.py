@@ -796,6 +796,43 @@ def main():
     check("null in the hold of a 60 deg ramp", err < 0.1 and all(app.bench.awg_on.values()),
           f"{fr['angle']:.3f}")
 
+    # a ramp scan while this window's AWG plays: the scan records what drives
+    app.scan_name.set("awg driven")
+    app.dark_mode.set("none")
+    app.bg_mode.set("none")
+    app.check_first.set(False)
+    for k, v in {"start": "0", "stop": "150", "step": "30", "ref_every": "0",
+                 "shots": "4", "blocks": "4"}.items():
+        app.sv[k].set(v)
+    app.do_start_scan()
+    settle(root, app, timeout=300)
+    man = app.result["d"].manifest if app.result else {}
+    check("a ramp scan with the AWG playing: the manifest says this window's AWG drives",
+          (man.get("drive") or {}).get("label", "").startswith("ramp to 60")
+          and man["drive"]["dry_run_passed"] and all(app.bench.awg_on.values())
+          and app.result["pol"] is not None, man.get("drive", {}).get("label"))
+    row = [r for r in lablog.read(app.outdir.get()) if r["name"] == "awg_driven"]
+    check("... and so does its lab-log row", row and row[0]["ilc"].startswith("AWG (this window)"),
+          row and row[0]["ilc"])
+    # the record follows its parts; the scope's span is set apart
+    app.av["hold_ms"].set("19")
+    app.av["tail_ms"].set("0.5")
+    app.do_awg_preview()
+    root.update()
+    check("a 22 ms ramp previews (the record is the sum of its parts)",
+          abs(app.awg_wave.period - 22.002e-3) < 1e-9 and "record 22 ms" in app.a_record.cget("text"),
+          app.a_record.cget("text"))
+    app.av["scope_before_ms"].set("2")
+    app.av["scope_after_ms"].set("5")
+    c_ = app.gather()
+    div, pos = app._awg_scope_tb(c_, app.awg_wave)
+    check("the scope's span: 2 ms before the trigger to 5 ms after the record (2 figures)",
+          abs((pos - div) + 2e-3) < 1e-9 and 27.0e-3 <= pos + 9 * div < 28.5e-3,
+          f"{(pos-div)*1e3:.2f}..{(pos+9*div)*1e3:.2f} ms")
+    app.av["hold_ms"].set("8")
+    app.av["scope_before_ms"].set("0.2")
+    app.av["scope_after_ms"].set("0")
+
     def wait_for(cond, limit=5.0):
         t1 = time.time()
         while not cond() and time.time() - t1 < limit:

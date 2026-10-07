@@ -132,7 +132,9 @@ def scan_row(summary):
         "fit_resid_mV": s.get("fit_residual_mV_median"),
         "result": s.get("corrections", ""),
         "software": short({"software": prov.get("software")}) if prov else "",
-        "ilc": short({"ilc_state_files": prov.get("ilc_state_files")}) if prov else "",
+        # what played into the Treks: this window's AWG when the scan says so
+        "ilc": (f"AWG (this window): {s['drive'].get('label', '')}" if s.get("drive")
+                else short({"ilc_state_files": prov.get("ilc_state_files")}) if prov else ""),
         "folder": s.get("folder", ""),
         "notes": s.get("notes", ""),
     }
