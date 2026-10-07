@@ -76,8 +76,8 @@ At every time sample, all analyzer angles fitted to a0 + B cos 2(theta - psi): I
 
 COLOURS, FILL, ARROWS, BARS
   Colour = which transport: leg 1 (the first motion) blue, leg 2 (the second) orange. The time axis is shaded per leg.
-  Filled = the rotation is moving away from rest (ramp out); hollow = moving back toward rest (ramp back).
-  A marker with an arrow growing out of its top = a lower bound: Imin is under 2 sigma of its own noise, so the ER is at least Imax / (2 sigma) - the marker sits at that bound and the true value is somewhere above. A method with smaller noise gives a higher bound for the same light: where the dip fit's triangles sit far above the measured circles with arrows on both, neither has resolved Imin - they agree that it is near zero. 'lower bounds' hides them.
+  Filled = on a ramp out from rest; hollow = on the ramp back; half-filled = the rotation standing still (rest, holds, after - the static and null-refine points, and dip fits that land in a still stretch). Which one is taken from the segment the point is in (the Table's segments).
+  A marker with a dotted line going up from it = a lower bound: Imin is under 2 sigma of its own noise, so the ER is at least Imax / (2 sigma) - the marker sits at that bound and the true value is somewhere above. A method with smaller noise gives a higher bound for the same light: where the dip fit's triangles sit far above the measured circles with dotted lines on both, neither has resolved Imin - they agree that it is near zero. 'lower bounds' hides them.
   Error bars = +-1 sigma from the statistical errors of Imin (and of Imax for the measured points); asymmetric, because ER goes as 1 / Imin. They do not include systematic errors (the dark / background subtraction, the analyzer's per-angle transmission, the scope's gain).
 
 x axis "rotation" puts both legs and both directions on one axis, so a property of the optics (the same at the same rotation) lines up, and one of the dynamics does not.
@@ -1819,8 +1819,11 @@ class App:
                         color=cols[d_], label=f"Imax / Imin ({d_})")
             lb = [i for i, p in enumerate(ps) if not p.get("er") and p.get("er_lower")]
             if lb:
-                ax.plot([x[i] for i in lb], [ps[i]["er_lower"] for i in lb], "^",
-                        color=cols[d_], label="lower bound (Imin unresolved)")
+                xs, ys = [x[i] for i in lb], [ps[i]["er_lower"] for i in lb]
+                ax.plot(xs, ys, "o", mfc="none", color=cols[d_],
+                        label="lower bound (Imin unresolved; dotted line up)")
+                ax.vlines(xs, ys, [y * 2.5 for y in ys], color=cols[d_], lw=1.0,
+                          linestyles=(0, (1, 1.6)))
             cv = [i for i in ok if ps[i].get("malus_ratio")]
             ax.plot([x[i] for i in cv],
                     [(ps[i]["imin"] + ps[i]["fit"]["k"]) / ps[i]["imin"] for i in cv],
@@ -4419,12 +4422,17 @@ class App:
             k = max(1, len(x) // 4000)
             ax3.plot(x[::k], np.where(ok, er, np.nan)[::k], color=c, lw=0.6, alpha=0.6)
             cr = [p for p in r.get("direct", []) if p["kind"] == "crossing"]
-            for lower, mk in ((False, "o"), (True, "^")):
+            for lower in (False, True):
                 sel = [p for p in cr if p["lower"] == lower]
-                if sel:
-                    ax3.plot([p["rotation"] if by_rot else p["t_ms"] for p in sel],
-                             [p["er"] for p in sel], mk, ms=3.5, color=c,
-                             mfc=c if not lower else "none", ls="none")
+                if not sel:
+                    continue
+                xs = [p["rotation"] if by_rot else p["t_ms"] for p in sel]
+                ys = [p["er"] for p in sel]
+                ax3.plot(xs, ys, "o", ms=3.5, color=c, mfc=c if not lower else "none",
+                         ls="none")
+                if lower:
+                    ax3.vlines(xs, ys, [y * 2.5 for y in ys], color=c, lw=1.0,
+                               linestyles=(0, (1, 1.6)))
         ax1.set_ylabel("rotation from rest (deg)")
         ax1.set_title("Polarization rotation, each scan from its own rest azimuth", fontsize=9)
         ax1.legend(fontsize=7, loc="best")
@@ -4448,9 +4456,9 @@ class App:
                 ax2.tick_params(labelbottom=False)
         ax3.set_ylabel("extinction ratio")
         ax3.set_title(f"Lines: ER_fit ({us:g} us mean); dots: measured directly at the "
-                      f"crossings (triangles: lower bounds)" if us else
+                      f"crossings (hollow with a dotted line up: lower bounds)" if us else
                       "Lines: ER_fit per sample; dots: measured directly at the crossings "
-                      "(triangles: lower bounds)", fontsize=8)
+                      "(hollow with a dotted line up: lower bounds)", fontsize=8)
         ax3.grid(alpha=0.3, which="both")
 
     # -- K: the polarization state -------------------------------------------------------
@@ -4961,7 +4969,7 @@ class App:
     def draw_extinction(self, fig):
         """Extinction ratio along the ramp, each measurement method a marker,
         each transport (leg) a colour, +-1 sigma error bars, lower bounds as
-        a marker with an arrow growing out of it. 'What are these?' explains
+        a marker with a dotted line going up from it. 'What are these?' explains
         every family (ER_HELP). Compared scans: one colour each."""
         res = self.result
         pol, d = res["pol"], res["d"]
@@ -4999,7 +5007,7 @@ class App:
                 ax.axhline(1 / dr, color="0.55", lw=0.8, ls=":", zorder=1)
 
         def pts(family, r):
-            """[(x, er, (lo, hi), lower, leg, away)] for a method of result r."""
+            """[(x, er, (lo, hi), lower, leg, direction)] for a method of result r."""
             p_, d_ = r["pol"], r["d"]
             sg = segs if r is res else an.segments(p_["t"], p_["rotation"])
             out = []
@@ -5011,13 +5019,14 @@ class App:
                     e = an.er_sigma(p["er"], p["imin_mV"], p["sig_mV"], p["imax_V"] * 1e3,
                                     p.get("sig_imax_V", 0.0) * 1e3)
                     out.append((p["rotation"] if by_rot else p["t_ms"], p["er"], e,
-                                p["lower"], an.leg_of(sg, t_s), an.moving_away(p_, t_s)))
+                                p["lower"], an.leg_of(sg, t_s),
+                                an.direction(sg, t_s) if family == "crossing" else "static"))
             elif family == "dip":
                 for p in r["dips"]:
                     e = an.er_sigma(p["er"], p["imin"], p["sig_imin"])
                     out.append((p["rotation"] if by_rot else p["t"] * 1e3, p["er"], e,
                                 p["er_lower"], an.leg_of(sg, p["t"]),
-                                an.moving_away(p_, p["t"])))
+                                an.direction(sg, p["t"])))
             elif family == "refine":
                 for rf in r["refine"]:
                     if "er" not in rf:
@@ -5026,7 +5035,7 @@ class App:
                     tm = 0.5 * (rf["t0"] + rf["t1"])
                     e = an.er_sigma(rf["er"], rf["imin"], rf["sig_imin"])
                     out.append((float(np.mean(p_["rotation"][m])) if by_rot else tm * 1e3,
-                                rf["er"], e, rf["er_lower"], an.leg_of(sg, tm), True))
+                                rf["er"], e, rf["er_lower"], an.leg_of(sg, tm), "static"))
             if not show["lower"]:
                 out = [o for o in out if not o[3]]
             return out
@@ -5035,7 +5044,7 @@ class App:
                 ("dip", "^", "dips", "Dip fit: Imin fitted around the crossing, Imax from the fit"),
                 ("static", "s", "direct", "Measured, static: analyzer angle nearest crossed"),
                 ("refine", "D", "refine", "Null refine: angles stepped around crossed")]
-        # everything to draw first, so a lower bound's arrow can be sized to the axis
+        # everything to draw first, so a lower bound's dotted line can be sized to the axis
         todo = []
         n_fam = {}
         for r_, c_ in [(res, None)] + ov:
@@ -5048,23 +5057,26 @@ class App:
                 todo += [(mk, c_, *q) for q in P]
         vals = [q[3] for q in todo]
         top = max(vals + [fit_top, 1.0])
-        # an arrow: a factor 2 up on a log axis, 6 % of the axis on a linear one
-        arrow = (lambda v: v) if log else (lambda v: 0.06 * top)
+        # a lower bound's dotted line: a factor 2.5 up on a log axis, 7 % of
+        # the axis on a linear one. Not an arrow: its head read as a triangle,
+        # the dip fit's marker (7 Oct 2026)
+        stub = (lambda v: 1.5 * v) if log else (lambda v: 0.07 * top)
         n_lower = 0
-        for mk, c_, xx, er_, (lo, hi), lower, leg, away in todo:
+        for mk, c_, xx, er_, (lo, hi), lower, leg, how in todo:
             col = c_ or leg_col.get(leg, "0.3")
-            mfc = col if away else "white"
+            fill = dict(mfc=col) if how == "away" else (
+                dict(mfc="white") if how == "back" else
+                dict(mfc=col, fillstyle="bottom", markerfacecoloralt="white"))
             ms, lw, al = (4.5, 0.8, 1.0) if c_ is None else (3.5, 0.6, 0.75)
             if lower:
                 n_lower += 1
-                # the bar grows out of the marker and ends in an arrowhead
-                ax.errorbar([xx], [er_], yerr=[[0], [arrow(er_)]], lolims=True, fmt=mk, ms=ms,
-                            color=col, mfc=mfc, mec=col, elinewidth=lw, capsize=2.5, alpha=al,
-                            zorder=3)
+                ax.plot([xx, xx], [er_, er_ + stub(er_)], color=col, lw=1.1, ls=(0, (1, 1.6)),
+                        alpha=al, zorder=2)
+                ax.plot([xx], [er_], mk, ms=ms, color=col, mec=col, alpha=al, zorder=3, **fill)
             else:
                 hi_ = hi if np.isfinite(hi) else er_
                 ax.errorbar([xx], [er_], yerr=[[lo], [hi_]], fmt=mk, ms=ms, color=col,
-                            mfc=mfc, mec=col, elinewidth=lw, capsize=1.5, alpha=al, zorder=3)
+                            mec=col, elinewidth=lw, capsize=1.5, alpha=al, zorder=3, **fill)
         if show["direct"]:
             off = [p for p in res.get("direct", []) if p.get("offset_limited")]
             for p in off:
@@ -5073,7 +5085,7 @@ class App:
         if log:
             lows = [q[3] - q[4][0] for q in todo if not q[5]] + vals
             floor = min([v for v in lows if v > 0] + [top])
-            ax.set_ylim(max(floor * 0.5, 1.0), max(top * 2.3, floor * 10))
+            ax.set_ylim(max(floor * 0.5, 1.0), max(top * 2.8, floor * 10))
         else:
             ax.set_ylim(0, top * 1.12)
         lim = self.cfg["analysis"]["polarizer_er"]
@@ -5092,13 +5104,16 @@ class App:
             H.append(Line2D([], [], marker="s", mfc="none", mec="0.6", ls="none", ms=5,
                             label="Static, angle too far from crossed (not the light's ER)"))
         H.append(Line2D([], [], marker="o", mfc="k", mec="k", ls="none", ms=5,
-                        label="filled: rotation moving away from rest"))
+                        label="filled: on a ramp out from rest"))
         H.append(Line2D([], [], marker="o", mfc="white", mec="k", ls="none", ms=5,
-                        label="hollow: moving back toward rest"))
+                        label="hollow: on the ramp back toward rest"))
+        H.append(Line2D([], [], marker="o", mfc="k", fillstyle="bottom",
+                        markerfacecoloralt="white", mec="k", ls="none", ms=5,
+                        label="half: rotation standing still (rest, hold, after)"))
         if n_lower:
-            H.append(Line2D([], [], marker="$↑$", color="k", ls="none", ms=9,
-                            label=f"arrow out of a marker: lower bound, the ER is above it "
-                                  f"(Imin < 2 sigma; {n_lower})"))
+            H.append(Line2D([], [], marker="$\u22ee$", color="k", ls="none", ms=9,
+                            label=f"dotted line up from a marker: lower bound, the ER is "
+                                  f"above it (Imin < 2 sigma; {n_lower})"))
         for leg in legs or [1]:
             H.append(Patch(color=leg_col.get(leg, "0.3"), label=f"leg {leg}"
                            + (" (first transport)" if leg == 1 and len(legs) > 1 else

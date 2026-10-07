@@ -351,8 +351,14 @@ def corrections_summary(d, pol=None):
         parts.append(f"subtract {info['kind']}{old} {sub*1e3:+.2f} mV{src}")
     if "dark" in lv and "background" in lv:
         out["light"] = lv["background"]["level"] - lv["dark"]["level"]
+        # with its error: at 1 V/div the two are each ~1.3 mV uncertain, and
+        # a background below the dark (7 Oct 2026: -0.83 mV) is that noise
+        s_l = float(np.hypot(lv["background"].get("sem") or 0, lv["dark"].get("sem") or 0))
+        out["light_sem"] = s_l
+        zero = s_l > 0 and abs(out["light"]) < 2 * s_l
         parts.append(f"(dark {lv['dark']['level']*1e3:+.2f} + stray light "
-                     f"{out['light']*1e3:+.2f} mV)")
+                     f"{out['light']*1e3:+.2f} +- {s_l*1e3:.2f} mV"
+                     + (": zero within its error" if zero else "") + ")")
     clocks, levels, _ = drift(d, sub)
     if len(levels) >= 2 and np.all(levels > 0):
         rel = levels / levels.mean() - 1
@@ -885,13 +891,16 @@ def er_sigma(er, imin, sig_imin, imax=None, sig_imax=0.0):
     return float(lo), float(hi)
 
 
-def moving_away(pol, t_s):
-    """True while |rotation| grows (moving away from rest) at time t_s."""
-    rot = pol["rotation"]
-    j = int(np.clip(np.searchsorted(pol["t"], t_s), 1, len(rot) - 1))
-    k = max(1, int(len(rot) / 2000))
-    a, b = rot[max(j - k, 0)], rot[min(j + k, len(rot) - 1)]
-    return abs(b) >= abs(a)
+def direction(segs, t_s):
+    """'away' on a ramp out (an 'up' segment), 'back' on a ramp back
+    ('down'), 'static' in rest, holds and after. From the segment, not the
+    local slope: within ~0.2 deg of rest the rotation rings through zero and
+    a slope there called the end of a ramp back 'away' (7 Oct 2026, test-6
+    and test-7)."""
+    for s in segs:
+        if s["t0"] <= t_s <= s["t1"]:
+            return {"up": "away", "down": "back"}.get(s["base"], "static")
+    return "static"
 
 
 ER_COLUMNS = ["method", "leg", "direction", "segment", "t_ms", "rotation_deg",
@@ -915,16 +924,14 @@ def er_table(res, fit_bin_deg=2.0):
     t_end = (max(downs) + 1e-3) if downs else float(pol["t"][-1])
     rows = []
 
-    def direction(t_s, moving=True):
-        if not moving:
-            return "static"
-        return "away" if moving_away(pol, t_s) else "back"
+    def direction_(t_s, moving=True):
+        return direction(segs, t_s) if moving else "static"
 
     def add(method, t_s, rotation, theta, rate, er, sig, lower, imin, simin, imax,
             n="", note="", moving=True, seg=None):
         lo, hi = sig
         rows.append({"method": method, "leg": leg_of(segs, t_s),
-                     "direction": direction(t_s, moving),
+                     "direction": direction_(t_s, moving),
                      "segment": seg or next((x["kind"] for x in segs
                                              if x["t0"] <= t_s <= x["t1"]), ""),
                      "t_ms": t_s * 1e3, "rotation_deg": rotation, "analyzer_deg": theta,
@@ -1057,8 +1064,8 @@ def er_csv(res, extra=()):
           "per-sample fit; refine = null refine at a sensitive V/div; er_fit = the per-sample "
           "Malus fit's ER, median per rotation bin (moving) or per stretch (static), "
           "er_sigma_lo/hi = 16th/84th percentile spread",
-          "leg: 1 = first transport, 2 = second; direction: away = |rotation| growing, back = "
-          "returning to rest, static",
+          "leg: 1 = first transport, 2 = second; direction: away = on a ramp out from rest, "
+          "back = on the ramp back, static = rest, hold or after",
           "rotation_deg: polarization rotation from rest (this scan's sign); analyzer_deg: "
           "the analyzer angle at crossed, in its own frame [0, 180)",
           "er_sigma_lo / er_sigma_hi: 1-sigma down / up (asymmetric: ER goes as 1/Imin); "

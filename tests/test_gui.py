@@ -495,7 +495,15 @@ def main():
           all(r_["leg"] in ("1", "2") and r_["direction"] in ("away", "back")
               and r_["rotation_deg"] and (r_["lower_bound"] == "1" or r_["er_sigma_lo"])
               for r_ in cr), cr[0] if cr else None)
-    import tkinter.filedialog as _fd
+    check("direction from the segment: ramp out = away, ramp back = back",
+          all((r_["segment"].startswith("up") and r_["direction"] == "away")
+              or (r_["segment"].startswith("down") and r_["direction"] == "back")
+              for r_ in cr if r_["segment"][:2] in ("up", "do")),
+          [(r_["segment"], r_["direction"]) for r_ in cr][:6])
+    corr_line = [ln for ln in txt.splitlines() if ln.startswith("# corrections applied:")]
+    check("the corrections line gives the stray light with its error",
+          bool(corr_line) and ("stray light" not in corr_line[0] or "+-" in corr_line[0]),
+          corr_line)
     target = os.path.join(SANDBOX, "er_export.csv")
     gui.filedialog.asksaveasfilename = lambda **k: target
     app.do_export_er()
