@@ -353,22 +353,94 @@ class App:
         ttk.Button(r, text="EOM calibration...", command=self.open_calibration).pack(
             side="right")
 
+    # -- shared layout helpers for the mode tabs ------------------------------------
+    @staticmethod
+    def _box(parent, text):
+        b = ttk.LabelFrame(parent, text=text)
+        b.pack(fill="x", padx=4, pady=(1, 0))
+        return b
+
+    @staticmethod
+    def _row(parent, pady=1):
+        rr = ttk.Frame(parent)
+        rr.pack(fill="x", padx=6, pady=pady)
+        return rr
+
+    @staticmethod
+    def _dialog(app, attr, title):
+        """A settings window of a tab (one at a time); returns its frame, or
+        None when it was already open (then it is raised)."""
+        w = getattr(app, attr, None)
+        if w is not None and w.winfo_exists():
+            w.lift()
+            return None
+        w = tk.Toplevel(app.root)
+        w.title(title)
+        w.transient(app.root)
+        setattr(app, attr, w)
+        f = ttk.Frame(w, padding=8)
+        f.pack(fill="both", expand=True)
+
+        def close():
+            app.save_settings()
+            w.destroy()
+        w.protocol("WM_DELETE_WINDOW", close)
+        f._close = close
+        return f
+
+    @staticmethod
+    def _dline(parent, items, note=None):
+        """One line of a settings dialog: labels and (var, width) entries."""
+        rr = ttk.Frame(parent)
+        rr.pack(fill="x", padx=6, pady=2)
+        for it in items:
+            if isinstance(it, str):
+                ttk.Label(rr, text=it).pack(side="left", padx=(0, 2))
+            elif isinstance(it, tuple) and isinstance(it[0], tk.Variable) and len(it) == 3:
+                ttk.Combobox(rr, textvariable=it[0], width=it[1], values=it[2],
+                             state="readonly").pack(side="left", padx=(0, 4))
+            else:
+                ttk.Entry(rr, textvariable=it[0], width=it[1]).pack(side="left", padx=(0, 4))
+        if note:
+            ttk.Label(parent, text=note, foreground="#666", wraplength=420,
+                      justify="left").pack(anchor="w", padx=6, pady=(0, 3))
+        return rr
+
+    # -- Ramp scan tab ---------------------------------------------------------------------
     def build_scan(self, left):
+        """A ramp scan in the order it is set up: 1 the scope, 2 the analyzer
+        angles, 3 shots and dark / background, 4 name, check, preview the
+        plan, start. How each step is acquired (mode, blocks, dither, points,
+        trigger wait, repetition, backoff, the reference angle) is set once
+        in Settings... (open_scan_settings)."""
         f = ttk.Frame(left)
-        f.pack(fill="x", padx=2, pady=3)
-        r = ttk.Frame(f)
-        r.pack(fill="x", padx=6, pady=2)
+        f.pack(fill="x", padx=2, pady=2)
+        self.sv = {}
+        for k in ("blocks", "dither_codes", "backoff_deg", "points", "wait_s", "rep_s",
+                  "ref_angle"):
+            self.sv[k] = tk.StringVar()
+        self.mode = tk.StringVar()
+
+        def ent(rr, key, w, label=None, after=None):
+            if label:
+                ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
+            self.sv[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.sv[key], width=w).pack(side="left", padx=(0, 4))
+            if after:
+                ttk.Label(rr, text=after).pack(side="left", padx=(0, 4))
+
+        b = self._box(f, "1  Scope")
+        r = self._row(b, (2, 1))
         ttk.Label(r, text="Preset").pack(side="left")
         self.preset = tk.StringVar()
         cb = ttk.Combobox(r, textvariable=self.preset, values=list(cfgmod.all_presets(self.cfg)),
-                          width=24, state="readonly")
+                          width=26, state="readonly")
         cb.pack(side="left", padx=4)
         self.preset_box = cb
         cb.bind("<<ComboboxSelected>>", lambda _e: self.preset_picked())
         self._btn(r, "Apply to scope", self.do_apply_preset)
-        self.sv = {}
         # the spin-echo sequence: shown when the preset is built from it
-        self.seq_row = ttk.Frame(f)
+        self.seq_row = ttk.Frame(b)
         self.seq = {}
         for label, key, w in (("legs", "spacing_ms", 7), ("ms apart, motion", "motion_ms", 5),
                               ("ms; keep", "before_ms", 4), ("before /", "after_ms", 4)):
@@ -380,107 +452,146 @@ class App:
             e.bind("<FocusOut>", lambda _e: self.sequence_changed())
             self.seq[key] = v
         ttk.Label(self.seq_row, text="ms after").pack(side="left")
-        self.seq_lbl = CopyLabel(f, text="", foreground="#666", width=48)
+        self.seq_lbl = CopyLabel(b, text="", foreground="#666", width=48)
         self._seq_anchor = r
 
-        def row(items):
-            rr = ttk.Frame(f)
-            rr.pack(fill="x", padx=6, pady=1)
-            for label, key, w in items:
-                ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
-                self.sv[key] = tk.StringVar()
-                ttk.Entry(rr, textvariable=self.sv[key], width=w).pack(side="left", padx=(0, 6))
-            return rr
-
-        row([("Angles from", "start", 6), ("to", "stop", 6), ("step", "step", 5)])
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        ttk.Label(rr, text="Order").pack(side="left")
+        b = self._box(f, "2  Analyzer angles")
+        r = self._row(b, (2, 1))
+        ent(r, "start", 6, "from")
+        ent(r, "stop", 6, "to")
+        ent(r, "step", 5, "step", "deg,")
         self.order = tk.StringVar()
-        ttk.Combobox(rr, textvariable=self.order, width=13, state="readonly",
-                     values=("forward", "bidirectional", "shuffled")).pack(side="left", padx=4)
-        ttk.Label(rr, text="Mode").pack(side="left")
-        self.mode = tk.StringVar()
-        ttk.Combobox(rr, textvariable=self.mode, width=8, state="readonly",
-                     values=("average", "single")).pack(side="left", padx=4)
-        row([("Shots/angle", "shots", 5), ("blocks (avg)", "blocks", 3), ("dither codes", "dither_codes", 3)])
-        row([("Ref every", "ref_every", 4), ("angles, at", "ref_angle", 6), ("backoff", "backoff_deg", 4)])
-        row([("Points (single)", "points", 7), ("trig wait s", "wait_s", 4), ("rep s", "rep_s", 5)])
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        ttk.Label(rr, text="Folder").pack(side="left")
-        self.outdir = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.outdir, width=30).pack(side="left", padx=4)
-        self._btn(rr, "...", self.pick_outdir)
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        ttk.Label(rr, text="Scan name").pack(side="left")
-        self.scan_name = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.scan_name, width=24).pack(side="left", padx=4)
-        self.check_first = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="check first", variable=self.check_first).pack(side="left")
-        ttk.Label(rr, text="(a used name counts up)", foreground="#666").pack(side="left")
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
+        ttk.Combobox(r, textvariable=self.order, width=12, state="readonly",
+                     values=("forward", "bidirectional", "shuffled")).pack(side="left")
+        r = self._row(b, (1, 3))
+        ent(r, "ref_every", 4, "back to the reference angle every", "angles (0 = never)")
+
+        b = self._box(f, "3  Shots, dark and background")
+        r = self._row(b, (2, 1))
+        ent(r, "shots", 5, "shots per angle")
         self.dark_mode = tk.StringVar(value="none")
         self.bg_mode = tk.StringVar(value="measure")
-        for label, var in (("Dark (PD covered)", self.dark_mode),
-                           ("Background (beam blocked)", self.bg_mode)):
-            ttk.Label(rr, text=label).pack(side="left")
-            ttk.Combobox(rr, textvariable=var, width=11, state="readonly",
+        r = self._row(b)
+        for label, var in (("dark (PD covered)", self.dark_mode),
+                           ("background (beam blocked)", self.bg_mode)):
+            ttk.Label(r, text=label).pack(side="left")
+            ttk.Combobox(r, textvariable=var, width=11, state="readonly",
                          values=("measure", "reuse latest", "none")).pack(side="left",
-                                                                         padx=(2, 8))
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
+                                                                         padx=(2, 6))
+        r = self._row(b, (1, 3))
         self.stray_on = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="stray light at", variable=self.stray_on).pack(side="left")
+        ttk.Checkbutton(r, text="stray light: both also read at", variable=self.stray_on).pack(
+            side="left")
         self.stray_vdiv = tk.StringVar(value="5")
-        ttk.Entry(rr, textvariable=self.stray_vdiv, width=4).pack(side="left", padx=2)
-        ttk.Label(rr, text="mV/div (dark and background both read there too)",
-                  foreground="#666").pack(side="left")
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=(4, 2))
-        self._btn(rr, "Check scope", self.do_check_scope)
-        self._btn(rr, "Start scan", self.do_start_scan, padx=(4, 0))
-        self.est_label = CopyLabel(rr, text="", foreground="#666", width=44)
-        self.est_label.pack(side="left", padx=6)
+        ttk.Entry(r, textvariable=self.stray_vdiv, width=4).pack(side="left", padx=2)
+        ttk.Label(r, text="mV/div").pack(side="left")
+
+        b = self._box(f, "4  Name, check, start")
+        r = self._row(b, (2, 1))
+        ttk.Label(r, text="Folder").pack(side="left")
+        self.outdir = tk.StringVar()
+        ttk.Entry(r, textvariable=self.outdir, width=34).pack(side="left", padx=4)
+        self._btn(r, "...", self.pick_outdir)
+        r = self._row(b)
+        ttk.Label(r, text="Name").pack(side="left")
+        self.scan_name = tk.StringVar()
+        ttk.Entry(r, textvariable=self.scan_name, width=26).pack(side="left", padx=4)
+        self.check_first = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text="check the scope first", variable=self.check_first).pack(
+            side="left")
+        r = self._row(b, (2, 1))
+        self._btn(r, "Check scope", self.do_check_scope)
+        ttk.Button(r, text="Preview plan", command=self.do_scan_plan).pack(side="left",
+                                                                           padx=(4, 0))
+        self._btn(r, "Start scan", self.do_start_scan, padx=(4, 0))
+        ttk.Button(r, text="Settings...", command=self.open_scan_settings).pack(side="right")
+        self.est_label = CopyLabel(b, text="", foreground="#666", width=60)
+        self.est_label.pack(anchor="w", padx=6, pady=(0, 3))
         for v in list(self.sv.values()) + [self.order, self.mode]:
             v.trace_add("write", lambda *_: self.update_estimate())
+
+    def open_scan_settings(self):
+        f = self._dialog(self, "scan_set_win", "Ramp scan settings")
+        if f is None:
+            return
+        L = self._dline
+        s = ttk.LabelFrame(f, text="Each angle")
+        s.pack(fill="x", pady=(0, 6))
+        L(s, ["mode", (self.mode, 8, ("single", "average")), "blocks (average)",
+              (self.sv["blocks"], 3), "dither codes", (self.sv["dither_codes"], 3)],
+          "single: one HRES shot per file, averaged here; average: the scope's own :DIGitize "
+          "averages, one file per block. The offset dither moves the PD offset a few ADC "
+          "codes between blocks (the 3.4 mV / code pattern at 1 V/div).")
+        L(s, ["points (single)", (self.sv["points"], 7), "trigger wait", (self.sv["wait_s"], 4),
+              "s, repetition", (self.sv["rep_s"], 5), "s"],
+          "The preset fills these; the repetition is the sequence's trigger period and sets "
+          "the time estimate.")
+        s = ttk.LabelFrame(f, text="The analyzer")
+        s.pack(fill="x", pady=(0, 6))
+        L(s, ["reference angle", (self.sv["ref_angle"], 6), "deg; approach from",
+              (self.sv["backoff_deg"], 4), "deg below"],
+          "The reference returns measure the intensity drift (divided out); every angle is "
+          "approached from the same side, so the mount's backlash is the same.")
+        ttk.Button(f, text="Close", command=f._close).pack(anchor="e")
+
+    def _scan_drive(self):
+        """(x1, x2) deg this window's AWG plays now, or None."""
+        s = self.awg_sess
+        if s is None or not s.owned or s.parked or s.wave is None:
+            return None
+        w = s.wave
+        if getattr(w, "ends", None):
+            return (w.ends["EO1"], w.ends["EO2"])
+        split = float(self.cfg["awg"].get("split", 0.5))
+        r = float(w.rotation or 0.0)
+        return (r * split, r * (1 - split))
+
+    def do_scan_plan(self):
+        """The Ramp scan tab's plan, step by step, on the Plan tab."""
+        c = self.gather()
+        from . import plan as planmod
+        try:
+            s = c["scan"]
+            drive = self._scan_drive()
+            stray = self._stray_scale(c)
+            steps = planmod.ramp_scan(s, self.dark_mode.get(), self.bg_mode.get(),
+                                      stray and stray["vdiv"], drive,
+                                      scanmod.safe_name(c.get("scan_name") or "scan"))
+        except (ValueError, KeyError) as exc:
+            self.log(f"Plan: {exc}")
+            return
+        note = ("this window's AWG plays " + self.awg_sess.wave.label if drive else
+                "this window's AWG is not driving: the scan records whatever plays (the ILC "
+                "panel's drive) - for one scan per AWG ramp use the AWG tab's Sequence")
+        self._show_plan(f"Ramp scan {c.get('scan_name') or ''}", steps, s, note)
 
     def build_analyzer_mode(self, f):
         """The two ways the analyzer goes near crossed: find an angle in the
         light as it is and leave the analyzer there, or measure the shown
         scan's extinction precisely where its rotation is flat (null refine:
         extra angles near crossed, added to that scan)."""
-        a = ttk.LabelFrame(f, text="Find the min / max transmission angle (and stay there)")
-        a.pack(fill="x", padx=4, pady=(4, 2))
+        a = self._box(f, "Find the min / max transmission angle, and stay there")
         self.build_find(a)
-        b = ttk.LabelFrame(f, text="Null refine: precise Imin of the shown scan where it is flat")
-        b.pack(fill="x", padx=4, pady=(2, 4))
+        b = self._box(f, "Null refine: precise Imin of the shown scan where it is flat")
         self.build_refine(b)
 
     def build_refine(self, left):
-        f = ttk.Frame(left)
-        f.pack(fill="x", padx=2, pady=3)
         self.rv = {}
-        for label, key, w in (("Windows (ms)", "windows", 22),
-                              ("Offsets (deg)", "offsets", 22),
-                              ("PD V/div at null", "pd_vdiv", 8)):
-            rr = ttk.Frame(f)
-            rr.pack(fill="x", padx=6, pady=1)
-            ttk.Label(rr, text=label, width=15).pack(side="left")
+
+        def ent(rr, key, w, label, after=None):
+            ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
             self.rv[key] = tk.StringVar()
-            ttk.Entry(rr, textvariable=self.rv[key], width=w).pack(side="left")
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=(2, 4))
-        self._btn(rr, "Plan (log only)", self.do_plan_refine)
-        self._btn(rr, "Measure, add to shown scan", self.do_run_refine, padx=6)
-        ttk.Label(f, foreground="#666", justify="left", wraplength=440,
-                  text="Where the rotation stands still (rest, holds, after: 'auto', or "
-                       "ms ranges), steps the analyzer to these offsets from crossed at the "
-                       "sensitive V/div and adds the captures to the shown scan: the "
-                       "Extinction tab's null-refine points.").pack(anchor="w", padx=6,
-                                                                    pady=(0, 4))
+            ttk.Entry(rr, textvariable=self.rv[key], width=w).pack(side="left", padx=(0, 3))
+            if after:
+                ttk.Label(rr, text=after).pack(side="left", padx=(0, 6))
+        r = self._row(left, (2, 1))
+        ent(r, "windows", 12, "where", "ms ('auto': rest, holds, after)")
+        r = self._row(left)
+        ent(r, "offsets", 20, "offsets", "deg from crossed")
+        ent(r, "pd_vdiv", 6, "at", "V/div")
+        r = self._row(left, (1, 3))
+        self._btn(r, "List the angles", self.do_plan_refine)
+        self._btn(r, "Measure, add to the shown scan", self.do_run_refine, padx=(4, 0))
 
     # -- right side -----------------------------------------------------------
     def build_right(self, right):
@@ -611,8 +722,9 @@ class App:
         self.fig_ilc = self._fig_tab("ILC target", self.draw_ilc)
         self.fig_find = self._fig_tab("Find angle", self.draw_find)
         self.fig_awg = self._fig_tab("AWG", self.draw_awg)
+        self.fig_plan = self._fig_tab("Plan", self.draw_plan)
         self.free_tabs = {self.fig_bias._frame, self.fig_ilc._frame, self.fig_find._frame,
-                          self.fig_cmp._frame, self.fig_awg._frame}
+                          self.fig_cmp._frame, self.fig_awg._frame, self.fig_plan._frame}
         ttk.Label(self.fig_ilc._ctl, text="figure:").pack(side="left")
         self.ilc_fig = tk.StringVar(value="fig2_rotation_vs_target.png")
         cb = ttk.Combobox(self.fig_ilc._ctl, textvariable=self.ilc_fig, width=28,
@@ -863,50 +975,136 @@ class App:
         self.progress_text = CopyLabel(f, text="", foreground="#060", width=48)
         self.progress_text.pack(anchor="w", pady=(0, 2))
 
+    # -- Fixed rotations tab -----------------------------------------------------------
     def build_bias(self, f):
         """Fixed rotations (in the code and the files: bias points): the AWG
-        holds the EOMs at fixed rotations, the analyzer steps around each null
-        at a sensitive V/div (rampol.bias)."""
-        ttk.Label(f, justify="left", wraplength=330, text=(
-            "Extinction ratio and rotation with the EOMs held still: the AWG holds "
-            "each rotation in the list (a plateau, no ramp) and the analyzer measures "
-            "Imin, Imax and the light's angle there.")).pack(anchor="w", padx=6, pady=(4, 2))
+        holds the EOMs at each rotation of a list, and at each the analyzer
+        finds the polarization's azimuth, steps around the null at a
+        sensitive V/div and reads the bright angle (rampol.bias)."""
+        ttk.Label(f, justify="left", wraplength=470, text=(
+            "Extinction and rotation with the EOMs held still: the AWG holds each rotation "
+            "(a plateau, no ramp); the analyzer finds the null there and steps around it."
+        )).pack(anchor="w", padx=6, pady=(4, 0))
         self.bv = {}
-        for items in ((("Rotations (deg)", "biases", 13), ("split on X1", "split", 5)),
-                      (("Shots", "shots", 4), ("null +-deg", "null_half_deg", 4),
-                       ("null points", "null_points", 3)),
-                      (("Hold ms", "hold_ms", 5), ("settle ms", "settle_ms", 4),
-                       ("Name", "name", 11))):
-            rr = ttk.Frame(f)
-            rr.pack(fill="x", padx=6, pady=1)
-            for label, key, w in items:
+
+        def ent(rr, key, w, label=None, after=None):
+            if label:
                 ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
-                self.bv[key] = tk.StringVar()
-                ttk.Entry(rr, textvariable=self.bv[key], width=w).pack(side="left", padx=(0, 6))
-        self.bias_reach = CopyLabel(f, text="", foreground="#666", width=46)
-        self.bias_reach.pack(anchor="w", padx=6)
+            self.bv[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.bv[key], width=w).pack(side="left", padx=(0, 3))
+            if after:
+                ttk.Label(rr, text=after).pack(side="left", padx=(0, 5))
+
+        b = self._box(f, "1  Rotations")
+        r = self._row(b, (2, 1))
+        ent(r, "biases", 12, None, "deg,")
+        ent(r, "split", 4, "X1 share")
+        self.bias_order = tk.StringVar()
+        ttk.Combobox(r, textvariable=self.bias_order, values=("up", "updown"),
+                     width=7, state="readonly").pack(side="left")
+        self.bias_reach = CopyLabel(b, text="", foreground="#666", width=60)
+        self.bias_reach.pack(anchor="w", padx=6, pady=(0, 2))
         for k in ("biases", "split"):
             self.bv[k].trace_add("write", lambda *_: self._bias_reach_text())
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        ttk.Label(rr, text="Order").pack(side="left")
-        self.bias_order = tk.StringVar()
-        ttk.Combobox(rr, textvariable=self.bias_order, values=("up", "updown"),
-                     width=8, state="readonly").pack(side="left", padx=4)
-        ttk.Button(rr, text="Preview", command=self.do_bias_preview).pack(
-            side="left", padx=(8, 0))
-        self._btn(rr, "Dry run on scope", self.do_bias_dry, padx=(4, 0))
-        self._btn(rr, "Start", self.do_start_bias, padx=(4, 0))
-        self._btn(rr, "Load...", self.do_load_bias, padx=(4, 0))
-        ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
-            "Rotations: start:stop:step or a list, in degrees of EOM rotation. The "
-            "4063B (close its GUI) plays plateaus on the bench trigger (EXT), CH1 "
-            "-> X1, CH2 -> X2, checked against the Trek limits first. Per rotation: 4 "
-            "angles find the azimuth, then the analyzer steps +-null deg around the "
-            "crossed position at the most sensitive V/div that holds it (Imin), and "
-            "once to the bright angle (Imax). The window opens 'settle' ms into the "
-            "hold (scope overdrive recovery). The beam is blocked once, for the "
-            "darks at every V/div used.")).pack(anchor="w", padx=6, pady=(2, 4))
+
+        b = self._box(f, "2  At each rotation")
+        r = self._row(b, (2, 1))
+        ent(r, "null_half_deg", 4, "around the null +-", "deg in")
+        ent(r, "null_points", 3, None, "points,")
+        ent(r, "shots", 4, None, "shots each")
+        r = self._row(b, (1, 3))
+        ent(r, "hold_ms", 5, "hold", "ms, measuring")
+        ent(r, "settle_ms", 4, None, "ms into it")
+
+        b = self._box(f, "3  Preview, check on the scope, run")
+        r = self._row(b, (2, 1))
+        ent(r, "name", 14, "Name")
+        self._btn(r, "Load...", self.do_load_bias, padx=(4, 0))
+        r = self._row(b, (1, 3))
+        ttk.Button(r, text="Preview", command=self.do_bias_preview).pack(side="left")
+        self._btn(r, "Dry run on scope", self.do_bias_dry, padx=(4, 0))
+        self._btn(r, "Start", self.do_start_bias, padx=(4, 0))
+        ttk.Label(f, foreground="#666", justify="left", wraplength=470, text=(
+            "Rotations: start:stop:step or a list. Per rotation: 4 angles find the azimuth, "
+            "then the null points at the most sensitive V/div that holds them (Imin), then "
+            "the bright angle (Imax). The beam is blocked once, for the darks at every "
+            "V/div. Preview: the plan step by step (Plan tab) and every plateau (AWG tab)."
+        )).pack(anchor="w", padx=6, pady=(2, 4))
+
+    # -- the Plan tab -------------------------------------------------------------------
+    def _show_plan(self, title, steps, s, note="", settle_s=1.0):
+        from . import plan as planmod
+        total = planmod.timeline(steps, s, settle_s)
+        self.plan_view = {"title": title, "steps": steps, "total": total, "note": note,
+                          "rep": float(s.get("rep_s", 0.27))}
+        self.log(f"Plan - {title}: {len(steps)} steps, ~{total / 60:.0f} min at "
+                 f"{float(s.get('rep_s', 0.27)):g} s per shot" + (f"; {note}" if note else ""))
+        for ln in planmod.table(steps):
+            self.log("  " + ln)
+        self.plot_dirty.add(self.fig_plan._frame)
+        self.nb.select(self.fig_plan._frame)
+        self.draw_visible()
+
+    def draw_plan(self, fig):
+        P = getattr(self, "plan_view", None)
+        if not P:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "No plan yet: 'Preview plan' (Ramp scan tab), the Sequence's "
+                              "Preview (AWG tab) or Preview (Fixed rotations)",
+                    ha="center", va="center", transform=ax.transAxes, color="#888")
+            ax.set_axis_off()
+            return
+        steps = P["steps"]
+        gs = fig.add_gridspec(2, 1, height_ratios=[1, 2.2])
+        ax1 = fig.add_subplot(gs[0])
+        ax2 = fig.add_subplot(gs[1], sharex=ax1)
+        tm = [(st["t0"] + 0.5 * st["dur"]) / 60 for st in steps]
+        driven = [st for st in steps if st.get("x1") is not None]
+        if driven:
+            for key, col, lab in (("x1", "#1f77b4", "X1"), ("x2", "#2ca02c", "X2")):
+                xs, ys = [], []
+                for st in steps:
+                    if st.get(key) is None:
+                        continue
+                    xs += [st["t0"] / 60, (st["t0"] + st["dur"]) / 60]
+                    ys += [st[key], st[key]]
+                ax1.plot(xs, ys, color=col, lw=1.2, label=f"{lab} (deg the AWG puts on it)")
+            ax1.legend(fontsize=7, loc="upper left")
+        else:
+            ax1.text(0.5, 0.5, "this window's AWG does not drive: whatever plays (the ILC "
+                               "panel's drive)", ha="center", va="center",
+                     transform=ax1.transAxes, color="#888", fontsize=8)
+        ax1.set_ylabel("AWG rotation (deg)")
+        ax1.grid(alpha=0.3)
+        ax1.tick_params(labelbottom=False)
+        styles = {"scan": ("o", "#1f77b4", "scan angle"), "ref": ("s", "0.45", "reference return"),
+                  "azimuth": ("^", "0.55", "azimuth (4 angles)"),
+                  "null": ("o", "#1f77b4", "around the null"),
+                  "bright": ("v", "#ff7f0e", "bright (Imax)")}
+        seen = set()
+        for st, t in zip(steps, tm):
+            if st["angle"] is None:
+                ax2.axvspan(st["t0"] / 60, (st["t0"] + st["dur"]) / 60, color="0.85", lw=0,
+                            label=None if "off" in seen else "dark / background")
+                seen.add("off")
+                continue
+            mk, col, lab = styles.get(st["kind"], ("o", "k", st["kind"]))
+            ax2.plot([t], [st["angle"]], mk, color=col, ms=4,
+                     label=None if st["kind"] in seen else lab)
+            seen.add(st["kind"])
+        rel = any(st.get("rel") for st in steps)
+        ax2.set_ylabel("analyzer, from the null found at each rotation (deg)" if rel
+                       else "analyzer angle (deg)")
+        ax2.set_xlabel("time (min, estimated)")
+        ax2.legend(fontsize=7, loc="upper right")
+        ax2.grid(alpha=0.3)
+        shots = sorted({st.get("shots") for st in steps if st.get("shots")})
+        ax1.set_title(f"{P['title']}: {len(steps)} steps, ~{P['total'] / 60:.0f} min "
+                      f"({', '.join(map(str, shots))} shots per step at {P['rep']:g} s)",
+                      fontsize=9)
+        if P.get("note"):
+            ax2.text(0.005, 0.005, P["note"], transform=ax2.transAxes, fontsize=7,
+                     color="#444", ha="left", va="bottom", wrap=True)
 
     def build_ilc(self, f):
         """The ILC target comparison and correction files (rampol.ilc_target)."""
@@ -2434,6 +2632,11 @@ class App:
         self._show_awg_set(f"Fixed rotations plan: {', '.join(f'{b:g}' for b in order[:10])}"
                            f"{' ...' if len(order) > 10 else ''} deg ({p['order']})",
                            waves, window, found)
+        from . import plan as planmod
+        steps = planmod.fixed_rotations(p, biases, c["bias"].get("name") or "bias")
+        self._show_plan(f"Fixed rotations {c['bias'].get('name') or ''}", steps, c["scan"],
+                        "angles marked * are counted from the null the run finds at each "
+                        "rotation; the plateaus themselves: AWG tab")
 
     def do_seq_preview(self):
         """Every ramp of the AWG tab's sequence, drawn together."""
@@ -2453,6 +2656,16 @@ class App:
         except (ValueError, KeyError):
             pass
         self._show_awg_set(f"AWG sequence: {len(waves)} ramps (X1/X2 deg)", waves, win, found)
+        from . import plan as planmod
+        base = scanmod.safe_name(c.get("scan_name") or "sequence")
+        stray = self._stray_scale(c)
+        steps = planmod.sequence(c["scan"], ends, c["awg"].get("seq_order", SEQ_ORDERS[0]),
+                                 self._seq_names(base, ends), self.dark_mode.get(),
+                                 self.bg_mode.get(), stray and stray["vdiv"])
+        self._show_plan(f"AWG sequence {base}", steps, c["scan"],
+                        "the analyzer angles are the Ramp scan tab's, the same for every ramp "
+                        "(the null moves with the rotation); the ramps themselves: AWG tab",
+                        settle_s=float(c["awg"].get("seq_settle_s", 1.0) or 0))
 
     def _draw_awg_set(self, fig, S):
         """A set of waveforms: the AWG outputs (solid CH1 -> X1, dashed CH2
@@ -3329,63 +3542,90 @@ class App:
         ax.grid(alpha=0.3, axis="y")
 
     # -- find the min / max transmission angle --------------------------------------
+    # -- Analyzer tab --------------------------------------------------------------------
     def build_find(self, f):
+        """Find: what to find, in which light, around where, then go there;
+        the Malus scan; the dark / background. Preset first and the timebase
+        zoom are in Settings... (open_find_settings)."""
         self.fv = {}
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        ttk.Label(rr, text="Find").pack(side="left")
+
+        def ent(rr, key, w, label=None, after=None):
+            if label:
+                ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
+            self.fv[key] = tk.StringVar()
+            ttk.Entry(rr, textvariable=self.fv[key], width=w).pack(side="left", padx=(0, 3))
+            if after:
+                ttk.Label(rr, text=after).pack(side="left", padx=(0, 6))
+
+        r = self._row(f, (2, 1))
+        ttk.Label(r, text="the").pack(side="left")
         self.find_kind = tk.StringVar(value="min")
-        ttk.Combobox(rr, textvariable=self.find_kind, values=("min", "max"), width=5,
-                     state="readonly").pack(side="left", padx=4)
-        ttk.Label(rr, text="transmission of").pack(side="left")
+        ttk.Combobox(r, textvariable=self.find_kind, values=("min", "max"), width=5,
+                     state="readonly").pack(side="left", padx=3)
+        ttk.Label(r, text="of").pack(side="left")
         self.find_light = tk.StringVar(value=FIND_LIGHT[0])
-        ttk.Combobox(rr, textvariable=self.find_light, values=FIND_LIGHT, width=24,
-                     state="readonly").pack(side="left", padx=4)
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        for label, key, w, after in (("window", "window", 11, "ms"), ("line", "line_hz", 4, "Hz"),
-                                     ("scan step", "step", 4, "deg")):
-            ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
-            self.fv[key] = tk.StringVar()
-            ttk.Entry(rr, textvariable=self.fv[key], width=w).pack(side="left")
-            ttk.Label(rr, text=after).pack(side="left", padx=(1, 8))
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        for label, key, w in (("+-deg", "half", 4), ("points", "points", 3), ("shots", "shots", 3)):
-            ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
-            self.fv[key] = tk.StringVar()
-            ttk.Entry(rr, textvariable=self.fv[key], width=w).pack(side="left", padx=(0, 8))
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=(3, 1))
-        self._btn(rr, "Malus scan 0-180", self.do_malus_scan)
-        self._btn(rr, "Find and go there", self.do_find_angle, padx=(4, 0))
-        self.find_zero_btn = ttk.Button(rr, text="Make it analyzer 0", state="disabled",
+        ttk.Combobox(r, textvariable=self.find_light, values=FIND_LIGHT, width=24,
+                     state="readonly").pack(side="left", padx=3)
+        # only the light chosen shows its field
+        self.find_win_row = ttk.Frame(f)
+        ent(self.find_win_row, "window", 11, "window", "ms in the record (e.g. -10:-0.5)")
+        self.find_line_row = ttk.Frame(f)
+        ent(self.find_line_row, "line_hz", 4, "mains", "Hz (the scope triggers on LINE)")
+        self._find_anchor = r
+        self.find_light.trace_add("write", lambda *_: self._find_light_shown())
+        r = self._row(f)
+        ent(r, "half", 4, "search +-", "deg,")
+        ent(r, "points", 3, None, "points (blank: auto),")
+        ent(r, "shots", 3, None, "shots")
+        r = self._row(f)
+        self._btn(r, "Find and go there", self.do_find_angle)
+        self.find_zero_btn = ttk.Button(r, text="Make it analyzer 0", state="disabled",
                                         command=self.do_find_zero)
         self.find_zero_btn.pack(side="left", padx=4)
-        self.find_lbl = CopyLabel(f, text="", foreground="#060", width=47)
-        self.find_lbl.pack(anchor="w", padx=6)
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
-        self.find_preset = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="preset first", variable=self.find_preset).pack(side="left")
-        self.find_zoom = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="timebase to the window", variable=self.find_zoom).pack(
-            side="left", padx=(6, 0))
-        self._btn(rr, "Set scope as ramp scan", self.do_apply_preset, padx=(6, 0))
-        rr = ttk.Frame(f)
-        rr.pack(fill="x", padx=6, pady=1)
+        r = self._row(f)
+        self._btn(r, "Malus scan 0-180", self.do_malus_scan)
+        ent(r, "step", 4, "every", "deg")
+        r = self._row(f)
         self.find_off = {}
-        for label, kind, default in (("Dark", "dark", "none"),
-                                     ("Background", "background", "measure after")):
-            ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
+        for label, kind, default in (("dark", "dark", "none"),
+                                     ("background", "background", "measure after")):
+            ttk.Label(r, text=label).pack(side="left", padx=(0, 2))
             v = tk.StringVar(value=default)
-            ttk.Combobox(rr, textvariable=v, values=ANALYZER_OFFSETS, width=12,
-                         state="readonly").pack(side="left", padx=(0, 8))
+            ttk.Combobox(r, textvariable=v, values=ANALYZER_OFFSETS, width=12,
+                         state="readonly").pack(side="left", padx=(0, 6))
             self.find_off[kind] = v
-        ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
-            "Static light: nothing ramping, LINE trigger, PD mean over one line period. "
-            "Dark/background: measured after, at every V/div used, and subtracted.")).pack(
-            anchor="w", padx=6, pady=(2, 4))
+        ttk.Button(r, text="Settings...", command=self.open_find_settings).pack(side="right")
+        self.find_lbl = CopyLabel(f, text="", foreground="#060", width=60)
+        self.find_lbl.pack(anchor="w", padx=6, pady=(0, 3))
+        self.find_preset = tk.BooleanVar(value=True)
+        self.find_zoom = tk.BooleanVar(value=True)
+        self._find_light_shown()
+
+    def _find_light_shown(self):
+        static = self.find_light.get().startswith("static")
+        show, hide = ((self.find_line_row, self.find_win_row) if static else
+                      (self.find_win_row, self.find_line_row))
+        hide.pack_forget()
+        if not show.winfo_manager():
+            show.pack(fill="x", padx=6, pady=1, after=self._find_anchor)
+
+    def open_find_settings(self):
+        f = self._dialog(self, "find_set_win", "Find / Malus scan settings")
+        if f is None:
+            return
+        ttk.Checkbutton(f, text="write the selected preset and run the scan's settings "
+                                "check first", variable=self.find_preset).pack(anchor="w")
+        ttk.Checkbutton(f, text="zoom the timebase onto the window while measuring (put "
+                                "back after)", variable=self.find_zoom).pack(anchor="w")
+        r = ttk.Frame(f)
+        r.pack(fill="x", pady=4)
+        self._btn(r, "Set scope as ramp scan", self.do_apply_preset)
+        ttk.Label(f, foreground="#666", wraplength=420, justify="left", text=(
+            "Static light: nothing ramping, LINE trigger, the PD's mean over one line period. "
+            "Dark / background 'measure after': read at every V/div the readings used, and "
+            "subtracted; 'reuse latest': the newest stored at that V/div.")).pack(
+            anchor="w", pady=(4, 6))
+        ttk.Button(f, text="Close", command=f._close).pack(anchor="e")
 
     def _run_in_window(self, run, static, win, line_hz, zoom, st, post=None):
         """Worker: run(window) with the scope set for it - static light (LINE

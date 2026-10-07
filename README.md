@@ -84,6 +84,27 @@ sign (not built in yet).
 
 ## Using it
 
+The mode tabs are laid out as numbered steps in the order of use (Ramp scan:
+1 scope, 2 analyzer angles, 3 shots and dark / background, 4 name, check,
+start; AWG: 1 waveform, 2 dry run -> load -> ON, 3 measure in the hold, the
+Sequence; Fixed rotations: 1 rotations, 2 at each rotation, 3 preview / dry
+run / run). What is set once lives behind each tab's **Settings...**.
+
+**Plan tab.** Before anything moves: *Preview plan* (Ramp scan), the
+Sequence's *Preview* (AWG) and *Preview* (Fixed rotations) lay out every step
+in the order it will be taken - the analyzer angle, what the AWG puts on X1
+and X2, the shots - against the estimated time, and log it as a table
+(`rampol/plan.py`). Which tab does what with the AWG: a **Ramp scan** never
+touches it (it records whatever plays; its plan says so); the **AWG tab's
+Sequence** loads one ramp per (X1, X2) end point and runs a ramp scan for
+each at the Ramp scan tab's angles - the same absolute angles for every
+ramp; **Fixed rotations** holds each rotation and steps the analyzer around
+the null it finds there (angles counted from that null, marked * in the
+table). So "+-2 deg around the null at X1 = 0, 10 ... 40 deg, 16 shots" is
+Fixed rotations (rotations `0:40:10`, X1 share 1, null +-2 in 5 points, 16
+shots); "the same five absolute analyzer angles at each of five ramps" is the
+Sequence.
+
 1. **Connect** (the Hardware pane, one row per instrument: address, Connect,
    what is connected) the scope (VISA address blank = first MSO-X found),
    the ELL14 (COM3 on this PC) and the BK Precision 4063B AWG (blank = first
@@ -456,6 +477,11 @@ The order, each step its own button:
    scan name; a member resumed from the Ramp scan tab would be measured with
    whatever the AWG plays, so that is refused. At the end every scan of the
    sequence is put in the Compare tab.
+   The dry run reads the idle level again at 20 mV/div centred on it
+   (`awg.IDLE_VDIV`): at the shared setting the screen is centred mid-swing,
+   where the scope's offset error is ~-22 mV per volt of offset - on 7 Oct a
+   flat 0 V on CH2 read -20, -72 and -121 mV as the centre went 0, 2.3 and
+   4.6 V, and the 100 mV idle check failed on the scope, not the AWG.
 2. **Dry run on scope**: the AWG's outputs go to two scope channels (`Dry
    run: AWG CH1 -> scope CH3, CH2 -> CH4` by default) - a BNC tee keeps the
    next stage's input driven - while the Treks do NOT drive the EOMs (HV

@@ -306,6 +306,48 @@ def main():
           and len(ax_[0].lines) == 6 and len(ax_[1].patches) == 1,
           (ax_[0].get_title() if ax_ else "", len(ax_[0].lines) if ax_ else 0))
     app.fig_awg.savefig(os.path.join(out, "AWG_fixed_rotations_preview.png"))
+    pv = app.plan_view
+    npts = int(app.bv["null_points"].get())
+    check("... and the plan step by step on the Plan tab: the dark, then per rotation 4 "
+          "azimuth angles, the null points and the bright angle",
+          len(pv["steps"]) == 1 + 3 * (4 + npts + 1)
+          and [st["kind"] for st in pv["steps"][1:6]] == ["azimuth"] * 4 + ["null"]
+          and [st["x1"] for st in pv["steps"] if st["kind"] == "bright"]
+          == [0.0, 45.0 * float(app.bv["split"].get()), 90.0 * float(app.bv["split"].get())],
+          (len(pv["steps"]), pv["title"]))
+    app.redraw(app.fig_plan)
+    check("the Plan tab draws it with the time estimate",
+          "~" in app.fig_plan.axes[0].get_title() and "min" in app.fig_plan.axes[0].get_title(),
+          app.fig_plan.axes[0].get_title())
+    app.fig_plan.savefig(os.path.join(out, "Plan_fixed_rotations.png"))
+    app.do_scan_plan()
+    pv = app.plan_view
+    n_ang = len([st for st in pv["steps"] if st["kind"] == "scan"])
+    check("Ramp scan 'Preview plan': its angles in order, and that the AWG is not "
+          "driving from here", n_ang > 0 and "not driving" in pv["note"], pv["note"][:60])
+    app.find_light.set(gui.FIND_LIGHT[1])
+    root.update()
+    check("Analyzer: static light shows the mains field, not the record window",
+          app.find_line_row.winfo_manager() == "pack" and not app.find_win_row.winfo_manager())
+    app.find_light.set(gui.FIND_LIGHT[0])
+    root.update()
+    for opener, attr, want in ((app.open_scan_settings, "scan_set_win",
+                                ["blocks", "dither_codes", "points", "wait_s", "rep_s",
+                                 "backoff_deg", "ref_angle"]),
+                               (app.open_find_settings, "find_set_win", [])):
+        opener()
+        root.update()
+        w_ = getattr(app, attr)
+        stack, kids = [w_], []
+        while stack:
+            x_ = stack.pop()
+            kids.append(x_)
+            stack += x_.winfo_children()
+        bound = {str(k_.cget("textvariable")) for k_ in kids
+                 if k_.winfo_class() in ("TEntry", "TCombobox")}
+        check(f"{attr}: opens, every set-once field in it",
+              {str(app.sv[k_]) for k_ in want} <= bound, sorted(want))
+        w_.destroy()
     app.do_bias_dry()
     settle(root, app, timeout=300)
     dry = getattr(app, "awg_dry_all", [])

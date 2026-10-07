@@ -245,6 +245,25 @@ def rule_checks():
           not rep["ok"] and any("as long as meant" in x for x in rep["problems"]),
           rep["problems"][:1])
     s.off(force=True)
+    # 7 Oct 2026, the bench: a 90 deg ramp all on X1, idle 0 - X2's flat 0 V
+    # read -121 mV at the shared 2 V/div / 4.6 V-offset setting (the scope's
+    # offset error, ~-22 mV per volt of offset) and failed the idle check
+    s._period = {}
+    s.awg.frq = {1: 1000.0, 2: 1000.0}
+    scope.offset_err = -0.022
+    w90 = awg.ramp_hold(0.0, {}, idle={"EO1": 0.0, "EO2": 0.0},
+                        ends={"EO1": 90.0, "EO2": 0.0})
+    rep = awg.dry_run(s, link, w90, {"EO1": 3, "EO2": 4}, shots=2, log=lambda *a: None,
+                      identify=False)
+    b = rep["steps"]["both"]["EO2"]
+    check("the idle is read again at 20 mV/div: the AWG's own -40 mV, not the scope's "
+          "offset error at 2 V/div",
+          rep["ok"] and b.get("idle_vdiv") == awg.IDLE_VDIV and b["idle_coarse_V"] < -0.09
+          and abs(b["idle_meas_V"] + 0.040) < 0.005,
+          f"coarse {b.get('idle_coarse_V', 0)*1e3:.0f} mV, fine {b['idle_meas_V']*1e3:.1f} mV; "
+          f"{rep['problems'][:1]}")
+    scope.offset_err = 0.0
+    s.off(force=True)
 
 
 def calib_checks():

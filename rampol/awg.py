@@ -643,6 +643,8 @@ class Session:
 
 
 # ------------------------------------------------------------------- dry run
+IDLE_VDIV = 0.02           # V/div the dry run reads the idle level at
+
 TOL = {"gain": 0.04,        # the MSO-X's own DC gain accuracy is +-3 % of full scale
        "stretch": 5e-4,     # a record played at the wrong FRQ is stretched
        "delay_us": 20.0,
@@ -816,6 +818,39 @@ def dry_run(sess, link, wave, wiring, shots=4, points=20000, wait_s=10.0,
                 f"{n} -> scope CH{c}: gain {res[n]['gain']:.3f}, delay "
                 f"{res[n]['delay_us']:.1f} us, {res[n]['rms_mV']:.1f} mV rms"
                 for n, c in zip(CHANNELS, chs)))
+        # The idle, read again at a V/div that can see it. At the shared
+        # setting the screen is centred mid-swing (2 V/div at 4.6 V for a 90
+        # deg ramp), where the scope's own offset error is ~-22 mV per volt
+        # of offset (7 Oct 2026: a flat 0 V read -20, -72, -121 mV as the
+        # centre went 0, 2.3, 4.6 V) and one code ~60 mV - the 100 mV idle
+        # check failed on the scope, not the AWG. Only the samples before the
+        # trigger are used: the burst overdrives this range, and the input
+        # has recovered by the next trigger, seconds later.
+        if vd > 2 * IDLE_VDIV:
+            if cancelled():
+                from .hw import Cancelled
+                raise Cancelled()
+            for name, ch in zip(CHANNELS, chs):
+                link.set_channel(ch, IDLE_VDIV, float(wave.u[name][0]))
+            got = capture(link, chs, shots, points, wait_s, cancelled)
+            for name, ch in zip(CHANNELS, chs):
+                t, mean, _stack = got[ch]
+                r = report["steps"]["both"][name]
+                pre = t < r["delay_us"] * 1e-6 - 20e-6
+                if pre.sum() <= 20:
+                    continue
+                meas = float(np.mean(mean[pre]))
+                meant = float(wave.u[name][0])
+                r["idle_coarse_V"], r["idle_meas_V"], r["idle_vdiv"] = (
+                    r["idle_meas_V"], meas, IDLE_VDIV)
+                r["problems"] = [p for p in r["problems"] if not p.startswith("idle ")]
+                if abs(meas - meant) > TOL["idle_V"]:
+                    r["problems"].append(f"idle {meas*1e3:+.0f} mV, meant {meant*1e3:+.0f} mV "
+                                         f"(read at {IDLE_VDIV*1e3:g} mV/div)")
+            log("  idle at %g mV/div: " % (IDLE_VDIV * 1e3) + "; ".join(
+                f"{n} {report['steps']['both'][n]['idle_meas_V']*1e3:+.1f} mV (meant "
+                f"{wave.u[n][0]*1e3:+.1f})" for n in CHANNELS
+                if report["steps"]["both"][n].get("idle_vdiv")))
         # which output reached which scope channel
         if identify:
             for name, other in (("EO1", "EO2"), ("EO2", "EO1")):
