@@ -941,22 +941,22 @@ class App:
 
     # -- AWG mode -----------------------------------------------------------------------------
     def build_awg(self, f):
-        """The 4063B playing a waveform into the Treks (CH1 -> X1, CH2 -> X2):
-        a ramp to a rotation and back, or two ILC drive files. Preview and
-        check, dry run on the scope, load, outputs on / park / off, then
-        measure in the hold."""
+        """The 4063B playing a waveform into the Treks (CH1 -> X1, CH2 -> X2),
+        laid out in the order it is used: its state (with Park / OFF always
+        at hand), 1 the waveform, 2 the dry run and the outputs, 3 measuring
+        in the hold, then the X1 / X2 sequence. What is set once - the grid,
+        idle trims, trigger, scope span, dry-run wiring, the safety rules -
+        lives in Settings... (open_awg_settings)."""
         self.av, self.a_choice = {}, {}
 
-        def row(pady=1):
-            rr = ttk.Frame(f)
-            rr.pack(fill="x", padx=6, pady=pady)
-            return rr
+        def var(key):
+            self.av[key] = tk.StringVar()
+            return self.av[key]
 
         def entry(rr, key, w, label=None, after=None):
             if label:
                 ttk.Label(rr, text=label).pack(side="left", padx=(0, 1))
-            self.av[key] = tk.StringVar()
-            ttk.Entry(rr, textvariable=self.av[key], width=w).pack(side="left", padx=(0, 4))
+            ttk.Entry(rr, textvariable=var(key), width=w).pack(side="left", padx=(0, 4))
             if after:
                 ttk.Label(rr, text=after).pack(side="left", padx=(0, 2))
 
@@ -965,94 +965,203 @@ class App:
             ttk.Combobox(rr, textvariable=self.a_choice[key], values=values, width=w,
                          state="readonly").pack(side="left", padx=(0, 4))
 
-        rr = row((4, 1))
-        ttk.Label(rr, text="Waveform").pack(side="left", padx=(0, 2))
-        combo(rr, "source", ("ramp", "ILC drives"), 10, "ramp")
-        entry(rr, "rotation", 6, "rotation", "deg, split X1")
-        entry(rr, "split", 4)
-        combo(rr, "edge", ("cosine", "linear"), 7, "cosine")
-        rr = row()
-        for label, key in (("lead", "lead_ms"), ("rise", "rise_ms"), ("hold", "hold_ms"),
-                           ("fall", "fall_ms"), ("after", "tail_ms")):
-            entry(rr, key, 4, label)
-        entry(rr, "dt_us", 4, "ms, dt", "us")
-        self.a_record = CopyLabel(f, text="", foreground="#666", width=46)
-        self.a_record.pack(anchor="w", padx=6)
-        for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms", "dt_us"):
-            self.av[k].trace_add("write", lambda *_: self._awg_record_text())
-        rr = row()
-        entry(rr, "idle1", 7, "Idle X1")
-        entry(rr, "idle2", 7, "X2", "V")
-        ttk.Button(rr, text="EOM calibration...", command=self.open_calibration).pack(
-            side="right")
-        rr = row()
-        ttk.Label(rr, text="ILC drives").pack(side="left")
-        for label, key in (("X1", "file1"), ("X2", "file2")):
-            ttk.Label(rr, text=label).pack(side="left", padx=(4, 1))
-            self.av[key] = tk.StringVar()
-            ttk.Entry(rr, textvariable=self.av[key], width=13).pack(side="left")
-            ttk.Button(rr, text="...", width=3,
-                       command=lambda k=key: self.pick_awg_file(k)).pack(side="left")
-        rr = row()
+        def box(text):
+            b = ttk.LabelFrame(f, text=text)
+            b.pack(fill="x", padx=4, pady=(3, 0))
+            return b
+
+        def row(parent, pady=1):
+            rr = ttk.Frame(parent)
+            rr.pack(fill="x", padx=6, pady=pady)
+            return rr
+
+        # what is set once: variables here, widgets in Settings...
+        for k in ("dt_us", "idle1", "idle2", "trig_hz", "scope_before_ms", "scope_after_ms",
+                  "dry_shots", "seq_settle_s"):
+            var(k)
+        for k, d in (("dry_ch1", "3"), ("dry_ch2", "4")):
+            self.a_choice[k] = tk.StringVar(value=d)
         self.a_fit_tb = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="scope from", variable=self.a_fit_tb).pack(side="left")
-        entry(rr, "scope_before_ms", 4, None, "ms before the trigger to")
-        entry(rr, "scope_after_ms", 4, None, "ms past the record")
-        rr = row()
-        entry(rr, "trig_hz", 4, "Trigger", "Hz")
         self.a_never = tk.BooleanVar(value=True)
         self.a_require = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="never let an output float", variable=self.a_never,
-                        command=self._awg_flags).pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(rr, text="require a dry run", variable=self.a_require,
-                        command=self._awg_flags).pack(side="left", padx=(6, 0))
-        rr = row()
-        ttk.Label(rr, text="Dry run: AWG CH1 -> scope CH").pack(side="left")
-        combo(rr, "dry_ch1", ("1", "2", "3", "4"), 2, "3")
-        ttk.Label(rr, text="CH2 -> CH").pack(side="left")
-        combo(rr, "dry_ch2", ("1", "2", "3", "4"), 2, "4")
-        entry(rr, "dry_shots", 3, "shots")
-        rr = row((3, 1))
-        ttk.Button(rr, text="Preview", command=self.do_awg_preview).pack(side="left")
-        self._btn(rr, "Dry run on scope", self.do_awg_dry, padx=(4, 0))
-        self._btn(rr, "Load to AWG", self.do_awg_load, padx=(4, 0))
-        ttk.Button(rr, text="?", width=2, command=lambda: self.log(AWG_HELP)).pack(
-            side="left", padx=(4, 0))
-        rr = row()
-        self._btn(rr, "Outputs ON", self.do_awg_on)
+
+        # -- the AWG's state, and the two buttons that must always work
+        top = ttk.Frame(f)
+        top.pack(fill="x", padx=6, pady=(4, 0))
         # never greyed out: they must work while anything else runs
-        ttk.Button(rr, text="Park (idle, ON)", command=self.do_awg_park).pack(
-            side="left", padx=(4, 0))
-        ttk.Button(rr, text="Outputs OFF", command=self.do_awg_off).pack(side="left", padx=(4, 0))
-        rr = row()
-        entry(rr, "settle_ms", 4, "In the hold, after", "ms settle,")
-        entry(rr, "shots", 3, "shots")
+        ttk.Button(top, text="Outputs OFF", command=self.do_awg_off).pack(side="right")
+        ttk.Button(top, text="Park", command=self.do_awg_park).pack(side="right", padx=(0, 4))
+        self.awg_lbl = CopyLabel(top, text="AWG: not connected (connects on first use)",
+                                 foreground="#666", width=34)
+        self.awg_lbl.pack(side="left", fill="x", expand=True)
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6)
+        self.awg_safety = ttk.Label(rr, text="", foreground="#666")
+        self.awg_safety.pack(side="left")
+        ttk.Button(rr, text="?", width=2, command=lambda: self.log(AWG_HELP)).pack(side="right")
+        ttk.Button(rr, text="Settings...", command=self.open_awg_settings).pack(
+            side="right", padx=(0, 4))
+
+        # -- 1: the waveform
+        b = box("1  Waveform")
+        rr = row(b, (2, 1))
+        self.a_choice["source"] = tk.StringVar(value="ramp")
+        for text, val in (("ramp to a rotation", "ramp"), ("ILC drive files", "ILC drives")):
+            ttk.Radiobutton(rr, text=text, value=val, variable=self.a_choice["source"]).pack(
+                side="left", padx=(0, 8))
+        ttk.Button(rr, text="Preview", command=self.do_awg_preview).pack(side="right")
+        self.a_ramp = ttk.Frame(b)
+        r1 = row(self.a_ramp)
+        entry(r1, "rotation", 6, "rotation", "deg,")
+        entry(r1, "split", 4, "X1 share")
+        ttk.Label(r1, text="edges").pack(side="left", padx=(4, 1))
+        combo(r1, "edge", ("cosine", "linear"), 7, "cosine")
+        r2 = row(self.a_ramp)
+        for label, key in (("lead", "lead_ms"), ("rise", "rise_ms"), ("hold", "hold_ms"),
+                           ("fall", "fall_ms"), ("after", "tail_ms")):
+            entry(r2, key, 4, label)
+        ttk.Label(r2, text="ms").pack(side="left")
+        self.a_record = CopyLabel(self.a_ramp, text="", foreground="#666", width=46)
+        self.a_record.pack(anchor="w", padx=6, pady=(0, 2))
+        for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms", "dt_us"):
+            self.av[k].trace_add("write", lambda *_: self._awg_record_text())
+        self.a_files = ttk.Frame(b)
+        r3 = row(self.a_files, (1, 3))
+        for label, key in (("X1", "file1"), ("X2", "file2")):
+            ttk.Label(r3, text=label).pack(side="left", padx=(0 if key == "file1" else 6, 1))
+            ttk.Entry(r3, textvariable=var(key), width=16).pack(side="left")
+            ttk.Button(r3, text="...", width=3,
+                       command=lambda k=key: self.pick_awg_file(k)).pack(side="left")
+        self.a_choice["source"].trace_add("write", lambda *_: self._awg_source_shown())
+        self._awg_source_shown()
+
+        # -- 2: on the scope first, then into the Treks
+        b = box("2  Check it on the scope, then drive the Treks")
+        rr = row(b, (2, 3))
+        self._btn(rr, "Dry run on scope", self.do_awg_dry)
+        ttk.Label(rr, text="->").pack(side="left", padx=3)
+        self._btn(rr, "Load to AWG", self.do_awg_load)
+        ttk.Label(rr, text="->").pack(side="left", padx=3)
+        self._btn(rr, "Outputs ON", self.do_awg_on)
+
+        # -- 3: measuring in the hold
+        b = box("3  Measure in the hold")
+        rr = row(b, (2, 1))
+        entry(rr, "settle_ms", 4, "from", "ms into the hold,")
+        entry(rr, "shots", 3, None, "shots")
         self._btn(rr, "Find min", lambda: self.do_awg_find("min"), padx=(4, 0))
         self._btn(rr, "Find max", lambda: self.do_awg_find("max"), padx=(4, 0))
-        # a sequence of end points: one ramp scan each, with the analyzer
-        rr = row((5, 1))
-        ttk.Label(rr, text="Sequence  X1 ends").pack(side="left", padx=(0, 1))
-        self.av["seq_x1"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.av["seq_x1"], width=10).pack(side="left", padx=(0, 4))
-        ttk.Label(rr, text="X2 ends").pack(side="left", padx=(0, 1))
-        self.av["seq_x2"] = tk.StringVar()
-        ttk.Entry(rr, textvariable=self.av["seq_x2"], width=10).pack(side="left", padx=(0, 2))
-        ttk.Label(rr, text="deg").pack(side="left", padx=(0, 4))
+        ttk.Label(b, foreground="#666", text="A whole ramp scan with the AWG playing: the "
+                  "Ramp scan tab (it records this drive).").pack(anchor="w", padx=6, pady=(0, 3))
+
+        # -- a sequence of end points: one ramp scan each, with the analyzer
+        b = box("Sequence: one ramp scan per X1 / X2 end point")
+        rr = row(b, (2, 1))
+        entry(rr, "seq_x1", 10, "X1 ends")
+        entry(rr, "seq_x2", 10, "X2 ends", "deg")
         combo(rr, "seq_how", ("pairs", "grid"), 5, "pairs")
-        rr = row()
-        combo(rr, "seq_order", SEQ_ORDERS, 19, SEQ_ORDERS[0])
-        ttk.Button(rr, text="Preview", command=self.do_seq_preview).pack(
-            side="left", padx=(2, 0))
+        rr = row(b)
+        combo(rr, "seq_order", SEQ_ORDERS, 22, SEQ_ORDERS[0])
+        ttk.Button(rr, text="Preview", command=self.do_seq_preview).pack(side="left")
         self._btn(rr, "Dry run all", self.do_seq_dry, padx=(4, 0))
-        self._btn(rr, "Start sequence", self.do_seq_start, padx=(4, 0))
-        self.awg_seq_lbl = CopyLabel(f, text="", foreground="#666", width=46)
-        self.awg_seq_lbl.pack(anchor="w", padx=6)
+        self._btn(rr, "Start", self.do_seq_start, padx=(4, 0))
+        self.awg_seq_lbl = CopyLabel(b, text="", foreground="#666", width=46)
+        self.awg_seq_lbl.pack(anchor="w", padx=6, pady=(0, 3))
         for k in ("seq_x1", "seq_x2"):
             self.av[k].trace_add("write", lambda *_: self._seq_text())
         self.a_choice["seq_how"].trace_add("write", lambda *_: self._seq_text())
-        self.awg_lbl = CopyLabel(f, text="AWG: not connected (connects on first use)",
-                                 foreground="#666", width=47)
-        self.awg_lbl.pack(anchor="w", padx=6, pady=(2, 4))
+        self._awg_safety_text()
+
+    def _awg_source_shown(self):
+        """Only the fields of the waveform chosen: a ramp's, or the files'."""
+        ramp = self.a_choice["source"].get() != "ILC drives"
+        show, hide = (self.a_ramp, self.a_files) if ramp else (self.a_files, self.a_ramp)
+        hide.pack_forget()
+        if not show.winfo_manager():
+            show.pack(fill="x")
+
+    def _awg_safety_text(self):
+        never, req = bool(self.a_never.get()), bool(self.a_require.get())
+        txt = (f"outputs {'never float' if never else 'MAY FLOAT (rule off)'}; "
+               f"{'a dry run is required' if req else 'NO dry run required'}")
+        self.awg_safety.configure(text=txt, foreground="#666" if never and req else "#c00000")
+
+    def open_awg_settings(self):
+        """The AWG settings that are set once and rarely touched."""
+        w = getattr(self, "awg_set_win", None)
+        if w is not None and w.winfo_exists():
+            w.lift()
+            return
+        w = tk.Toplevel(self.root)
+        w.title("AWG settings")
+        w.transient(self.root)
+        self.awg_set_win = w
+        f = ttk.Frame(w, padding=8)
+        f.pack(fill="both", expand=True)
+
+        def sect(text):
+            lf = ttk.LabelFrame(f, text=text)
+            lf.pack(fill="x", pady=(0, 6))
+            return lf
+
+        def line(parent, items, note=None):
+            rr = ttk.Frame(parent)
+            rr.pack(fill="x", padx=6, pady=2)
+            for it in items:
+                if isinstance(it, str):
+                    ttk.Label(rr, text=it).pack(side="left", padx=(0, 2))
+                else:
+                    kind, key, width = it
+                    if kind == "e":
+                        ttk.Entry(rr, textvariable=self.av[key], width=width).pack(
+                            side="left", padx=(0, 4))
+                    else:
+                        ttk.Combobox(rr, textvariable=self.a_choice[key], width=width,
+                                     values=("1", "2", "3", "4"), state="readonly").pack(
+                            side="left", padx=(0, 4))
+            if note:
+                ttk.Label(parent, text=note, foreground="#666", wraplength=420,
+                          justify="left").pack(anchor="w", padx=6, pady=(0, 3))
+            return rr
+
+        s = sect("Waveform")
+        line(s, ["grid", ("e", "dt_us", 5), "us per point"],
+             "The ILC's record is 11 ms at 2 us (5501 points); the 4063B takes up to 16384.")
+        rr = line(s, ["idle X1", ("e", "idle1", 8), "X2", ("e", "idle2", 8), "V"],
+                  "Blank = the ILC state files' first sample (the learned trim): the AWG holds "
+                  "the first sample between bursts, and file zero parks the EOMs at -9 / -41 V.")
+        ttk.Button(rr, text="EOM calibration...", command=self.open_calibration).pack(
+            side="right")
+        s = sect("Timing")
+        line(s, ["bench trigger", ("e", "trig_hz", 5), "Hz"],
+             "Checked against the record: a record over 80 % of the trigger period skips bursts.")
+        rr = ttk.Frame(s)
+        rr.pack(fill="x", padx=6, pady=2)
+        ttk.Checkbutton(rr, text="set the scope from", variable=self.a_fit_tb).pack(side="left")
+        ttk.Entry(rr, textvariable=self.av["scope_before_ms"], width=5).pack(side="left", padx=2)
+        ttk.Label(rr, text="ms before the trigger to").pack(side="left")
+        ttk.Entry(rr, textvariable=self.av["scope_after_ms"], width=5).pack(side="left", padx=2)
+        ttk.Label(rr, text="ms past the record").pack(side="left")
+        ttk.Label(s, text="On Load and for Find in the hold; the dry run always shows the "
+                          "whole record.", foreground="#666").pack(anchor="w", padx=6, pady=(0, 3))
+        line(s, ["sequence: wait", ("e", "seq_settle_s", 5), "s after each waveform change"])
+        s = sect("Dry run wiring")
+        line(s, ["AWG CH1 -> scope CH", ("c", "dry_ch1", 2), "CH2 -> scope CH",
+                 ("c", "dry_ch2", 2), ("e", "dry_shots", 3), "shots per waveform"])
+        s = sect("Safety")
+        ttk.Checkbutton(s, text="never let an output float (both): the end of anything is "
+                                "Park, not OFF", variable=self.a_never,
+                        command=self._awg_flags).pack(anchor="w", padx=6, pady=1)
+        ttk.Checkbutton(s, text="require a dry run before a waveform may drive the Treks",
+                        variable=self.a_require, command=self._awg_flags).pack(
+            anchor="w", padx=6, pady=(1, 4))
+
+        def close():
+            self.save_settings()
+            self._awg_record_text()
+            w.destroy()
+        ttk.Button(f, text="Close", command=close).pack(anchor="e")
+        w.protocol("WM_DELETE_WINDOW", close)
 
     def pick_awg_file(self, key):
         start = os.path.dirname(self.av[key].get()) or os.path.join(
@@ -1081,6 +1190,7 @@ class App:
             s.never_float = bool(self.a_never.get())
             s.require_dry_run = bool(self.a_require.get())
         self._awg_status()
+        self._awg_safety_text()
 
     def _awg_idle(self, c):
         """{EO1, EO2: idle V}: typed, or the ILC state files' first sample."""
@@ -3654,6 +3764,7 @@ class App:
         self.a_fit_tb.set(bool(a.get("fit_timebase", True)))
         self.a_never.set(bool(a.get("never_float", True)))
         self.a_require.set(bool(a.get("require_dry_run", True)))
+        self._awg_safety_text()
 
     def gather(self):
         """The window's values into self.cfg (validated where it matters)."""

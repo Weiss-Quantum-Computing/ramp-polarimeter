@@ -764,6 +764,39 @@ def main():
     app.cal_win.destroy()
 
     print("\nAWG mode: dry run, then ramp to a rotation and find the null in the hold")
+    app.modes.select(2)
+    app.a_choice["source"].set("ILC drives")
+    root.update()
+    check("AWG tab: choosing ILC drive files shows their fields, not the ramp's",
+          app.a_files.winfo_manager() == "pack" and not app.a_ramp.winfo_manager())
+    app.a_choice["source"].set("ramp")
+    root.update()
+    check("... and back", app.a_ramp.winfo_manager() == "pack" and not app.a_files.winfo_manager())
+    app.open_awg_settings()
+    root.update()
+    win_ = app.awg_set_win
+    kids = []
+    stack = [win_]
+    while stack:
+        w_ = stack.pop()
+        kids.append(w_)
+        stack += w_.winfo_children()
+    bound = {str(k_.cget("textvariable")) for k_ in kids
+             if k_.winfo_class() in ("TEntry", "TCombobox")}
+    want = {str(app.av[k_]) for k_ in ("dt_us", "idle1", "idle2", "trig_hz", "scope_before_ms",
+                                       "scope_after_ms", "dry_shots", "seq_settle_s")}
+    want |= {str(app.a_choice[k_]) for k_ in ("dry_ch1", "dry_ch2")}
+    check("Settings...: every set-once AWG field is in the dialog", want <= bound,
+          sorted(want - bound))
+    app.a_require.set(False)
+    gui.messagebox.askyesno = lambda *a_, **k_: True
+    app._awg_flags()
+    check("the safety line turns red with a rule off",
+          "NO dry run" in app.awg_safety.cget("text")
+          and str(app.awg_safety.cget("foreground")) == "#c00000", app.awg_safety.cget("text"))
+    app.a_require.set(True)
+    app._awg_flags()
+    win_.destroy()
     app.a_choice["source"].set("ramp")
     app.av["rotation"].set("60")
     app.do_awg_preview()

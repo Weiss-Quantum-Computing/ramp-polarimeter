@@ -384,7 +384,15 @@ partly the filter, and correcting it would put a real error on the light.
 
 The 4063B plays a waveform into the Treks on the bench trigger (EXT burst),
 CH1 -> X1 -> EO1, CH2 -> X2 -> EO2, through EOM-ILC's upload path and checks
-(`rampol/awg.py`). The order, each step its own button:
+(`rampol/awg.py`). The tab follows the order of use: the AWG's state at the
+top with **Park** and **Outputs OFF** (always usable) and a line saying
+whether the safety rules are on (red if one is off); **1 Waveform** (a ramp
+or two ILC drive files - only the chosen one's fields show - and Preview);
+**2** Dry run on scope -> Load to AWG -> Outputs ON; **3** Find min / max in
+the hold; and the **Sequence**. What is set once - the dt grid, idle trims,
+EOM calibration, bench trigger, the scope's span, dry-run wiring, the
+sequence's settle time and the two safety rules - is in **Settings...**.
+The order, each step its own button:
 
 1. **Preview**: the waveform per channel and the rotation it gives (from the
    EOM calibration), and the checks: Trek limits, the 9.6 V cap, the 100 mV
