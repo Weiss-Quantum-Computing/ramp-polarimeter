@@ -438,6 +438,69 @@ def main():
     check("Compare: rotation of both scans, their difference and the ER",
           len(ax) == 3 and "gui_test" in names and "gui_test_2 (shown)" in names, names)
     app.fig_cmp.savefig(os.path.join(out, "Compare.png"))
+    app.fig_cmp._ylog.set(False)
+    app.redraw(app.fig_cmp)
+    check("Compare: the ER panel goes linear", app.fig_cmp.axes[-1].get_yscale() == "linear")
+    app.fig_cmp._ylog.set(True)
+
+    print("\ncompared scans on the other tabs; log / linear; the ER table")
+    app.nb.select(app.fig_ext._frame)
+    app.fig_ext._cmp_on.set(True)
+    app.redraw(app.fig_ext)
+    leg = app.fig_ext.axes[0].get_legend()
+    texts = [t.get_text() for t in leg.get_texts()] if leg else []
+    check("Extinction: the compared scan drawn and named in the key",
+          any(t == "compared: gui_test" for t in texts), texts[-6:])
+    check("Extinction: log by default", app.fig_ext.axes[0].get_yscale() == "log")
+    app.fig_ext._ylog.set(False)
+    app.redraw(app.fig_ext)
+    check("... and linear from 0 when unticked", app.fig_ext.axes[0].get_yscale() == "linear"
+          and app.fig_ext.axes[0].get_ylim()[0] == 0)
+    app.fig_ext._ylog.set(True)
+    app.fig_ext._cmp_on.set(False)
+    app.ext_show["lower"].set(False)
+    app.redraw(app.fig_ext)
+    leg = app.fig_ext.axes[0].get_legend()
+    texts = [t.get_text() for t in leg.get_texts()] if leg else []
+    check("'lower bounds' unticked: no lower bound drawn",
+          not any("lower bound" in t for t in texts), texts)
+    app.ext_show["lower"].set(True)
+    for f_, what in ((app.fig_malus, "Malus"), (app.fig_angle, "Angle"),
+                     (app.fig_poin, "Poincaré"), (app.fig_diag, "Diagnostics")):
+        f_._cmp_on.set(True)
+        app.redraw(f_)
+        labels = [ln.get_label() for a_ in f_.axes for ln in a_.lines]
+        check(f"{what}: the compared scan drawn", "gui_test" in labels, labels[:8])
+        f_._cmp_on.set(False)
+    for f_, what in ((app.fig_traces, "Traces"), (app.fig_malus, "Malus")):
+        f_._ylog.set(True)
+        app.redraw(f_)
+        check(f"{what}: log y is symlog (the dark-subtracted level goes below zero)",
+              f_.axes[0].get_yscale() == "symlog")
+        f_._ylog.set(False)
+        app.redraw(f_)
+    app.do_copy_er()
+    txt = root.clipboard_get()
+    import csv as _csv
+    import io as _io
+    body = [ln for ln in txt.splitlines() if not ln.startswith("#")]
+    rows = list(_csv.DictReader(_io.StringIO("\n".join(body))))
+    meth = {r_["method"] for r_ in rows}
+    check("Copy CSV: a '#' header, then crossings, dips and the binned ER_fit",
+          txt.startswith("# extinction ratio along the ramp - scan gui_test_2")
+          and {"crossing", "dip", "er_fit"} <= meth
+          and all(r_["er"] for r_ in rows if r_["method"] == "crossing"), sorted(meth))
+    cr = [r_ for r_ in rows if r_["method"] == "crossing"]
+    check("each crossing row: leg, direction, rotation, sigma or a lower-bound flag",
+          all(r_["leg"] in ("1", "2") and r_["direction"] in ("away", "back")
+              and r_["rotation_deg"] and (r_["lower_bound"] == "1" or r_["er_sigma_lo"])
+              for r_ in cr), cr[0] if cr else None)
+    import tkinter.filedialog as _fd
+    target = os.path.join(SANDBOX, "er_export.csv")
+    gui.filedialog.asksaveasfilename = lambda **k: target
+    app.do_export_er()
+    check("Export CSV writes the same table", os.path.isfile(target)
+          and open(target, encoding="utf-8").read() == app._er_csv())
 
     print("\nbrief export")
     app.do_export_brief()

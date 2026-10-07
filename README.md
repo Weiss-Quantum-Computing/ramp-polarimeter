@@ -507,13 +507,22 @@ box opens any angle: key `<name>_a045.00`, runs `1-4`.
 
 ## Tabs
 
+Two switches recur. **log y** (Traces, Malus, Extinction, Shots, Compare,
+Fixed rotations): an extinction ratio goes log; a light level, which can go
+below zero once the dark is subtracted, goes symmetric-log (linear within
++-1 mV). **compare scans** (Extinction, Malus, Angle, Poincaré,
+Diagnostics): the scans picked in the Compare tab (*Compare selected*) are
+drawn there too, one colour each - green, red, purple, ... - while the shown
+scan keeps its own colours. The Malus tab sets them against the shown scan
+at the same TIME, which means the same thing only for the same sequence.
+
 | tab | shows |
 |---|---|
 | Traces | PD at every analyzer angle (colour = angle), dark dashed; monitors below |
 | Map | I(t, theta) / Imax(t), with the fitted null psi + 90 drawn over it; or the Malus-fit residual (mV, or per standard error) per angle and time, with the rms per angle beside it: a bad angle, clipping, a missed lock or drift shows as a row or a patch |
 | Malus | I vs analyzer angle at the cursor time, the fit, residuals |
 | Angle | rotation from rest with +-1 SD, the monitor prediction, their difference in mdeg |
-| Extinction | the extinction ratio along the record by method (marker): measured at a crossing (circles), dip fit (triangles), measured static (squares; grey hollow where the angle was too far from crossed), null refine (diamonds), the per-sample Malus fit as a grey line with its drift limit; colour = leg (first / second transport, shaded on the time axis), filled = rotation moving away from rest, hollow = moving back; +-1 sigma bars (asymmetric: ER goes as 1/Imin); lower bounds as arrows. *What are these?* opens the explanation of every family. x = time or rotation (rotation lines the two legs up) |
+| Extinction | the extinction ratio along the record by method (marker): measured at a crossing (circles), dip fit (triangles), measured static (squares; grey hollow where the angle was too far from crossed), null refine (diamonds), the per-sample Malus fit as a grey line with its drift limit; colour = leg (first / second transport, shaded on the time axis), filled = rotation moving away from rest, hollow = moving back; +-1 sigma bars (asymmetric: ER goes as 1/Imin); a lower bound is its marker with an arrow growing out of the top (the true ER is above it; a method with smaller noise gives a higher bound for the same unresolved Imin, so dip-fit bounds sit above the measured ones), hidden by unticking *lower bounds*. *What are these?* opens the explanation of every family. x = time or rotation (rotation lines the two legs up). **Export CSV... / Copy CSV**: every value as a table (`analysis.er_csv`) - method, leg, direction, time, rotation, analyzer angle, ER, +-1 sigma, lower-bound flag, Imin, Imax, and the per-sample fit's ER in 2-deg rotation bins - under a '#' header saying what the scan was, what was subtracted, the crossings' Imin spread across analyzer angles and the ER it limits to, and the drift limit; `pandas.read_csv(path, comment='#')` reads it |
 | Poincaré | the linear Stokes parameters in the rest frame on the sphere (coloured by time), |S3| and the ellipticity angle chi vs time assuming full polarization (handedness not measured), the ellipse at the cursor against the rest ellipse |
 | Diagnostics | ref returns vs time, per-angle transmission (or 1-theta and 4-theta amplitudes with it off), residual vs block SEM, landing error and off-screen samples per step; a line under each panel says what it shows and what it should look like |
 | Table | per-segment medians, every refine, dip and direct ER; Save CSV |

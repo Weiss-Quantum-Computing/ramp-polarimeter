@@ -885,6 +885,196 @@ def er_sigma(er, imin, sig_imin, imax=None, sig_imax=0.0):
     return float(lo), float(hi)
 
 
+def moving_away(pol, t_s):
+    """True while |rotation| grows (moving away from rest) at time t_s."""
+    rot = pol["rotation"]
+    j = int(np.clip(np.searchsorted(pol["t"], t_s), 1, len(rot) - 1))
+    k = max(1, int(len(rot) / 2000))
+    a, b = rot[max(j - k, 0)], rot[min(j + k, len(rot) - 1)]
+    return abs(b) >= abs(a)
+
+
+ER_COLUMNS = ["method", "leg", "direction", "segment", "t_ms", "rotation_deg",
+              "analyzer_deg", "rate_deg_per_ms", "er", "er_sigma_lo", "er_sigma_hi",
+              "lower_bound", "imin_mV", "imin_sigma_mV", "imax_V", "n", "note"]
+
+
+def er_table(res, fit_bin_deg=2.0):
+    """Every extinction-ratio value of an analysed scan (the GUI result
+    dict) as rows of ER_COLUMNS, in time order within each method:
+    'crossing' and 'static' (both intensities measured), 'dip' (Imin
+    fitted around a crossing), 'refine' (null refine), then 'er_fit' (the
+    per-sample Malus fit's ER: its median in `fit_bin_deg` rotation bins per
+    leg and direction while moving, and per static stretch, with the 16th /
+    84th percentiles as the spread). Static points whose angle sat too far
+    from crossed (offset_limited) are kept and marked in 'note'.
+    Returns (rows, facts): facts is a dict of numbers for the header."""
+    d, pol = res["d"], res["pol"]
+    segs = segments(pol["t"], pol["rotation"])
+    downs = [x["t1"] for x in segs if x["base"] == "down"]
+    t_end = (max(downs) + 1e-3) if downs else float(pol["t"][-1])
+    rows = []
+
+    def direction(t_s, moving=True):
+        if not moving:
+            return "static"
+        return "away" if moving_away(pol, t_s) else "back"
+
+    def add(method, t_s, rotation, theta, rate, er, sig, lower, imin, simin, imax,
+            n="", note="", moving=True, seg=None):
+        lo, hi = sig
+        rows.append({"method": method, "leg": leg_of(segs, t_s),
+                     "direction": direction(t_s, moving),
+                     "segment": seg or next((x["kind"] for x in segs
+                                             if x["t0"] <= t_s <= x["t1"]), ""),
+                     "t_ms": t_s * 1e3, "rotation_deg": rotation, "analyzer_deg": theta,
+                     "rate_deg_per_ms": rate, "er": er, "er_sigma_lo": lo,
+                     "er_sigma_hi": hi, "lower_bound": int(bool(lower)),
+                     "imin_mV": imin, "imin_sigma_mV": simin, "imax_V": imax, "n": n,
+                     "note": note})
+    for p in sorted(res.get("direct", []), key=lambda p: (p["kind"] != "crossing", p["t_ms"])):
+        sig = (np.nan, np.nan) if p["lower"] else er_sigma(
+            p["er"], p["imin_mV"], p["sig_mV"], p["imax_V"] * 1e3,
+            p.get("sig_imax_V", 0.0) * 1e3)
+        note = ""
+        if p.get("offset_limited"):
+            note = (f"offset-limited: the angle sat {p['off_deg']:+.2f} deg from crossed, "
+                    f"which alone gives {p['imin_from_offset_mV']:.2f} mV - not the light's ER")
+        elif p["kind"] == "static":
+            note = f"angle {p['off_deg']:+.2f} deg from crossed"
+        add(p["kind"], p["t_ms"] * 1e-3, p["rotation"], float(wrap_deg(p["theta"])),
+            p["rate"], p["er"], sig, p["lower"], p["imin_mV"], p["sig_mV"], p["imax_V"],
+            note=note, moving=p["kind"] == "crossing", seg=p.get("seg"))
+    for p in res.get("dips", []):
+        sig = (np.nan, np.nan) if p["er_lower"] else er_sigma(p["er"], p["imin"], p["sig_imin"])
+        add("dip", p["t"], p["rotation"], float(wrap_deg(p["theta"])), p["rate"] * 1e3,
+            p["er"], sig, p["er_lower"], p["imin"] * 1e3, p["sig_imin"] * 1e3, p["imax"],
+            n=p["n"])
+    for r in res.get("refine", []):
+        if "er" not in r:
+            continue
+        m = (pol["t"] >= r["t0"]) & (pol["t"] <= r["t1"])
+        tm = 0.5 * (r["t0"] + r["t1"])
+        sig = (np.nan, np.nan) if r["er_lower"] else er_sigma(r["er"], r["imin"], r["sig_imin"])
+        add("refine", tm, float(np.mean(pol["rotation"][m])), float(wrap_deg(r["theta_null"])),
+            0.0, r["er"], sig, r["er_lower"], r["imin"] * 1e3, r["sig_imin"] * 1e3,
+            float(np.median(pol["imax"][m])), note=r.get("label", ""), moving=False)
+    # the per-sample fit, binned
+    t, rot, er = pol["t"], pol["rotation"], pol["er"]
+    drift = pol.get("drift_resid")
+    lim = 1 / drift if drift else None
+    for sg in segs:
+        m = (t >= sg["t0"]) & (t <= sg["t1"])
+        moving = sg["base"] in ("up", "down")
+        if not moving and sg["t0"] > t_end:
+            continue                    # after the intensity lock switches off
+        if moving:
+            lo_, hi_ = np.min(rot[m]), np.max(rot[m])
+            edges = np.arange(np.floor(lo_ / fit_bin_deg) * fit_bin_deg,
+                              hi_ + fit_bin_deg, fit_bin_deg)
+            groups = [(m & (rot >= a) & (rot < b)) for a, b in zip(edges[:-1], edges[1:])]
+        else:
+            groups = [m]
+        for g in groups:
+            if g.sum() < 5:
+                continue
+            e = er[g]
+            med, p16, p84 = np.percentile(e, [50, 16, 84])
+            tm = float(np.median(t[g]))
+            notes = []
+            if lim and med > lim:
+                notes.append(f"above ER_fit's drift limit {lim:.0f}")
+            nl = int(np.sum(pol["er_lower"][g]))
+            if nl:
+                notes.append(f"{nl} of {int(g.sum())} samples lower bounds")
+            add("er_fit", tm, float(np.median(rot[g])), "", float(np.median(
+                np.abs(np.gradient(rot, t))[g]) * 1e-3) if moving else 0.0,
+                float(med), (float(med - p16), float(p84 - med)), False,
+                float(np.median(pol["imin"][g]) * 1e3), float(np.median(pol["sig_imin"][g]) * 1e3),
+                float(np.median(pol["imax"][g])), n=int(g.sum()), note="; ".join(notes),
+                moving=moving, seg=sg["kind"])
+    order = {"crossing": 0, "static": 1, "dip": 2, "refine": 3, "er_fit": 4}
+    rows.sort(key=lambda r_: (order[r_["method"]], r_["t_ms"]))
+    cr = [r_ for r_ in rows if r_["method"] == "crossing"]
+    facts = {"segments": [(x["kind"], x["t0"] * 1e3, x["t1"] * 1e3) for x in segs],
+             "drift_limit": lim, "t_end_ms": t_end * 1e3}
+    if cr:
+        im = np.array([r_["imin_mV"] for r_ in cr])
+        facts.update(n_crossing=len(cr), n_crossing_lower=sum(r_["lower_bound"] for r_ in cr),
+                     imin_median_mV=float(np.median(im)), imin_sd_mV=float(np.std(im)),
+                     imin_range_mV=(float(im.min()), float(im.max())),
+                     imax_median_V=float(np.median([r_["imax_V"] for r_ in cr])))
+    ups = [x["t0"] for x in segs if x["base"] == "up"]
+    if len(ups) >= 2:
+        facts["leg_spacing_ms"] = (ups[1] - ups[0]) * 1e3
+    return rows, facts
+
+
+def wrap_deg(a):
+    """An analyzer angle in [0, 180)."""
+    return float(np.mod(a, 180.0))
+
+
+def er_csv(res, extra=()):
+    """The ER table as CSV text with a '#' header saying what the scan was,
+    what was subtracted and corrected, and what limits the numbers.
+    Read it with pandas.read_csv(path, comment='#')."""
+    import csv
+    import io
+    rows, facts = er_table(res)
+    d = res["d"]
+    man = d.manifest
+    plan = man.get("plan", {})
+    corr = (res.get("corr") or {}).get("text", "")
+    H = [f"extinction ratio along the ramp - scan {d.name}",
+         f"measured {man.get('created', '')} - preset '{plan.get('preset', '')}', "
+         f"{(res.get('pol') or {}).get('n_angles', '?')} analyzer angles, "
+         f"{plan.get('shots', '?')} shots each, PD at {_pd_vdiv(d, 'scan')} V/div"]
+    seq = plan.get("sequence")
+    if seq:
+        H.append("sequence (recorded): " + ", ".join(f"{k} {v:g}" for k, v in seq.items()))
+    if facts.get("leg_spacing_ms"):
+        H.append(f"legs {facts['leg_spacing_ms']:.3f} ms apart (measured from the light)")
+    if man.get("notes"):
+        H.append("notes: " + man["notes"].replace("\n", " "))
+    H.append("corrections applied: " + (corr or "none"))
+    H.append("segments (ms): " + "; ".join(f"{k} {a:.2f}..{b:.2f}" for k, a, b in facts["segments"]))
+    if facts.get("n_crossing"):
+        im0, im1 = facts["imin_range_mV"]
+        H.append(f"crossings: {facts['n_crossing']} ({facts['n_crossing_lower']} lower bounds); "
+                 f"Imin there {im0:+.2f}..{im1:+.2f} mV across analyzer angles (median "
+                 f"{facts['imin_median_mV']:+.2f}, SD {facts['imin_sd_mV']:.2f}) against Imax "
+                 f"{facts['imax_median_V']:.2f} V: an Imin of 2 SD would be ER "
+                 f"{facts['imax_median_V'] / max(2e-3 * facts['imin_sd_mV'], 1e-12):.0f}")
+    if facts.get("drift_limit"):
+        H.append(f"ER_fit is drift-limited above ~{facts['drift_limit']:.0f} (reference returns)")
+    H += list(extra)
+    H += ["",
+          "method: crossing = Imin read off the trace of the analyzer angle the light sweeps "
+          "through crossed (4 us boxcar), Imax = the trace 90 deg away at the same instant; "
+          "static = the angle nearest crossed averaged over a still stretch, Imax its 90-deg "
+          "partner; dip = Imin fitted to the dip within +-8 deg of crossed, Imax from the "
+          "per-sample fit; refine = null refine at a sensitive V/div; er_fit = the per-sample "
+          "Malus fit's ER, median per rotation bin (moving) or per stretch (static), "
+          "er_sigma_lo/hi = 16th/84th percentile spread",
+          "leg: 1 = first transport, 2 = second; direction: away = |rotation| growing, back = "
+          "returning to rest, static",
+          "rotation_deg: polarization rotation from rest (this scan's sign); analyzer_deg: "
+          "the analyzer angle at crossed, in its own frame [0, 180)",
+          "er_sigma_lo / er_sigma_hi: 1-sigma down / up (asymmetric: ER goes as 1/Imin); "
+          "lower_bound = 1: Imin < 2 sigma, er = Imax / (2 sigma) and the true ER is above it",
+          "rate_deg_per_ms: how fast the rotation swept through crossed"]
+    buf = io.StringIO()
+    for h in H:
+        buf.write(f"# {h}\n" if h else "#\n")
+    w = csv.DictWriter(buf, fieldnames=ER_COLUMNS, lineterminator="\n")
+    w.writeheader()
+    for r_ in rows:
+        w.writerow({k: (f"{v:.6g}" if isinstance(v, float) and np.isfinite(v)
+                        else "" if isinstance(v, float) else v) for k, v in r_.items()})
+    return buf.getvalue()
+
+
 def leg_of(segs, t):
     """The transport (leg) a time belongs to, from segments(): 'up 2' ->
     2; a record with one transport, or a time before it, is leg 1."""

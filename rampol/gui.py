@@ -77,10 +77,16 @@ At every time sample, all analyzer angles fitted to a0 + B cos 2(theta - psi): I
 COLOURS, FILL, ARROWS, BARS
   Colour = which transport: leg 1 (the first motion) blue, leg 2 (the second) orange. The time axis is shaded per leg.
   Filled = the rotation is moving away from rest (ramp out); hollow = moving back toward rest (ramp back).
-  An arrow pointing up = a lower bound: Imin is under 2 sigma of its own noise, so the ER is at least Imax / (2 sigma).
+  A marker with an arrow growing out of its top = a lower bound: Imin is under 2 sigma of its own noise, so the ER is at least Imax / (2 sigma) - the marker sits at that bound and the true value is somewhere above. A method with smaller noise gives a higher bound for the same light: where the dip fit's triangles sit far above the measured circles with arrows on both, neither has resolved Imin - they agree that it is near zero. 'lower bounds' hides them.
   Error bars = +-1 sigma from the statistical errors of Imin (and of Imax for the measured points); asymmetric, because ER goes as 1 / Imin. They do not include systematic errors (the dark / background subtraction, the analyzer's per-angle transmission, the scope's gain).
 
 x axis "rotation" puts both legs and both directions on one axis, so a property of the optics (the same at the same rotation) lines up, and one of the dynamics does not.
+
+COMPARE SCANS
+  With 'compare scans' ticked, the scans picked in the Compare tab (Compare selected) are drawn too, one colour each (green, red, purple, ...), same markers; the shown scan keeps the leg colours.
+
+EXPORT CSV / COPY CSV
+  Every value on this plot as a table: method, leg, direction, time, rotation, analyzer angle, ER with its +-1 sigma, lower-bound flag, Imin, Imax, plus the per-sample fit's ER binned by rotation. A '#' header says what the scan was, what was subtracted, and what limits the numbers (read it with pandas.read_csv(path, comment='#')).
 """
 ANALYZER_OFFSETS = ("measure after", "reuse latest", "none")
 FIND_LIGHT = ("record window", "static light (line trigger)")
@@ -525,6 +531,7 @@ class App:
         self.logbox.pack(fill="both", expand=True)
 
         self.fig_traces = self._fig_tab("Traces", self.draw_traces)
+        self._ylog_box(self.fig_traces, False, "log y (linear within +-1 mV)")
         self.fig_map = self._fig_tab("Map", self.draw_map, click=True)
         ttk.Label(self.fig_map._ctl, text="show:").pack(side="left")
         self.map_show = tk.StringVar(value=MAP_MODES[0])
@@ -536,9 +543,16 @@ class App:
                   text="residual: what a0 + B cos 2(theta - psi) leaves, per angle").pack(
             side="left", padx=6)
         self.fig_malus = self._fig_tab("Malus", self.draw_malus)
+        self._ylog_box(self.fig_malus, False, "log y (linear within +-1 mV)")
+        self._cmp_box(self.fig_malus, "compare scans (same time)")
         self.fig_angle = self._fig_tab("Angle", self.draw_angle, click=True)
+        self._cmp_box(self.fig_angle)
         self.fig_ext = self._fig_tab("Extinction", self.draw_extinction, click=True)
-        ctl = self.fig_ext._ctl
+        top = self.fig_ext._ctl
+        ctl = ttk.Frame(top)
+        ctl.pack(fill="x")
+        ctl2 = ttk.Frame(top)
+        ctl2.pack(fill="x", pady=(2, 0))
         ttk.Label(ctl, text="x axis:").pack(side="left")
         self.ext_x = tk.StringVar(value="time")
         cb = ttk.Combobox(ctl, textvariable=self.ext_x, values=("time", "rotation"),
@@ -547,22 +561,32 @@ class App:
         cb.bind("<<ComboboxSelected>>", lambda _e: self.redraw(self.fig_ext))
         ttk.Button(ctl, text="What are these?", command=self.show_er_help).pack(
             side="left", padx=(8, 0))
+        ttk.Button(ctl, text="Export CSV...", command=self.do_export_er).pack(
+            side="left", padx=(8, 0))
+        ttk.Button(ctl, text="Copy CSV", command=self.do_copy_er).pack(side="left", padx=(4, 0))
+        self._ylog_box(self.fig_ext, True, parent=ctl)
+        self._cmp_box(self.fig_ext, parent=ctl)
+        ttk.Label(ctl2, text="show:").pack(side="left")
         self.ext_show = {}
         for key, text in (("direct", "measured"), ("dips", "dip fit"),
-                          ("refine", "null refine"), ("fit", "ER_fit line")):
+                          ("refine", "null refine"), ("fit", "ER_fit line"),
+                          ("lower", "lower bounds")):
             v = tk.BooleanVar(value=True)
-            ttk.Checkbutton(ctl, text=text, variable=v,
+            ttk.Checkbutton(ctl2, text=text, variable=v,
                             command=lambda: self.redraw(self.fig_ext)).pack(side="left",
                                                                             padx=(6, 0))
             self.ext_show[key] = v
         self.fig_poin = self._fig_tab("Poincaré", self.draw_poincare, click=True)
+        self._cmp_box(self.fig_poin, "compare scans (chi)")
         ttk.Label(self.fig_poin._ctl, foreground="#666", text=(
             "A linear analyzer measures S1 and S2 only: |S3| is drawn as sqrt(1 - p^2), "
             "which assumes full polarization; the handedness is not measured. Click "
             "the time plot to move the cursor.")).pack(side="left")
         self.fig_diag = self._fig_tab("Diagnostics", self.draw_diagnostics)
+        self._cmp_box(self.fig_diag)
         self.build_table_tab()
         self.build_shots_tab()
+        self._ylog_box(self.fig_shots, False, "log y (linear within +-1 mV)", parent=None)
         self.build_build_tab()
         self.fig_corr = self._fig_tab("Corrections", self.draw_corrections)
         ttk.Button(self.fig_corr._ctl, text="Borrow dark / background from another scan...",
@@ -570,6 +594,7 @@ class App:
         self.build_compare_tab()
         # these draw without a ramp scan loaded
         self.fig_bias = self._fig_tab("Fixed rotations", self.draw_bias)
+        self._ylog_box(self.fig_bias, True, "log y (ER, Imin)")
         self.fig_ilc = self._fig_tab("ILC target", self.draw_ilc)
         self.fig_find = self._fig_tab("Find angle", self.draw_find)
         self.fig_awg = self._fig_tab("AWG", self.draw_awg)
@@ -603,6 +628,116 @@ class App:
             canvas.mpl_connect("button_press_event",
                                lambda ev, fig=fig: self.on_click(ev, fig))
         return fig
+
+    # one colour per compared scan; the shown scan keeps its own (the leg colours)
+    CMP_COLS = ("#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#17becf")
+
+    def _ylog_box(self, fig, default=False, text="log y", parent="ctl"):
+        """A 'log y' box for a tab. parent 'ctl': the tab's control row (packed
+        right); None: the tab's side panel (stacked); or a frame."""
+        v = tk.BooleanVar(value=default)
+        fig._ylog = v
+        par = fig._ctl if parent in ("ctl", None) else parent
+        cb = ttk.Checkbutton(par, text=text, variable=v, command=lambda: self.redraw(fig))
+        if parent is None:
+            cb.pack(anchor="w", pady=(4, 0))
+        else:
+            cb.pack(side="right" if parent == "ctl" else "left", padx=(8, 0))
+        return v
+
+    def _cmp_box(self, fig, text="compare scans", parent="ctl"):
+        """A 'compare scans' box: the scans analysed in the Compare tab drawn
+        on this tab too."""
+        v = tk.BooleanVar(value=False)
+        fig._cmp_on = v
+
+        def toggled():
+            if v.get() and not self._compared():
+                self.log("Compare scans: pick scans in the Compare tab's list and press "
+                         "'Compare selected' - they are drawn on this tab.")
+            self.redraw(fig)
+        par = fig._ctl if parent == "ctl" else parent
+        ttk.Checkbutton(par, text=text, variable=v, command=toggled).pack(
+            side="right" if parent == "ctl" else "left", padx=(8, 0))
+        return v
+
+    def _compared(self, fig=None):
+        """[(result, colour)]: the scans analysed in the Compare tab, without
+        the shown one. With `fig`, only when that tab's 'compare scans' box is
+        ticked."""
+        if fig is not None and not (getattr(fig, "_cmp_on", None) and fig._cmp_on.get()):
+            return []
+        here = (os.path.normcase(os.path.abspath(self.result["d"].folder))
+                if self.result else None)
+        out = []
+        for k in self.cmp_sel:
+            r = self.cmp_results.get(k)
+            if r is None or r.get("pol") is None:
+                continue
+            if here and os.path.normcase(os.path.abspath(r["d"].folder)) == here:
+                continue
+            out.append((r, self.CMP_COLS[len(out) % len(self.CMP_COLS)]))
+        return out
+
+    @staticmethod
+    def _logy(fig, ax, kind="ratio", linthresh=1.0):
+        """The tab's 'log y' box applied to ax: a ratio (always > 0) goes
+        log; a level that can go below zero once the dark is subtracted goes
+        symlog, linear within +-linthresh. Returns whether it is log."""
+        v = getattr(fig, "_ylog", None)
+        if v is None or not v.get():
+            return False
+        if kind == "ratio":
+            ax.set_yscale("log")
+        else:
+            ax.set_yscale("symlog", linthresh=linthresh)
+        return True
+
+    def _cmp_dirty(self):
+        """The compared scans changed: every tab that can draw them redraws."""
+        for f in (self.fig_ext, self.fig_malus, self.fig_angle, self.fig_poin, self.fig_diag):
+            self.plot_dirty.add(f._frame)
+
+    # -- the extinction ratio as a table ---------------------------------------------
+    def _er_csv(self):
+        res = self.result
+        if not res or res.get("pol") is None:
+            self.log("Export: load a scan with a fit first (Plot data: Scan).")
+            return None
+        o = self._opts()
+        extra = [f"exported {time.strftime('%Y-%m-%d %H:%M')} by rampol {__version__}; "
+                 f"Apply switches: subtract dark/background {'on' if o['sub_dark'] else 'OFF'}, "
+                 f"per-angle transmission {'on' if o['gains'] else 'OFF'}, drift correction "
+                 f"{'on' if self.drift_on.get() else 'OFF'}, lock filter "
+                 f"{'on' if o['lock'] else 'OFF'}"]
+        return an.er_csv(res, extra=extra)
+
+    def do_export_er(self):
+        txt = self._er_csv()
+        if txt is None:
+            return
+        d = self.result["d"]
+        start = os.path.join(d.folder, "analysis")
+        os.makedirs(start, exist_ok=True)
+        p = filedialog.asksaveasfilename(parent=self.root, defaultextension=".csv",
+                                         initialdir=start, initialfile=f"{d.name}_extinction.csv",
+                                         filetypes=[("CSV", "*.csv")])
+        if not p:
+            return
+        with open(p, "w", encoding="utf-8", newline="") as fh:
+            fh.write(txt)
+        n = sum(1 for ln in txt.splitlines() if ln and not ln.startswith("#")) - 1
+        self.log(f"Extinction ratio: {n} rows -> {p}")
+
+    def do_copy_er(self):
+        txt = self._er_csv()
+        if txt is None:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        n = sum(1 for ln in txt.splitlines() if ln and not ln.startswith("#")) - 1
+        self.log(f"Extinction ratio of {self.result['d'].name}: {n} rows on the clipboard "
+                 f"(CSV with a '#' header) - paste it anywhere")
 
     def build_table_tab(self):
         frame = ttk.Frame(self.nb)
@@ -1690,7 +1825,7 @@ class App:
             ax.plot([x[i] for i in cv],
                     [(ps[i]["imin"] + ps[i]["fit"]["k"]) / ps[i]["imin"] for i in cv],
                     "x", color=cols[d_], alpha=0.6, label="from the null's curvature")
-        ax.set_yscale("log")
+        self._logy(fig, ax)
         ax.set_xlabel("rotation, monitors (deg)")
         ax.set_ylabel("extinction ratio")
         ax.set_title(f"Static extinction ratio ({r['name']})")
@@ -1728,7 +1863,7 @@ class App:
             if p.get("scan"):
                 ax.annotate(f"{p['scan']['vdiv']*1e3:g}", (xi, p["imin"] * 1e3), fontsize=6,
                             xytext=(3, 3), textcoords="offset points", color="#666")
-        ax.set_yscale("log")
+        self._logy(fig, ax)
         ax.set_xlabel("rotation, monitors (deg)")
         ax.set_ylabel("Imin (mV); labels: mV/div")
         ax.grid(alpha=0.3, which="both")
@@ -2172,6 +2307,7 @@ class App:
         if self.cursor_t is not None and t0 <= self.cursor_t <= t1:
             ax.axvline(self.cursor_t * 1e3, color="0.4", lw=0.6, ls=":")
         ax.set_xlim(t0 * 1e3, t1 * 1e3)
+        self._logy(fig, ax, "level", 1.0)
         ax.set_xlabel("time from trigger (ms)")
         ax.set_ylabel(f"{role} (mV)" + (" - dark/background" if o["dark"] and role == "PD" else ""))
         ax.set_title(f"{d.name}: single shots from the files; averages as the fit "
@@ -4168,7 +4304,9 @@ class App:
         ttk.Label(side, foreground="#666", justify="left", wraplength=230, text=(
             "Each scan with the window's Apply switches. Rotation is from each "
             "scan's own rest azimuth; the difference is smoothed by the Smooth "
-            "box.")).pack(anchor="w", pady=(4, 0))
+            "box. The scans compared here are also drawn on the Extinction, "
+            "Malus, Angle, Poincaré and Diagnostics tabs when their 'compare "
+            "scans' box is ticked.")).pack(anchor="w", pady=(4, 0))
         fig = Figure(figsize=(7.0, 5.0), dpi=100, constrained_layout=True)
         canvas = FigureCanvasTkAgg(fig, master=right)
         toolbar = NavigationToolbar2Tk(canvas, right)
@@ -4178,6 +4316,7 @@ class App:
         self.plot_tabs[frame] = (fig, self.draw_compare)
         self.plot_dirty.add(frame)
         self.fig_cmp = fig
+        self._ylog_box(fig, True, "log y (ER)", parent=None)
 
     def _fill_compare_list(self, names):
         keep = {self.cmp_lb.get(i) for i in self.cmp_lb.curselection()}
@@ -4221,6 +4360,7 @@ class App:
             self.cmp_sel = [(p, key) for p in paths]
             # hold only what is shown: each analysis keeps every step's traces
             self.cmp_results = {k: v for k, v in self.cmp_results.items() if k in self.cmp_sel}
+            self._cmp_dirty()
             self.nb.select(self.fig_cmp._frame)
             self.redraw(self.fig_cmp)
         self.worker(go, done=done)
@@ -4228,6 +4368,7 @@ class App:
     def do_compare_clear(self):
         self.cmp_sel, self.cmp_results = [], {}
         self.cmp_lb.selection_clear(0, "end")
+        self._cmp_dirty()
         self.redraw(self.fig_cmp)
 
     def draw_compare(self, fig):
@@ -4299,7 +4440,7 @@ class App:
             ax2.legend(fontsize=7, loc="best")
             ax2.grid(alpha=0.3)
             ax1.tick_params(labelbottom=False)
-        ax3.set_yscale("log")
+        self._logy(fig, ax3)
         ax3.set_xlabel("rotation from rest (deg)" if by_rot else "time (ms)")
         if not by_rot:
             ax3.set_xlabel("time (ms)")
@@ -4365,6 +4506,13 @@ class App:
                 label=f"chi ({us:g} us mean)" if us else "chi (per sample)")
         ax.plot(tt, np.where(~ok_d, chi_d, np.nan), lw=0.5, alpha=0.35, color="#1f77b4",
                 label="upper bound (Imin < 2 sigma)")
+        for r_, c_ in self._compared(fig):
+            t_r = r_["d"].t
+            er_r, ok_r, _ = self.smoothed_er(r_["pol"], t_r)
+            chi_r = np.rad2deg(np.arctan(1.0 / np.sqrt(np.maximum(er_r, 1.0))))
+            k_r = max(1, len(t_r) // 6000)
+            ax.plot(t_r[::k_r] * 1e3, np.where(ok_r, chi_r, np.nan)[::k_r], lw=0.6, color=c_,
+                    label=r_["d"].name)
         ax.set_xlabel("time (ms)")
         ax.set_ylabel("ellipticity angle chi (deg)")
         ax.set_title("If fully polarized: tan chi = sqrt(Imin / Imax)", fontsize=8)
@@ -4609,6 +4757,7 @@ class App:
             if s["kind"] in an.OFFSET_KINDS and "PD" in s["v"]:
                 ax.plot(t, s["v"]["PD"], lw=0.6, color="k", ls="--", label=s["kind"])
         sm = matplotlib.cm.ScalarMappable(cmap=cmap, norm=matplotlib.colors.Normalize(0, 360))
+        self._logy(fig, ax, "level", 1e-3)
         ax.set_ylabel("PD - dark, drift corrected (V)")
         ax.set_title(f"Analyzer photodiode at {pol['n_angles']} analyzer angles ({d.name})")
         ax.grid(alpha=0.3)
@@ -4722,6 +4871,11 @@ class App:
         if "c1" in pol:
             full, = ax.plot(g, zero_g, color="#ff7f0e", lw=0.7, ls="--",
                             label="with 1- and 4-theta terms")
+        ov = []
+        for r_, c_ in self._compared(fig):
+            ln, = ax.plot([], [], "s", ms=3.5, color=c_, mfc="none", label=r_["d"].name)
+            ov.append((r_, ln))
+        self._logy(fig, ax, "level", 1.0)
         ax.set_ylabel("PD - dark (mV)")
         title = ax.set_title("")
         txt = ax.text(0.01, 0.97, "", transform=ax.transAxes, va="top", fontsize=7,
@@ -4750,6 +4904,14 @@ class App:
                 full.set_ydata((model + extra) * 1e3)
             fit_at = a0 + c2 * np.cos(2 * thr) + s2 * np.sin(2 * thr)
             rpts.set_ydata((y - fit_at) * 1e3)
+            for r_, ln in ov:
+                p_ = r_["pol"]
+                tr = r_["d"].t
+                if tr[0] <= t[j] <= tr[-1]:
+                    j2 = int(np.argmin(np.abs(tr - t[j])))
+                    ln.set_data(wrap_angle(p_["theta"]), p_["I"][:, j2] * 1e3)
+                else:
+                    ln.set_data([], [])
             title.set_text(f"Transmission vs analyzer angle at t = {t[j] * 1e3:.3f} ms ({d.name})")
             txt.set_text(f"psi = {pol['psi'][j]:+.3f} +- {pol['sig_psi'][j] * 1e3:.1f} mdeg\n"
                          f"Imax = {pol['imax'][j] * 1e3:.1f} mV, Imin = {pol['imin'][j] * 1e3:.2f} "
@@ -4771,9 +4933,14 @@ class App:
         ax.fill_between(*self._band(t, rot - sig, rot + sig), color="#1f77b4", alpha=0.3,
                         lw=0)
         ax.plot(t, rot, color="#1f77b4", lw=0.9, label=f"measured ({d.name})")
+        ov = self._compared(fig)
         if res["mon"] is not None:
-            ax.plot(t, res["mon"][0], color="#2ca02c", lw=0.8, ls="--",
+            # the monitors' green would read as a compared scan
+            ax.plot(t, res["mon"][0], color="#2ca02c" if not ov else "0.4", lw=0.8, ls="--",
                     label="from Trek monitors (offset matched)")
+        for r_, c_ in ov:
+            tt_, rr_ = self._decimate(r_["d"].t, r_["pol"]["rotation"], 4000)
+            ax.plot(tt_ * 1e3, rr_, color=c_, lw=0.8, label=r_["d"].name)
         ax.set_ylabel("rotation from rest (deg)")
         ax.set_title(f"Polarization rotation vs time (rest azimuth {pol['psi_rest']:+.3f} deg "
                      f"in the analyzer frame)")
@@ -4794,13 +4961,16 @@ class App:
     def draw_extinction(self, fig):
         """Extinction ratio along the ramp, each measurement method a marker,
         each transport (leg) a colour, +-1 sigma error bars, lower bounds as
-        arrows. 'What are these?' explains every family (ER_HELP)."""
+        a marker with an arrow growing out of it. 'What are these?' explains
+        every family (ER_HELP). Compared scans: one colour each."""
         res = self.result
         pol, d = res["pol"], res["d"]
         by_rot = self.ext_x.get() == "rotation"
         x = pol["rotation"] if by_rot else d.t * 1e3
         ax = fig.add_subplot(111)
         show = {k: v.get() for k, v in self.ext_show.items()}
+        log = self._logy(fig, ax)
+        ov = self._compared(fig)
         segs = an.segments(pol["t"], pol["rotation"])
         legs = sorted({an.leg_of(segs, s["t0"]) for s in segs if s["base"] in ("up", "down")})
         leg_col = {1: "#1f77b4", 2: "#ff7f0e", 3: "#2ca02c", 4: "#9467bd"}
@@ -4810,77 +4980,105 @@ class App:
                 if s["base"] in ("up", "down"):
                     ax.axvspan(s["t0"] * 1e3, s["t1"] * 1e3, lw=0, alpha=0.06,
                                color=leg_col.get(an.leg_of(segs, s["t0"]), "0.5"))
+        fit_top = 0.0
         if show["fit"]:
-            er, ok, us = self.smoothed_er(pol, d.t)
-            ax.plot(x, np.where(ok, er, np.nan), color="0.55", lw=0.6, zorder=1)
-            ax.plot(x, np.where(~ok, er, np.nan), color="0.55", lw=0.5, alpha=0.35, zorder=1)
+            for r_, c_ in [(res, None)] + ov:
+                p_ = r_["pol"]
+                er, ok, us = self.smoothed_er(p_, r_["d"].t)
+                xx_ = p_["rotation"] if by_rot else r_["d"].t * 1e3
+                k = max(1, len(xx_) // 6000) if c_ else 1
+                ax.plot(xx_[::k], np.where(ok, er, np.nan)[::k], color=c_ or "0.55",
+                        lw=0.6, alpha=0.5 if c_ else 1, zorder=1)
+                if c_ is None:
+                    ax.plot(x, np.where(~ok, er, np.nan), color="0.55", lw=0.5, alpha=0.35,
+                            zorder=1)
+                if ok.any():
+                    fit_top = max(fit_top, float(np.percentile(er[ok], 99.5)))
             dr = pol.get("drift_resid")
             if dr:
                 ax.axhline(1 / dr, color="0.55", lw=0.8, ls=":", zorder=1)
 
-        def pts(family):
-            """[(x, er, (lo, hi), lower, leg, up)] for a method."""
+        def pts(family, r):
+            """[(x, er, (lo, hi), lower, leg, away)] for a method of result r."""
+            p_, d_ = r["pol"], r["d"]
+            sg = segs if r is res else an.segments(p_["t"], p_["rotation"])
             out = []
             if family == "crossing" or family == "static":
-                for p in res.get("direct", []):
+                for p in r.get("direct", []):
                     if p["kind"] != family or p.get("offset_limited"):
                         continue
                     t_s = p["t_ms"] * 1e-3
                     e = an.er_sigma(p["er"], p["imin_mV"], p["sig_mV"], p["imax_V"] * 1e3,
                                     p.get("sig_imax_V", 0.0) * 1e3)
                     out.append((p["rotation"] if by_rot else p["t_ms"], p["er"], e,
-                                p["lower"], an.leg_of(segs, t_s), self._going_up(pol, t_s)))
+                                p["lower"], an.leg_of(sg, t_s), an.moving_away(p_, t_s)))
             elif family == "dip":
-                for p in res["dips"]:
+                for p in r["dips"]:
                     e = an.er_sigma(p["er"], p["imin"], p["sig_imin"])
                     out.append((p["rotation"] if by_rot else p["t"] * 1e3, p["er"], e,
-                                p["er_lower"], an.leg_of(segs, p["t"]),
-                                self._going_up(pol, p["t"])))
+                                p["er_lower"], an.leg_of(sg, p["t"]),
+                                an.moving_away(p_, p["t"])))
             elif family == "refine":
-                for r in res["refine"]:
-                    if "er" not in r:
+                for rf in r["refine"]:
+                    if "er" not in rf:
                         continue
-                    m = (d.t >= r["t0"]) & (d.t <= r["t1"])
-                    tm = 0.5 * (r["t0"] + r["t1"])
-                    e = an.er_sigma(r["er"], r["imin"], r["sig_imin"])
-                    out.append((float(np.mean(pol["rotation"][m])) if by_rot else tm * 1e3,
-                                r["er"], e, r["er_lower"], an.leg_of(segs, tm), True))
+                    m = (d_.t >= rf["t0"]) & (d_.t <= rf["t1"])
+                    tm = 0.5 * (rf["t0"] + rf["t1"])
+                    e = an.er_sigma(rf["er"], rf["imin"], rf["sig_imin"])
+                    out.append((float(np.mean(p_["rotation"][m])) if by_rot else tm * 1e3,
+                                rf["er"], e, rf["er_lower"], an.leg_of(sg, tm), True))
+            if not show["lower"]:
+                out = [o for o in out if not o[3]]
             return out
 
         fams = [("crossing", "o", "direct", "Measured at a crossing: Imin and Imax both read"),
                 ("dip", "^", "dips", "Dip fit: Imin fitted around the crossing, Imax from the fit"),
                 ("static", "s", "direct", "Measured, static: analyzer angle nearest crossed"),
                 ("refine", "D", "refine", "Null refine: angles stepped around crossed")]
+        # everything to draw first, so a lower bound's arrow can be sized to the axis
+        todo = []
         n_fam = {}
-        top_needed = 0.0
-        for fam, mk, key, _lbl in fams:
-            if not show[key]:
-                continue
-            P = pts(fam)
-            n_fam[fam] = len(P)
-            for xx, er_, (lo, hi), lower, leg, up in P:
-                col = leg_col.get(leg, "0.3")
-                mfc = col if up else "white"
-                if lower:
-                    ax.plot([xx], [er_], mk, ms=4.5, mfc="white", mec=col, zorder=3)
-                    top_needed = max(top_needed, er_ * 3.0)
-                    ax.annotate("", xy=(xx, er_ * 2.5), xytext=(xx, er_ * 1.12),
-                                arrowprops=dict(arrowstyle="-|>", color=col, lw=0.8,
-                                                mutation_scale=7), zorder=3)
-                else:
-                    hi_ = hi if np.isfinite(hi) else er_ * 2
-                    ax.errorbar([xx], [er_], yerr=[[lo], [hi_]], fmt=mk, ms=4.5, color=col,
-                                mfc=mfc, mec=col, elinewidth=0.8, capsize=1.5, zorder=3)
+        for r_, c_ in [(res, None)] + ov:
+            for fam, mk, key, _lbl in fams:
+                if not show[key]:
+                    continue
+                P = pts(fam, r_)
+                if r_ is res:
+                    n_fam[fam] = len(P)
+                todo += [(mk, c_, *q) for q in P]
+        vals = [q[3] for q in todo]
+        top = max(vals + [fit_top, 1.0])
+        # an arrow: a factor 2 up on a log axis, 6 % of the axis on a linear one
+        arrow = (lambda v: v) if log else (lambda v: 0.06 * top)
+        n_lower = 0
+        for mk, c_, xx, er_, (lo, hi), lower, leg, away in todo:
+            col = c_ or leg_col.get(leg, "0.3")
+            mfc = col if away else "white"
+            ms, lw, al = (4.5, 0.8, 1.0) if c_ is None else (3.5, 0.6, 0.75)
+            if lower:
+                n_lower += 1
+                # the bar grows out of the marker and ends in an arrowhead
+                ax.errorbar([xx], [er_], yerr=[[0], [arrow(er_)]], lolims=True, fmt=mk, ms=ms,
+                            color=col, mfc=mfc, mec=col, elinewidth=lw, capsize=2.5, alpha=al,
+                            zorder=3)
+            else:
+                hi_ = hi if np.isfinite(hi) else er_
+                ax.errorbar([xx], [er_], yerr=[[lo], [hi_]], fmt=mk, ms=ms, color=col,
+                            mfc=mfc, mec=col, elinewidth=lw, capsize=1.5, alpha=al, zorder=3)
         if show["direct"]:
             off = [p for p in res.get("direct", []) if p.get("offset_limited")]
             for p in off:
                 ax.plot([p["rotation"] if by_rot else p["t_ms"]], [p["er"]], "s", ms=4.5,
                         mfc="none", mec="0.6", zorder=2)
-        ax.set_yscale("log")
-        if top_needed > ax.get_ylim()[1]:
-            ax.set_ylim(top=top_needed)          # the lower-bound arrows stay on the plot
+        if log:
+            lows = [q[3] - q[4][0] for q in todo if not q[5]] + vals
+            floor = min([v for v in lows if v > 0] + [top])
+            ax.set_ylim(max(floor * 0.5, 1.0), max(top * 2.3, floor * 10))
+        else:
+            ax.set_ylim(0, top * 1.12)
         lim = self.cfg["analysis"]["polarizer_er"]
-        if lim <= 10 * ax.get_ylim()[1]:
+        on_scale = log and lim <= 10 * ax.get_ylim()[1]
+        if on_scale:
             ax.axhline(lim, color="k", lw=0.8, ls="--")
         # the key: methods (black), then legs (colour), then the lines
         from matplotlib.lines import Line2D
@@ -4897,19 +5095,23 @@ class App:
                         label="filled: rotation moving away from rest"))
         H.append(Line2D([], [], marker="o", mfc="white", mec="k", ls="none", ms=5,
                         label="hollow: moving back toward rest"))
-        H.append(Line2D([], [], marker="$\u2191$", color="k", ls="none", ms=8,
-                        label="arrow up: lower bound (Imin under 2 sigma)"))
+        if n_lower:
+            H.append(Line2D([], [], marker="$↑$", color="k", ls="none", ms=9,
+                            label=f"arrow out of a marker: lower bound, the ER is above it "
+                                  f"(Imin < 2 sigma; {n_lower})"))
         for leg in legs or [1]:
             H.append(Patch(color=leg_col.get(leg, "0.3"), label=f"leg {leg}"
                            + (" (first transport)" if leg == 1 and len(legs) > 1 else
                               " (second transport)" if leg == 2 else "")))
+        for r_, c_ in ov:
+            H.append(Patch(color=c_, label=f"compared: {r_['d'].name}"))
         if show["fit"]:
             H.append(Line2D([], [], color="0.55", lw=0.8,
                             label="per-sample Malus fit (ER_fit)"))
             if pol.get("drift_resid"):
                 H.append(Line2D([], [], color="0.55", lw=0.8, ls=":",
                                 label=f"ER_fit's drift limit ({1 / pol['drift_resid']:.0f})"))
-        if lim <= 10 * ax.get_ylim()[1]:
+        if on_scale:
             H.append(Line2D([], [], color="k", lw=0.8, ls="--",
                             label=f"analyzer's own ER ({lim:.1e})"))
         else:
@@ -4919,19 +5121,11 @@ class App:
                   title="+-1 sigma bars; 'What are these?' explains", title_fontsize=7)
         ax.set_xlabel("rotation from rest (deg)" if by_rot else "time (ms)")
         ax.set_ylabel("extinction ratio Imax / Imin")
-        ax.set_title(f"Extinction ratio along the ramp ({d.name})")
+        ax.set_title(f"Extinction ratio along the ramp ({d.name}"
+                     + (f", with {len(ov)} compared" if ov else "") + ")")
         ax.grid(alpha=0.3, which="both")
         if not by_rot:
             self._cursor(ax)
-
-    @staticmethod
-    def _going_up(pol, t_s):
-        """True while |rotation| grows (moving away from rest) at time t_s."""
-        rot = pol["rotation"]
-        j = int(np.clip(np.searchsorted(pol["t"], t_s), 1, len(rot) - 1))
-        k = max(1, int(len(rot) / 2000))
-        a, b = rot[max(j - k, 0)], rot[min(j + k, len(rot) - 1)]
-        return abs(b) >= abs(a)
 
     def show_er_help(self):
         win = getattr(self, "er_help_win", None)
@@ -4973,10 +5167,16 @@ class App:
                    f"('drift-correct from refs'). How well the returns predict each other "
                    + (f"({dr * 1e3:.2f}e-3) caps the trustworthy ER_fit at ~{1 / dr:.0f}."
                       if dr else "sets the cap on a trustworthy ER_fit."))
-        if len(pol["ref_clocks"]):
-            c0 = pol["ref_clocks"].min()
-            lv = pol["ref_levels"]
-            ax.plot((pol["ref_clocks"] - c0) / 60, (lv / lv.mean() - 1) * 1e3, "o-", ms=3)
+        ov = self._compared(fig)
+        for r_, c_ in [(res, "#1f77b4")] + ov:
+            p_ = r_["pol"]
+            if len(p_["ref_clocks"]):
+                c0 = p_["ref_clocks"].min()
+                lv = p_["ref_levels"]
+                ax.plot((p_["ref_clocks"] - c0) / 60, (lv / lv.mean() - 1) * 1e3, "o-", ms=3,
+                        color=c_, label=r_["d"].name)
+        if ov:
+            ax.legend(fontsize=6)
         ax.set_xlabel("time into scan (min)")
         ax.set_ylabel("ref level - mean (1e-3)")
         ax.set_title("Reference-angle returns")
@@ -4990,7 +5190,16 @@ class App:
                        "points at that capture.")
             g = pol["angle_gain"]
             order = np.argsort(wrap_angle(pol["theta"]))
-            ax.plot(wrap_angle(pol["theta"])[order], (g[order] - 1) * 100, "o-", ms=3)
+            ax.plot(wrap_angle(pol["theta"])[order], (g[order] - 1) * 100, "o-", ms=3,
+                    label=d.name)
+            for r_, c_ in ov:
+                g_ = r_["pol"].get("angle_gain")
+                if g_ is not None:
+                    o_ = np.argsort(wrap_angle(r_["pol"]["theta"]))
+                    ax.plot(wrap_angle(r_["pol"]["theta"])[o_], (g_[o_] - 1) * 100, "o-", ms=3,
+                            color=c_, label=r_["d"].name)
+            if ov:
+                ax.legend(fontsize=6)
             ax.axhline(0, color="k", lw=0.6)
             ax.set_xlabel("analyzer angle (deg)")
             ax.set_ylabel("transmission - mean (%)")
@@ -5028,6 +5237,9 @@ class App:
         ax.plot(t, pol["rms"] * 1e3, lw=0.6,
                 label="fit residual rms" if src == "residual"
                 else f"error scale from {src}")
+        for r_, c_ in ov:
+            tt_, rr_ = self._decimate(r_["d"].t, r_["pol"]["rms"] * 1e3, 4000)
+            ax.plot(tt_ * 1e3, rr_, lw=0.6, color=c_, alpha=0.8, label=r_["d"].name)
         if np.isfinite(sem_med):
             ax.axhline(sem_med * 1e3, color="k", ls="--", lw=0.8, label="median block SEM")
         ax.set_xlabel("time (ms)")
