@@ -883,6 +883,10 @@ class App:
                 ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
                 self.bv[key] = tk.StringVar()
                 ttk.Entry(rr, textvariable=self.bv[key], width=w).pack(side="left", padx=(0, 6))
+        self.bias_reach = CopyLabel(f, text="", foreground="#666", width=46)
+        self.bias_reach.pack(anchor="w", padx=6)
+        for k in ("biases", "split"):
+            self.bv[k].trace_add("write", lambda *_: self._bias_reach_text())
         rr = ttk.Frame(f)
         rr.pack(fill="x", padx=6, pady=1)
         ttk.Label(rr, text="Order").pack(side="left")
@@ -1021,6 +1025,10 @@ class App:
                            ("fall", "fall_ms"), ("after", "tail_ms")):
             entry(r2, key, 4, label)
         ttk.Label(r2, text="ms").pack(side="left")
+        self.a_reach = CopyLabel(self.a_ramp, text="", foreground="#666", width=46)
+        self.a_reach.pack(anchor="w", padx=6)
+        for k in ("rotation", "split", "idle1", "idle2"):
+            self.av[k].trace_add("write", lambda *_: self._awg_reach_text())
         self.a_record = CopyLabel(self.a_ramp, text="", foreground="#666", width=46)
         self.a_record.pack(anchor="w", padx=6, pady=(0, 2))
         for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms", "dt_us"):
@@ -1071,6 +1079,40 @@ class App:
             self.av[k].trace_add("write", lambda *_: self._seq_text())
         self.a_choice["seq_how"].trace_add("write", lambda *_: self._seq_text())
         self._awg_safety_text()
+
+    def _awg_idle_guess(self):
+        """The idle levels as the fields give them; blank = the ILC trim,
+        allowed for at the 100 mV idle cap (it is 20-80 mV)."""
+        out = {}
+        for k, key in (("EO1", "idle1"), ("EO2", "idle2")):
+            txt = self.av[key].get().strip()
+            out[k] = float(txt) if _isnum(txt) else awgmod.IDLE_CAP
+        return out
+
+    def _awg_reach_text(self):
+        """Under the ramp's fields: each crystal's share in deg and volts,
+        and - red - what to change when one is past what the AWG can give."""
+        try:
+            rot = float(self.av["rotation"].get())
+            split = float(self.av["split"].get())
+        except (ValueError, KeyError):
+            self.a_reach.configure(text="")
+            return
+        idle = self._awg_idle_guess()
+        m = awgmod.max_deg(idle)
+        x1, x2 = rot * split, rot * (1 - split)
+        v = {k: abs(awgmod.biasmod.awg_volts(d, 1.0 if k == "EO1" else 0.0)[k])
+             for k, d in (("EO1", x1), ("EO2", x2))}
+        txt = (f"X1 {x1:g} deg ({v['EO1']:.2f} V), X2 {x2:g} deg ({v['EO2']:.2f} V); "
+               f"each reaches at most X1 {m['EO1']:.1f}, X2 {m['EO2']:.1f} deg "
+               f"({awgmod.AWG_CAP:g} V cap)")
+        bad = abs(x1) > m["EO1"] + 1e-9 or abs(x2) > m["EO2"] + 1e-9 or not 0 <= split <= 1
+        if bad:
+            rng = awgmod.share_range(rot, idle)
+            txt = ("PAST THE AWG'S REACH - " + txt + ". " + (
+                f"{rot:g} deg works with an X1 share of {rng[0]:.2f} to {rng[1]:.2f}"
+                if rng else f"the pair reaches at most {m['EO1'] + m['EO2']:.1f} deg"))
+        self.a_reach.configure(text=txt, foreground="#c00000" if bad else "#666")
 
     def _awg_source_shown(self):
         """Only the fields of the waveform chosen: a ramp's, or the files'."""
@@ -1334,9 +1376,18 @@ class App:
         ends = awgmod.parse_ends(a.get("seq_x1", ""), a.get("seq_x2", ""),
                                  a.get("seq_how", "pairs"))
         idle = self._awg_idle(c)
+        found = []
+        out_ = [(e1, e2) for e1, e2 in ends
+                if not awgmod.within_reach({"EO1": e1, "EO2": e2}, idle)]
+        if out_ and a.get("seq_how") == "grid":
+            # a grid spans X1 x X2: the corners it cannot reach are left out
+            ends = [e for e in ends if e not in out_]
+            found.append(("WARN", f"{len(out_)} grid point(s) past the AWG's reach left out: "
+                                  + ", ".join(f"{e1:g}/{e2:g}" for e1, e2 in out_[:8])))
+            if not ends:
+                raise ValueError("no point of the grid is within the AWG's reach")
         waves = [awgmod.ramp_hold(0.0, a, idle=idle, ends={"EO1": e1, "EO2": e2})
                  for e1, e2 in ends]
-        found = []
         for w in waves:
             for lv, msg in self._wave_checks(c, w):
                 if lv != "INFO":
@@ -1353,10 +1404,23 @@ class App:
         except (ValueError, KeyError) as exc:
             self.awg_seq_lbl.configure(text=str(exc) if self.av["seq_x1"].get() else "")
             return
+        m = awgmod.max_deg(self._awg_idle_guess())
+        out_ = [(e1, e2) for e1, e2 in ends if abs(e1) > m["EO1"] + 1e-9
+                or abs(e2) > m["EO2"] + 1e-9]
+        grid = self.a_choice["seq_how"].get() == "grid"
+        if grid:
+            ends = [e for e in ends if e not in out_]
         shown = ", ".join(f"{e1:g}/{e2:g}" for e1, e2 in ends[:8])
-        self.awg_seq_lbl.configure(text=f"{len(ends)} ramps (X1/X2 deg): {shown}"
-                                    + (" ..." if len(ends) > 8 else "")
-                                    + " - one ramp scan each, at the Ramp scan tab's angles")
+        txt = (f"{len(ends)} ramps (X1/X2 deg): {shown}" + (" ..." if len(ends) > 8 else "")
+               + " - one ramp scan each, at the Ramp scan tab's angles")
+        if out_:
+            what = ", ".join(f"{e1:g}/{e2:g}" for e1, e2 in out_[:4]) + (
+                " ..." if len(out_) > 4 else "")
+            txt += (f". {len(out_)} past the AWG's reach (X1 <= {m['EO1']:.1f}, X2 <= "
+                    f"{m['EO2']:.1f} deg): {what}"
+                    + (" - left out of the grid" if grid else " - change them to start"))
+        self.awg_seq_lbl.configure(text=txt, foreground="#c00000" if out_ and not grid
+                                   else "#666")
 
     def do_seq_dry(self):
         """Every ramp of the sequence through the scope (the dry run)."""
@@ -2185,6 +2249,8 @@ class App:
         self.save_settings()
         self.log("EOM calibration applied: " + calib.summary(cal))
         self.awg_wave = None
+        self._awg_reach_text()
+        self._bias_reach_text()
         self.plot_dirty.add(self.fig_awg._frame)
         if self.result:
             self.reanalyse()
@@ -2283,6 +2349,27 @@ class App:
         def done(folder):
             self.load_bias(folder)
         self.worker(go, done=done)
+
+    def _bias_reach_text(self):
+        """Under the rotations: the most the split lets the pair reach, and
+        which rotations of the list are past it."""
+        from . import bias as biasmod
+        try:
+            split = float(self.bv["split"].get())
+            bs = biasmod.parse_biases(self.bv["biases"].get())
+        except (ValueError, KeyError):
+            self.bias_reach.configure(text="")
+            return
+        m = awgmod.max_deg(self._awg_idle_guess())
+        lim = min(m["EO1"] / split if split > 0 else float("inf"),
+                  m["EO2"] / (1 - split) if split < 1 else float("inf"))
+        over = [b for b in bs if abs(b) > lim + 1e-9]
+        txt = (f"with X1 share {split:g}: up to {lim:.1f} deg (X1 <= {m['EO1']:.1f}, X2 <= "
+               f"{m['EO2']:.1f} deg at the {awgmod.AWG_CAP:g} V cap)")
+        if over:
+            txt = (f"PAST THE AWG'S REACH: {', '.join(f'{b:g}' for b in over[:6])} deg - "
+                   + txt)
+        self.bias_reach.configure(text=txt, foreground="#c00000" if over else "#666")
 
     def _bias_plan(self, c):
         plan = dict(c["bias"])

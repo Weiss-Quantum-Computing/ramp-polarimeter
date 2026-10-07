@@ -392,6 +392,15 @@ or two ILC drive files - only the chosen one's fields show - and Preview);
 the hold; and the **Sequence**. What is set once - the dt grid, idle trims,
 EOM calibration, bench trigger, the scope's span, dry-run wiring, the
 sequence's settle time and the two safety rules - is in **Settings...**.
+**Reach.** The 4063B gives +-10 V per channel; this program caps it at
+9.6 V. With the 1 Sep 2026 calibration that is ~94 deg on X1 (9.82 deg/V)
+and ~99.6 deg on X2 (10.38 deg/V), a little less with the idle trim on top
+(`awg.max_deg`): no single crystal reaches 180 deg, and the pair reaches it
+only with an X1 share of ~0.45-0.52 (`awg.share_range`). The ramp's fields
+say what each crystal gets in deg and volts as they are typed - red, with
+the shares that would work, when one is out of reach; the Sequence flags
+end points out of reach (a grid leaves them out, a pairs list will not
+start); the Fixed rotations tab says how far its split reaches.
 The order, each step its own button:
 
 1. **Preview**: the waveform per channel and the rotation it gives (from the

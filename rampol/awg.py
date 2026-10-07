@@ -63,7 +63,8 @@ import numpy as np
 from . import bias as biasmod
 
 FULL_SCALE = 10.0          # V: AMP 20 Vpp, OFST 0, samples u / FULL_SCALE uploaded as-is
-AWG_CAP = 9.6              # V: this program's cap per channel (a margin under the rail)
+AWG_CAP = 9.6              # V: this program's cap per channel (the 4063B gives +-10 V;
+                           # a margin under that rail)
 MAX_PTS = 16384            # 4063B arb memory (datasheet; unprobed above 5501)
 PROVEN_PTS = 5501
 IDLE_CAP = 0.100           # V: EOM-ILC Limits.idle_awg
@@ -290,6 +291,38 @@ def predict(wave, chan=None):
     return mon, rot
 
 
+def max_deg(idle=None, chan=None, cap=AWG_CAP):
+    """{EO1, EO2}: the most rotation each crystal can be driven to (deg)
+    with its AWG channel at most `cap` volts - its idle level allowed for
+    (the rotation is on top of idle). With the 1 Sep 2026 calibration that
+    is ~94 deg on X1 (9.82 deg/V) and ~99.6 deg on X2 (10.38 deg/V): a
+    rotation of 180 deg needs both crystals, and no single one gets there."""
+    chan = chan or biasmod.CHAN
+    idle = idle or {}
+    out = {}
+    for k in CHANNELS:
+        per_deg = abs(biasmod.awg_volts(1.0, 1.0 if k == "EO1" else 0.0, chan)[k])
+        out[k] = max(cap - abs(float(idle.get(k, 0.0))), 0.0) / per_deg
+    return out
+
+
+def share_range(rotation, idle=None, chan=None):
+    """(lo, hi): the X1 shares that keep both crystals within reach for
+    `rotation` deg, or None when the pair cannot reach it at all."""
+    m = max_deg(idle, chan)
+    r = abs(float(rotation))
+    if r == 0:
+        return 0.0, 1.0
+    lo, hi = max(0.0, 1.0 - m["EO2"] / r), min(1.0, m["EO1"] / r)
+    return (lo, hi) if lo <= hi + 1e-12 else None
+
+
+def within_reach(ends, idle=None, chan=None):
+    """True when each crystal's end point (deg) is within its reach."""
+    m = max_deg(idle, chan)
+    return abs(float(ends["EO1"])) <= m["EO1"] + 1e-9 and abs(float(ends["EO2"])) <= m["EO2"] + 1e-9
+
+
 def check(wave, eomilc=None, trig_hz=None, chan=None):
     """[(level, text)], level FAIL | WARN | INFO. A FAIL stops an upload."""
     chan = chan or biasmod.CHAN
@@ -301,7 +334,10 @@ def check(wave, eomilc=None, trig_hz=None, chan=None):
     for k, u in wave.u.items():
         pk = float(np.max(np.abs(u)))
         if pk > AWG_CAP:
-            out.append(("FAIL", f"{k}: {pk:.3f} V at the AWG, past the {AWG_CAP:g} V cap"))
+            reach = max_deg(wave.idle(), chan)[k]
+            out.append(("FAIL", f"{k}: {pk:.3f} V at the AWG, past the {AWG_CAP:g} V cap (the "
+                                f"4063B gives +-10 V) - {k} reaches at most {reach:.1f} deg; "
+                                f"put more of the rotation on the other crystal"))
         for end, v in (("first", u[0]), ("last", u[-1])):
             if abs(v) > IDLE_CAP:
                 out.append(("FAIL", f"{k}: {end} sample {v*1e3:+.0f} mV - past the "

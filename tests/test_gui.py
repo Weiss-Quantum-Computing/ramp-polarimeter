@@ -797,6 +797,39 @@ def main():
     app.a_require.set(True)
     app._awg_flags()
     win_.destroy()
+    # what the AWG can reach (+-10 V; 9.6 V cap here): shown as it is typed
+    app.av["rotation"].set("180")
+    app.av["split"].set("1")
+    root.update()
+    t_ = app.a_reach.cget("text")
+    check("180 deg all on X1: flagged red, with the X1 shares that would work",
+          t_.startswith("PAST THE AWG'S REACH") and "X1 share of 0.4" in t_
+          and str(app.a_reach.cget("foreground")) == "#c00000", t_)
+    app.av["split"].set("0.5")
+    root.update()
+    check("... and 90 / 90 is fine", not app.a_reach.cget("text").startswith("PAST"),
+          app.a_reach.cget("text"))
+    app.av["seq_x1"].set("0:120:60")
+    app.av["seq_x2"].set("0:120:60")
+    app.a_choice["seq_how"].set("grid")
+    root.update()
+    e_, w_, f_ = app._seq_waves(app.gather())
+    check("a sequence grid leaves out the corners past the AWG's reach",
+          len(e_) == 4 and all(max(x, y) <= 60 for x, y in e_)
+          and any("left out" in m for _lv, m in f_), (e_, app.awg_seq_lbl.cget("text")))
+    app.a_choice["seq_how"].set("pairs")
+    app.av["seq_x1"].set("120")
+    app.av["seq_x2"].set("0")
+    root.update()
+    check("... a pairs list says which to change",
+          "change them to start" in app.awg_seq_lbl.cget("text"), app.awg_seq_lbl.cget("text"))
+    app.bv["split"].set("1.0")
+    app.bv["biases"].set("0:120:60")
+    root.update()
+    check("Fixed rotations: the rotations past what the split reaches, in red",
+          app.bias_reach.cget("text").startswith("PAST THE AWG'S REACH: 120"),
+          app.bias_reach.cget("text"))
+    app.bv["split"].set("0.5")
     app.a_choice["source"].set("ramp")
     app.av["rotation"].set("60")
     app.do_awg_preview()
