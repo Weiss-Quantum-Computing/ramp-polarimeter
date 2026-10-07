@@ -993,6 +993,26 @@ def main():
     check("both in the Compare tab afterwards, at their own rotations (30 and 60 deg)",
           len(app.cmp_sel) == 2 and sorted(round(abs(v)) for k, v in rots.items()
                                            if k.startswith("seq_test")) == [30, 60], rots)
+    # dark and background reused from an earlier scan: the first scan has
+    # nothing measured of its own to lend, only what it borrowed (7 Oct: this
+    # raised 'no completed steps with data in this scan yet' before any step)
+    app.dark_mode.set("reuse latest")
+    app.bg_mode.set("reuse latest")
+    app.scan_name.set("seq reuse")
+    app.do_seq_start()
+    settle(root, app, timeout=600)
+    mans = {}
+    for n_ in ("seq_reuse_X1_30_X2_0", "seq_reuse_X1_30_X2_30"):
+        mp_ = os.path.join(app.outdir.get(), n_, f"{n_}_scan.json")
+        mans[n_] = _js.load(open(mp_, encoding="utf-8")) if os.path.isfile(mp_) else {}
+    srcs = [{k: (m.get("borrowed") or {}).get(k, {}).get("source") for k in ("dark", "background")}
+            for m in mans.values()]
+    check("a sequence reusing the latest dark / background: every step measured, the "
+          "second scan borrowing what the first borrowed",
+          all(m and all(x["status"] == "done" for x in m["steps"]) for m in mans.values())
+          and srcs[0] == srcs[1] and all(srcs[0].values()), srcs)
+    app.dark_mode.set("none")
+    app.bg_mode.set("none")
     # nothing loaded, scans compared: the Compare tab and the overlay tabs draw them
     saved_res = app.result
     app.result = None
@@ -1002,7 +1022,7 @@ def main():
     app.redraw(app.fig_ext)
     t_ = app.fig_ext.axes[0].get_title() if app.fig_ext.axes else ""
     check("nothing loaded: Extinction draws the first compared scan and the other",
-          t_.startswith("Extinction ratio along the ramp (seq_test") and "with 1 compared" in t_, t_)
+          t_.startswith("Extinction ratio along the ramp (seq_") and "with 1 compared" in t_, t_)
     app.result = saved_res
     # the record follows its parts; the scope's span is set apart
     app.av["hold_ms"].set("19")

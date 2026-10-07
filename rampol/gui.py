@@ -1773,9 +1773,18 @@ class App:
     def _seq_share_offsets(self, runs):
         """Worker: the first scan's dark / background / stray light, lent to
         the others (one beam block serves the whole sequence)."""
-        if not any(x["kind"] in an.OFFSET_KINDS and x.get("status") == "done"
-                   for x in runs[0].manifest["steps"]) and not runs[0].manifest.get("borrowed"):
-            return                         # nothing measured or borrowed to lend
+        measured = any(x["kind"] in an.OFFSET_KINDS and x.get("status") == "done"
+                       for x in runs[0].manifest["steps"])
+        if not measured:
+            # only borrowed (reuse latest): nothing of its own to load yet, so
+            # lend what it borrowed as it is
+            lent = runs[0].manifest.get("borrowed")
+            if lent:
+                for r in runs[1:]:
+                    r.manifest.setdefault("borrowed", {}).update(
+                        {k: (dict(v) if isinstance(v, dict) else v) for k, v in lent.items()})
+                    r.save()
+            return
         sg = self.load_sg()
         d0 = an.load_scan(runs[0].folder, sg.load_capture, trim=int(self.cfg["analysis"]["trim"]))
         pd = next(ch for ch, (r, _n) in cfgmod.channel_roles(self.cfg).items() if r == "PD")

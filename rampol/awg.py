@@ -865,9 +865,12 @@ def dry_run(sess, link, wave, wiring, shots=4, points=20000, wait_s=10.0,
                 res[name] = compare(t, mean, w.u[name], w.dt, stack)
                 res[name]["trace"] = (t, mean)
             report["steps"][key] = res
+            # a channel held at idle has no edge to fit a gain or delay to
             log(f"  dry run {key}: " + "; ".join(
-                f"{n} -> scope CH{c}: gain {res[n]['gain']:.3f}, delay "
-                f"{res[n]['delay_us']:.1f} us, {res[n]['rms_mV']:.1f} mV rms"
+                (f"{n} -> scope CH{c}: gain {res[n]['gain']:.3f}, delay "
+                 f"{res[n]['delay_us']:.1f} us, {res[n]['rms_mV']:.1f} mV rms")
+                if float(np.ptp(w.u[n])) >= 0.05 else
+                f"{n} -> scope CH{c}: flat (idle), {res[n]['rms_mV']:.1f} mV rms"
                 for n, c in zip(CHANNELS, chs)))
         # The idle, read again at a V/div that can see it. At the shared
         # setting the screen is centred mid-swing (2 V/div at 4.6 V for a 90
