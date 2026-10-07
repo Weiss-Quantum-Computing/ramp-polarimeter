@@ -181,6 +181,11 @@ DEFAULTS = {
             # scope_before_ms before the trigger to scope_after_ms after the
             # AWG record ends - set apart from the AWG record itself
             "scope_before_ms": 0.2, "scope_after_ms": 0.0,
+            # a sequence of ramps with their own X1 / X2 end points (deg),
+            # one ramp scan each, interleaved with the analyzer angles (the
+            # Ramp scan tab's); settle after each live change of waveform
+            "seq_x1": "45", "seq_x2": "0:90:45", "seq_how": "pairs",
+            "seq_order": "interleaved (per angle)", "seq_settle_s": 1.0,
             "file1": "", "file2": "", "trig_hz": 3.7,
             "settle_ms": 4.0, "fit_timebase": True, "shots": 8,
             # BOTH outputs: never switched off by the program (the X2 path's

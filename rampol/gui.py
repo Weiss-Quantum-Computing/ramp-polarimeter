@@ -92,6 +92,7 @@ EXPORT CSV / COPY CSV
   Every value on this plot as a table: method, leg, direction, time, rotation, analyzer angle, ER with its +-1 sigma, lower-bound flag, Imin, Imax, plus the per-sample fit's ER binned by rotation. A '#' header says what the scan was, what was subtracted, and what limits the numbers (read it with pandas.read_csv(path, comment='#')).
 """
 ANALYZER_OFFSETS = ("measure after", "reuse latest", "none")
+SEQ_ORDERS = ("interleaved (per angle)", "one setting at a time")
 FIND_LIGHT = ("record window", "static light (line trigger)")
 MAP_MODES = ("transmission", "fit residual (mV)", "residual / standard error")
 PLOT_HINT = ("Click a time on the Map, Angle or Extinction tab to move the "
@@ -632,6 +633,7 @@ class App:
         toolbar = NavigationToolbar2Tk(canvas, frame)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, ctl, frame
+        self._hook_save(fig, toolbar)
         self.plot_tabs[frame] = (fig, draw)
         self.plot_dirty.add(frame)
         canvas.mpl_connect("button_press_event", self.copy_coords)
@@ -676,7 +678,8 @@ class App:
         """[(result, colour)]: the scans analysed in the Compare tab, without
         the shown one. With `fig`, only when that tab's 'compare scans' box is
         ticked."""
-        if fig is not None and not (getattr(fig, "_cmp_on", None) and fig._cmp_on.get()):
+        if fig is not None and not (getattr(fig, "_cmp_on", None) and fig._cmp_on.get()) \
+                and not getattr(fig, "_force_cmp", False):
             return []
         here = (os.path.normcase(os.path.abspath(self.result["d"].folder))
                 if self.result else None)
@@ -749,6 +752,73 @@ class App:
         n = sum(1 for ln in txt.splitlines() if ln and not ln.startswith("#")) - 1
         self.log(f"Extinction ratio of {self.result['d'].name}: {n} rows on the clipboard "
                  f"(CSV with a '#' header) - paste it anywhere")
+
+    def _hook_save(self, fig, toolbar):
+        """The toolbar's Save button: our dialog (a name and a folder filled
+        in), not matplotlib's ('image' in the working directory). The button
+        took its command when the toolbar was built, so it is re-pointed."""
+        toolbar.save_figure = lambda *_a: self.save_figure(fig)
+        try:
+            toolbar._buttons["Save"].configure(command=toolbar.save_figure)
+        except (AttributeError, KeyError, tk.TclError):
+            pass
+
+    def _figure_name(self, fig):
+        """(folder, file stem) for saving a tab's figure: under the shown
+        scan's folder (the output folder for the tabs that are not about a
+        scan), in saved_figures/; named scan_tab[_view]."""
+        tab = self.nb.tab(fig._frame, "text")
+        out = self.outdir.get().strip() or self.cfg["outdir"]
+        free = fig._frame in getattr(self, "free_tabs", ())
+        res = self.result
+        parts = []
+        if fig is getattr(self, "fig_cmp", None):
+            names = [r["d"].name for r, _c in self._compared()]
+            if res:
+                names.insert(0, res["d"].name)
+            folder = res["d"].folder if res else out
+            parts = ["compare"] + names[:3] + ([f"and_{len(names) - 3}_more"]
+                                                if len(names) > 3 else [])
+        elif free or not res:
+            folder = out
+            parts = [tab]
+            if fig is getattr(self, "fig_bias", None) and getattr(self, "bias_result", None):
+                parts = [self.bias_result.get("name", ""), tab]
+            if fig is getattr(self, "fig_ilc", None):
+                parts.append(os.path.splitext(self.ilc_fig.get())[0])
+        else:
+            folder = res["d"].folder
+            parts = [res["d"].name, tab]
+            if fig is self.fig_ext:
+                parts.append(f"vs_{self.ext_x.get()}")
+            if fig is self.fig_map:
+                parts.append(self.map_show.get().split(" (")[0])
+            if self.cursor_t is not None and fig in (self.fig_malus, self.fig_poin):
+                parts.append(f"t{self.cursor_t * 1e3:.3f}ms")
+        import unicodedata
+        stem = "_".join(p for p in parts if p)
+        stem = unicodedata.normalize("NFKD", stem).encode("ascii", "ignore").decode()
+        stem = scanmod.safe_name(stem).replace("/", "_")
+        return os.path.join(folder, "saved_figures"), stem
+
+    def save_figure(self, fig):
+        folder, stem = self._figure_name(fig)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            folder = os.path.dirname(folder)
+        name, k = stem, 2
+        while os.path.exists(os.path.join(folder, name + ".png")):
+            name, k = f"{stem}_{k}", k + 1
+        p = filedialog.asksaveasfilename(
+            parent=self.root, title="Save the figure", initialdir=folder,
+            initialfile=name + ".png", defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg"), ("All", "*.*")])
+        if not p:
+            return None
+        fig.savefig(p, dpi=150)
+        self.log(f"Figure saved: {p}")
+        return p
 
     def build_table_tab(self):
         frame = ttk.Frame(self.nb)
@@ -903,7 +973,7 @@ class App:
                            ("fall", "fall_ms"), ("after", "tail_ms")):
             entry(rr, key, 4, label)
         entry(rr, "dt_us", 4, "ms, dt", "us")
-        self.a_record = CopyLabel(f, text="", foreground="#666", width=60)
+        self.a_record = CopyLabel(f, text="", foreground="#666", width=46)
         self.a_record.pack(anchor="w", padx=6)
         for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms", "dt_us"):
             self.av[k].trace_add("write", lambda *_: self._awg_record_text())
@@ -921,19 +991,18 @@ class App:
             ttk.Button(rr, text="...", width=3,
                        command=lambda k=key: self.pick_awg_file(k)).pack(side="left")
         rr = row()
-        entry(rr, "trig_hz", 5, "Trigger", "Hz")
         self.a_fit_tb = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="set the scope: from", variable=self.a_fit_tb).pack(
-            side="left", padx=(8, 0))
+        ttk.Checkbutton(rr, text="scope from", variable=self.a_fit_tb).pack(side="left")
         entry(rr, "scope_before_ms", 4, None, "ms before the trigger to")
-        entry(rr, "scope_after_ms", 4, None, "ms after the record")
+        entry(rr, "scope_after_ms", 4, None, "ms past the record")
         rr = row()
+        entry(rr, "trig_hz", 4, "Trigger", "Hz")
         self.a_never = tk.BooleanVar(value=True)
         self.a_require = tk.BooleanVar(value=True)
-        ttk.Checkbutton(rr, text="never let an output float (both)", variable=self.a_never,
-                        command=self._awg_flags).pack(side="left")
+        ttk.Checkbutton(rr, text="never let an output float", variable=self.a_never,
+                        command=self._awg_flags).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(rr, text="require a dry run", variable=self.a_require,
-                        command=self._awg_flags).pack(side="left", padx=(8, 0))
+                        command=self._awg_flags).pack(side="left", padx=(6, 0))
         rr = row()
         ttk.Label(rr, text="Dry run: AWG CH1 -> scope CH").pack(side="left")
         combo(rr, "dry_ch1", ("1", "2", "3", "4"), 2, "3")
@@ -957,6 +1026,25 @@ class App:
         entry(rr, "shots", 3, "shots")
         self._btn(rr, "Find min", lambda: self.do_awg_find("min"), padx=(4, 0))
         self._btn(rr, "Find max", lambda: self.do_awg_find("max"), padx=(4, 0))
+        # a sequence of end points: one ramp scan each, with the analyzer
+        rr = row((5, 1))
+        ttk.Label(rr, text="Sequence  X1 ends").pack(side="left", padx=(0, 1))
+        self.av["seq_x1"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.av["seq_x1"], width=10).pack(side="left", padx=(0, 4))
+        ttk.Label(rr, text="X2 ends").pack(side="left", padx=(0, 1))
+        self.av["seq_x2"] = tk.StringVar()
+        ttk.Entry(rr, textvariable=self.av["seq_x2"], width=10).pack(side="left", padx=(0, 2))
+        ttk.Label(rr, text="deg").pack(side="left", padx=(0, 4))
+        combo(rr, "seq_how", ("pairs", "grid"), 5, "pairs")
+        rr = row()
+        combo(rr, "seq_order", SEQ_ORDERS, 19, SEQ_ORDERS[0])
+        self._btn(rr, "Dry run all", self.do_seq_dry, padx=(2, 0))
+        self._btn(rr, "Start sequence", self.do_seq_start, padx=(4, 0))
+        self.awg_seq_lbl = CopyLabel(f, text="", foreground="#666", width=46)
+        self.awg_seq_lbl.pack(anchor="w", padx=6)
+        for k in ("seq_x1", "seq_x2"):
+            self.av[k].trace_add("write", lambda *_: self._seq_text())
+        self.a_choice["seq_how"].trace_add("write", lambda *_: self._seq_text())
         self.awg_lbl = CopyLabel(f, text="AWG: not connected (connects on first use)",
                                  foreground="#666", width=47)
         self.awg_lbl.pack(anchor="w", padx=6, pady=(2, 4))
@@ -1039,6 +1127,10 @@ class App:
             wave = awgmod.from_files(a.get("file1"), a.get("file2"))
         else:
             wave = awgmod.ramp_hold(float(a["rotation"]), a, idle=self._awg_idle(c))
+        return wave, self._wave_checks(c, wave)
+
+    def _wave_checks(self, c, wave):
+        a = c["awg"]
         found = awgmod.check(wave, self._eom(c), trig_hz=float(a.get("trig_hz") or 0) or None)
         # a spin-echo sequence triggers every leg: a record longer than the
         # legs' spacing is still playing when leg 2's trigger comes
@@ -1049,7 +1141,7 @@ class App:
                                       f"{gap:g} ms between the spin-echo legs (Spin echo "
                                       f"preset): leg 2's trigger comes while the burst still "
                                       f"plays, and the 4063B ignores it - leg 2 is not driven"))
-        return wave, found
+        return found
 
     def do_awg_preview(self):
         c = self.gather()
@@ -1100,12 +1192,16 @@ class App:
         s = self.awg_sess
         if s is None or not s.owned or s.parked or s.wave is None:
             return None
-        w = s.wave
+        return self._drive_info(s.wave, s.is_verified(s.wave))
+
+    def _drive_info(self, w, verified):
         out = {"source": "this window's AWG (rampol)", "label": w.label,
                "names": list(awgmod.names(w)), "record_ms": w.period * 1e3,
-               "dt_us": w.dt * 1e6, "idle_V": w.idle(), "dry_run_passed": s.is_verified(w),
+               "dt_us": w.dt * 1e6, "idle_V": w.idle(), "dry_run_passed": bool(verified),
                "rotation_deg": w.rotation,
                "hold_ms": None if not w.hold else [w.hold[0] * 1e3, w.hold[1] * 1e3]}
+        if getattr(w, "ends", None):
+            out["ends_deg"] = {"X1": w.ends["EO1"], "X2": w.ends["EO2"]}
         if w.source == "ramp":
             a = self.cfg.get("awg", {})
             out["ramp"] = {k: a.get(k) for k in ("rotation", "split", "edge", "lead_ms",
@@ -1113,6 +1209,278 @@ class App:
         else:
             out["files"] = dict(w.files)
         return out
+
+    # -- a sequence of ramp end points, interleaved with the analyzer ---------------
+    def _seq_waves(self, c):
+        """(ends, waves, findings) for the AWG tab's sequence: one ramp per
+        (X1, X2) end point, the ramp's other settings from the tab."""
+        a = c["awg"]
+        ends = awgmod.parse_ends(a.get("seq_x1", ""), a.get("seq_x2", ""),
+                                 a.get("seq_how", "pairs"))
+        idle = self._awg_idle(c)
+        waves = [awgmod.ramp_hold(0.0, a, idle=idle, ends={"EO1": e1, "EO2": e2})
+                 for e1, e2 in ends]
+        found = []
+        for w in waves:
+            for lv, msg in self._wave_checks(c, w):
+                if lv != "INFO":
+                    found.append((lv, f"X1 {w.ends['EO1']:g} / X2 {w.ends['EO2']:g}: {msg}"))
+        return ends, waves, found
+
+    def _seq_names(self, base, ends):
+        return [scanmod.safe_name(f"{base}_X1_{e1:g}_X2_{e2:g}") for e1, e2 in ends]
+
+    def _seq_text(self):
+        try:
+            a = {k: self.av[k].get() for k in ("seq_x1", "seq_x2")}
+            ends = awgmod.parse_ends(a["seq_x1"], a["seq_x2"], self.a_choice["seq_how"].get())
+        except (ValueError, KeyError) as exc:
+            self.awg_seq_lbl.configure(text=str(exc) if self.av["seq_x1"].get() else "")
+            return
+        shown = ", ".join(f"{e1:g}/{e2:g}" for e1, e2 in ends[:8])
+        self.awg_seq_lbl.configure(text=f"{len(ends)} ramps (X1/X2 deg): {shown}"
+                                    + (" ..." if len(ends) > 8 else "")
+                                    + " - one ramp scan each, at the Ramp scan tab's angles")
+
+    def do_seq_dry(self):
+        """Every ramp of the sequence through the scope (the dry run)."""
+        if not self.need(ell=False):
+            return
+        c = self.gather()
+        self.save_settings()
+        try:
+            ends, waves, found = self._seq_waves(c)
+            wiring = self._awg_wiring(c)
+        except (ValueError, OSError) as exc:
+            self.log(f"Sequence dry run: {exc}")
+            return
+        if self.report_checks(found, f"AWG sequence ({len(waves)} ramps)") == "FAIL":
+            self.log("Dry run not started.")
+            return
+        if not self._dry_confirm(wiring, len(waves)):
+            return
+        a = c["awg"]
+        self._run_dry(waves, wiring, c, f"sequence X1 {a['seq_x1']} / X2 {a['seq_x2']} "
+                                        f"({a['seq_how']})")
+
+    def do_seq_start(self):
+        """One ramp scan per (X1, X2) end point, the AWG loaded live between
+        them, interleaved with the analyzer: at each angle every ramp in
+        turn (or each ramp's scan whole, 'one setting at a time')."""
+        if not self.need():
+            return
+        c = self.gather()
+        self.save_settings()
+        if "PD" not in [r for r, _ in cfgmod.channel_roles(c).values()]:
+            self.log("No channel has the PD role.")
+            return
+        try:
+            ends, waves, found = self._seq_waves(c)
+        except (ValueError, OSError) as exc:
+            self.log(f"Sequence: {exc}")
+            return
+        if self.report_checks(found, f"AWG sequence ({len(waves)} ramps)") == "FAIL":
+            self.log("Sequence not started.")
+            return
+        s = self.awg_sess
+        if c["awg"].get("require_dry_run", True):
+            unver = [w for w in waves if s is None or not s.is_verified(w)]
+            if unver:
+                if messagebox.askyesno(
+                        "Not dry-run", f"{len(unver)} of the {len(waves)} ramps have not "
+                        f"passed a dry run on the scope this session, and 'require a dry "
+                        f"run' is ticked.\n\nDry-run all of them now?", parent=self.root):
+                    self.do_seq_dry()
+                return
+        base = scanmod.safe_name(c.get("scan_name") or "sequence")
+        names = self._seq_names(base, ends)
+        out = c["outdir"]
+        existing = [n for n in names if os.path.isfile(os.path.join(out, n, f"{n}_scan.json"))]
+        resume = False
+        if existing:
+            mans = []
+            for n in existing:
+                with open(os.path.join(out, n, f"{n}_scan.json"), encoding="utf-8") as fh:
+                    mans.append(json.load(fh))
+            ours = len(existing) == len(names) and all(
+                (m.get("plan", {}).get("series") or {}).get("base") == base for m in mans)
+            left = sum(1 for m in mans for x in m["steps"] if x.get("status") != "done")
+            if ours and left:
+                ans = messagebox.askyesnocancel(
+                    "Sequence exists", f"The sequence {base} ({len(names)} scans) has {left} "
+                    f"step(s) not measured.\n\nYes = resume it\nNo = a new sequence\n"
+                    f"Cancel = do nothing", parent=self.root)
+                if ans is None:
+                    return
+                resume = bool(ans)
+            if not resume:
+                k = 2
+                while True:
+                    nb = f"{base}_{k}"
+                    if not any(os.path.exists(os.path.join(out, n))
+                               for n in self._seq_names(nb, ends)):
+                        break
+                    k += 1
+                self.log(f"{base} is taken - this sequence is {nb}")
+                base = nb
+                names = self._seq_names(base, ends)
+                self.scan_name.set(base)
+        peak = max(float(np.max(np.abs(awgmod.predict(w)[1]))) for w in waves)
+        if not messagebox.askokcancel(
+                "AWG sequence", f"{len(waves)} ramps (X1/X2 end points "
+                f"{', '.join(f'{e1:g}/{e2:g}' for e1, e2 in ends[:6])}"
+                f"{' ...' if len(ends) > 6 else ''}), one ramp scan each, "
+                f"{c['awg'].get('seq_order', SEQ_ORDERS[0])}.\n\nThe AWG outputs go ON "
+                f"into the Treks (CH1 -> X1, CH2 -> X2) and each ramp is loaded live as "
+                f"the sequence goes (up to {peak:.1f} deg). At the end the AWG is parked. "
+                f"Park or Outputs OFF stop it at any time.\n\nStart?", parent=self.root):
+            return
+        runs = [self._new_run(n) for n in names]
+        here = {}
+        for r in runs:
+            r.here = here
+        sc = c["scan"]
+        dm, bm = self.dark_mode.get(), self.bg_mode.get()
+        pre = [k for k, m in (("dark", dm), ("background", bm)) if m == "measure"]
+        if resume:
+            for r in runs:
+                r.load()
+            pre = [k for k in pre if any(x["kind"] == k and x["status"] != "done"
+                                         for x in runs[0].manifest["steps"])]
+            reuse = []
+        else:
+            angles = scanmod.ordered(scanmod.angle_list(sc["start"], sc["stop"], sc["step"]),
+                                     sc["order"])
+            steps = scanmod.build_steps(angles, int(sc["ref_every"]), sc["ref_angle"])
+            offs = [{"kind": k, "target": 0.0} for k in pre]
+            stray = self._stray_scale(c) if len(pre) == 2 else None
+            if stray:
+                offs = [{"kind": "dark", "target": 0.0},
+                        {"kind": "dark", "target": 0.0, "pd_scale": stray},
+                        {"kind": "background", "target": 0.0, "pd_scale": stray},
+                        {"kind": "background", "target": 0.0}]
+            plan = dict(sc, preset=c["preset"], software=f"rampol {__version__}",
+                        dark_mode=dm, bg_mode=bm)
+            if (cfgmod.PRESETS.get(c["preset"]) or {}).get("sequence"):
+                plan["sequence"] = dict(c.get("sequence") or cfgmod.DEFAULTS["sequence"])
+            prov = self._provenance(c)
+            order = c["awg"].get("seq_order", SEQ_ORDERS[0])
+            for k, (r, w, (e1, e2)) in enumerate(zip(runs, waves, ends)):
+                pl = dict(plan, series={"base": base, "index": k, "of": len(runs),
+                                        "ends_deg": {"X1": e1, "X2": e2}, "order": order,
+                                        "members": names})
+                r.new(pl, (offs if k == 0 else []) + [dict(x) for x in steps],
+                      extra={"zero_deg": float(c["ell_zero_deg"]), "provenance": prov,
+                             "drive": self._drive_info(w, s is not None and s.is_verified(w))})
+            reuse = [k for k, m in (("dark", dm), ("background", bm)) if m == "reuse latest"]
+            if bm == "reuse latest" and self._stray_scale(c):
+                reuse.append("stray")
+        self.run = runs[0]
+        self.seq_runs = runs
+        self.log(f"Sequence {base}: {len(runs)} ramp scans ({', '.join(names[:3])}"
+                 f"{' ...' if len(names) > 3 else ''})")
+
+        def start():
+            # which scan the plots follow: read here, on the Tk thread
+            shown = os.path.normcase(os.path.abspath(self._scan_path(self.show_scan.get()) or ""))
+            watch = next((k for k, r in enumerate(runs)
+                          if os.path.normcase(os.path.abspath(r.folder)) == shown), 0)
+            self.worker(lambda: self._run_seq(runs, waves, c, watch), done=self._seq_done)
+
+        def after_offsets():
+            if reuse:
+                self.borrow_latest(runs[0], reuse, start)
+            else:
+                start()
+        self.offsets_then(runs[0], pre, after_offsets)
+
+    def _seq_share_offsets(self, runs):
+        """Worker: the first scan's dark / background / stray light, lent to
+        the others (one beam block serves the whole sequence)."""
+        if not any(x["kind"] in an.OFFSET_KINDS and x.get("status") == "done"
+                   for x in runs[0].manifest["steps"]) and not runs[0].manifest.get("borrowed"):
+            return                         # nothing measured or borrowed to lend
+        sg = self.load_sg()
+        d0 = an.load_scan(runs[0].folder, sg.load_capture, trim=int(self.cfg["analysis"]["trim"]))
+        pd = next(ch for ch, (r, _n) in cfgmod.channel_roles(self.cfg).items() if r == "PD")
+        vdiv = self.link.channel_state([pd])[pd][0]
+        lv = an.offset_levels(d0, vdiv)
+        lend = {}
+        for k in an.OFFSET_KINDS:
+            e = lv.get(k)
+            if e:
+                lend[k] = {"level": float(e["level"]), "sem": float(e.get("sem") or 0.0),
+                           "n": int(e.get("n") or 0), "vdiv": float(e["vdiv"]),
+                           "offset": float(e["offset"]), "measured": e.get("measured", ""),
+                           "source": runs[0].name if e["source"] == "this scan" else e["source"]}
+        st = an.stray_light(d0)
+        if st:
+            lend["stray"] = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
+                             for k, v in st.items()}
+            if st["source"] == "this scan":
+                lend["stray"]["source"] = runs[0].name
+        if lend:
+            for r in runs[1:]:
+                r.manifest.setdefault("borrowed", {}).update(lend)
+                r.save()
+
+    def _run_seq(self, runs, waves, c, watch=0):
+        """Worker: the sequence's steps in order, the AWG loaded live when
+        the ramp changes; parked at the end, whatever happens."""
+        sess = self._awg_session(c)
+        a = c["awg"]
+        self._seq_share_offsets(runs)
+        steps = [[x for x in r.manifest["steps"] if x["kind"] in ("scan", "ref")] for r in runs]
+        n = min(len(x) for x in steps)
+        if str(a.get("seq_order", "")).startswith("one"):
+            order = [(k, i) for k in range(len(runs)) for i in range(n)]
+        else:
+            order = [(k, i) for i in range(n) for k in range(len(runs))]
+        todo = [(k, i) for k, i in order if steps[k][i].get("status") != "done"]
+        settle = float(a.get("seq_settle_s", 1.0) or 0)
+        from .bias import eta
+        t0, done, cur = time.time(), 0, None
+        try:
+            for k, i in todo:
+                if self.stop_flag.is_set():
+                    raise hw.Cancelled()
+                if cur != k:
+                    if sess.wave is None or awgmod.names(sess.wave) != awgmod.names(waves[k]):
+                        sess.load(waves[k], keep_on=True)
+                    if not all(sess.outputs().values()):
+                        sess.on()
+                    cur = k
+                    if settle > 0:
+                        time.sleep(settle)
+                st = steps[k][i]
+                self._progress(done, len(todo), f"sequence: {runs[k].name}: {st['kind']} "
+                                                f"{st['target']:.2f} deg ({done + 1}/{len(todo)}"
+                                                f"{eta(t0, done, len(todo))})")
+                f = runs[k].folder
+                runs[k].run_step(st, on_step=(lambda _s, f=f: self.call(self.live_refresh, f))
+                                 if k == watch else None)
+                done += 1
+            self._progress(len(todo), len(todo), "sequence done")
+        except hw.Cancelled:
+            self.log(f"Sequence stopped after {done} of {len(todo)} steps. Start it again "
+                     f"under the same name (AWG tab) to resume.")
+        finally:
+            try:
+                sess.end()
+            except Exception as exc:
+                self.log(f"  AWG park at the end: {exc}")
+        return runs
+
+    def _seq_done(self, runs):
+        self._awg_status()
+        self.log(f"Sequence: {len(runs)} scans - all of them in the Compare tab")
+        self.refresh_scan_list()
+        names = [r.name for r in runs]
+        self.cmp_lb.selection_clear(0, "end")
+        for i, n in enumerate(self.cmp_lb.get(0, "end")):
+            if n in names:
+                self.cmp_lb.selection_set(i)
+        self.do_compare_load()
 
     def do_connect_awg(self):
         """Connect the 4063B now rather than on first use. Only *IDN? is sent:
@@ -2217,6 +2585,7 @@ class App:
         toolbar = NavigationToolbar2Tk(canvas, right)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, side, frame
+        self._hook_save(fig, toolbar)
         canvas.mpl_connect("button_press_event", lambda ev: self._shots_click(ev))
         canvas.mpl_connect("button_press_event", self.copy_coords)
         self.plot_tabs[frame] = (fig, self.draw_shots)
@@ -3221,7 +3590,7 @@ class App:
         a = c["awg"]
         for k, v in self.av.items():
             txt = v.get().strip()
-            if k in ("idle1", "idle2", "file1", "file2"):
+            if k in ("idle1", "idle2", "file1", "file2", "seq_x1", "seq_x2"):
                 a[k] = txt
             elif _isnum(txt):
                 a[k] = int(float(txt)) if k in ("shots", "dry_shots") else float(txt)
@@ -3820,6 +4189,16 @@ class App:
             new = scanmod.next_free_name(c["outdir"], run.name)
             unfinished = [x for x in man["steps"] if x.get("status") != "done"]
             ans = False
+            if unfinished and (man.get("plan") or {}).get("series"):
+                base = man["plan"]["series"].get("base", "")
+                if not messagebox.askyesno(
+                        "Part of an AWG sequence", f"{run.name} is one scan of the AWG "
+                        f"sequence {base}: resumed here it would be measured with whatever "
+                        f"the AWG plays now, not its own ramp. Resume it with the AWG tab's "
+                        f"Start sequence (same scan name).\n\nStart a new scan {new} here "
+                        f"instead?", parent=self.root):
+                    return
+                unfinished = []
             if unfinished:
                 ans = messagebox.askyesnocancel(
                     "Scan exists", f"{run.name} already exists with {len(unfinished)} "
@@ -4444,6 +4823,7 @@ class App:
         toolbar = NavigationToolbar2Tk(canvas, right)
         canvas.get_tk_widget().pack(fill="both", expand=True)
         fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, side, frame
+        self._hook_save(fig, toolbar)
         canvas.mpl_connect("button_press_event", self.copy_coords)
         self.plot_tabs[frame] = (fig, self.draw_compare)
         self.plot_dirty.add(frame)
@@ -4524,7 +4904,10 @@ class App:
             ax.set_axis_off()
             return
         by_rot = self.cmp_x.get() == "rotation"
-        diff_on = bool(self.cmp_diff.get()) and shown is not None and len(items) > 1
+        # the difference is from the shown scan, or from the first compared
+        # one when nothing is loaded
+        ref = shown if shown is not None else items[0][0]
+        diff_on = bool(self.cmp_diff.get()) and len(items) > 1
         gs = fig.add_gridspec(3 if diff_on else 2, 1,
                               height_ratios=[1.2, 1, 1.3] if diff_on else [1.2, 1.3])
         ax1 = fig.add_subplot(gs[0])
@@ -4538,14 +4921,15 @@ class App:
             lab = d.name + (" (shown)" if is_shown else "")
             tt, rr = self._decimate(d.t, pol["rotation"], 3000)
             ax1.plot(tt * 1e3, rr, color=c, lw=1.0 if is_shown else 0.8, label=lab)
-            if diff_on and not is_shown:
-                tr = shown["d"].t
+            if diff_on and r is not ref:
+                tr = ref["d"].t
                 m = (tr >= d.t[0]) & (tr <= d.t[-1])
                 if m.sum() > 10:
                     dd = (np.interp(tr[m], d.t, pol["rotation"])
-                          - shown["pol"]["rotation"][m]) * 1e3
+                          - ref["pol"]["rotation"][m]) * 1e3
                     tt, dd = self._decimate(tr[m], self.smooth(dd, tr[m]), 3000)
-                    ax2.plot(tt * 1e3, dd, color=c, lw=0.8, label=f"{d.name} - shown")
+                    ax2.plot(tt * 1e3, dd, color=c, lw=0.8,
+                             label=f"{d.name} - " + ("shown" if ref is shown else ref["d"].name))
             er, ok, us = self.smoothed_er(pol, d.t)
             x = pol["rotation"] if by_rot else d.t * 1e3
             k = max(1, len(x) // 4000)
@@ -4567,8 +4951,8 @@ class App:
         ax1.legend(fontsize=7, loc="best")
         ax1.grid(alpha=0.3)
         if diff_on:
-            sig = shown["pol"]["sig_psi"] * 1e3
-            t3 = shown["d"].t * 1e3
+            sig = ref["pol"]["sig_psi"] * 1e3
+            t3 = ref["d"].t * 1e3
             kk = max(1, len(t3) // 4000)
             ax2.fill_between(t3[::kk], -sig[::kk], sig[::kk], color="0.85", lw=0,
                              label="+-1 SD per sample, shown scan's fit")
@@ -4782,6 +5166,21 @@ class App:
                 ax.text(0.02, 0.5, f"Could not draw: {exc}", transform=ax.transAxes)
                 ax.set_axis_off()
                 self.log(f"draw: {exc}")
+        elif not self.result and hasattr(fig, "_cmp_on") and self._compared():
+            # nothing loaded but scans compared: the first stands in for the
+            # shown one, the others are drawn against it
+            first = self._compared()[0][0]
+            self.result, fig._force_cmp = first, True
+            try:
+                draw(fig)
+            except Exception as exc:
+                fig.clear()
+                ax = fig.add_subplot(111)
+                ax.text(0.02, 0.5, f"Could not draw: {exc}", transform=ax.transAxes)
+                ax.set_axis_off()
+                self.log(f"draw: {exc}")
+            finally:
+                self.result, fig._force_cmp = None, False
         elif not self.result:
             ax = fig.add_subplot(111)
             ax.text(0.5, 0.5, "No scan loaded", ha="center", va="center",

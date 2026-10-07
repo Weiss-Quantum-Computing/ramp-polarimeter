@@ -407,8 +407,8 @@ CH1 -> X1 -> EO1, CH2 -> X2 -> EO2, through EOM-ILC's upload path and checks
      between bursts, and file zero parks the EOMs at -9 / -41 V.
    - **ILC drives**: two `run/drive_<stem>_iNN.csv` (AWG volts; a target in
      EOM volts is refused), checked against their own state's target.
-   **The scope's span** is set apart from the AWG record (*set the scope:
-   from `before` ms before the trigger to `after` ms after the record*,
+   **The scope's span** is set apart from the AWG record (*scope from
+   `before` ms before the trigger to `after` ms past the record*,
    rounded up to two figures), on Load and for Find in the hold. The dry run
    always shows the whole record.
 
@@ -419,6 +419,26 @@ CH1 -> X1 -> EO1, CH2 -> X2 -> EO2, through EOM-ILC's upload path and checks
    parked) records it in its manifest (`drive`: the waveform, its names,
    record, idle, whether its dry run passed), and the lab log's `ilc`
    column says so instead of naming the ILC state files.
+   **Sequence** (X1 ends, X2 ends, pairs / grid; *Dry run all*, *Start
+   sequence*): ramps with each crystal's own end point (deg; lists as
+   `0:90:30` or `0, 45, 90`; *pairs* takes them together - a single value
+   goes with every entry of the other - *grid* every X1 with every X2), the
+   rest of the ramp from the fields above. *Start sequence* makes one ramp
+   scan per ramp, named `<scan name>_X1_<a>_X2_<b>`, at the Ramp scan tab's
+   angles, shots, refs and dark / background, and runs them with the AWG
+   loaded live between them: *interleaved (per angle)* measures every ramp at
+   one analyzer angle before moving on (the analyzer stays put - each step
+   says `stayed` - and slow drift is shared alike), *one setting at a time*
+   does each ramp's scan whole (fewer AWG changes). A waveform change waits
+   `seq_settle_s` (1 s) before the next shot. One dark / background (and
+   stray-light pair) is taken in the first scan and lent to the others. Each
+   scan's manifest has the ramp it ran (`drive`, with `ends_deg`) and its
+   place in the sequence (`plan.series`). Every ramp must have passed a dry
+   run (*Dry run all* plays each into the scope); the AWG ends parked on the
+   ILC's record. Stopped, it resumes with *Start sequence* under the same
+   scan name; a member resumed from the Ramp scan tab would be measured with
+   whatever the AWG plays, so that is refused. At the end every scan of the
+   sequence is put in the Compare tab.
 2. **Dry run on scope**: the AWG's outputs go to two scope channels (`Dry
    run: AWG CH1 -> scope CH3, CH2 -> CH4` by default) - a BNC tee keeps the
    next stage's input driven - while the Treks do NOT drive the EOMs (HV
@@ -541,6 +561,16 @@ The capture names split as Scope Grab expects (`prefix_NNN`), so its Compare
 box opens any angle: key `<name>_a045.00`, runs `1-4`.
 
 ## Tabs
+
+Every figure's **Save** button opens on `<the shown scan's folder>/saved_figures/`
+(the output folder for the tabs that are not about a scan), the file named
+for the scan and the tab - `<scan>_Extinction_vs_rotation.png`,
+`<scan>_Malus_t12.000ms.png`, `compare_<scans>.png` - with _2, _3 ... when
+it exists; PNG at 150 dpi, or PDF / SVG.
+
+With no scan loaded, the Compare tab draws the compared scans (the
+difference from the first of them), and so do the tabs with a *compare
+scans* box: the first compared scan stands in for the shown one.
 
 Two switches recur. **log y** (Traces, Malus, Extinction, Shots, Compare,
 Fixed rotations): an extinction ratio goes log; a light level, which can go

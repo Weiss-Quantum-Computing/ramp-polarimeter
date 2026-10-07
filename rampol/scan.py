@@ -287,6 +287,9 @@ class ScanRun:
         self.fmt = fmt
         self.manifest = None
         self._on_step = None
+        # shared between the scans of an AWG sequence: where the analyzer
+        # was last put, so the next scan at the same angle does not move it
+        self.here = None
 
     # -- manifest ---------------------------------------------------------
     def exists(self):
@@ -373,6 +376,16 @@ class ScanRun:
         self.progress(done, total, "done")
         return done
 
+    def run_step(self, s, on_step=None):
+        """Measure one step of this scan (an AWG sequence interleaves its
+        scans step by step) and save."""
+        self._on_step = on_step
+        self.measure(s, self.manifest["plan"])
+        self.save()
+        self.done_count = getattr(self, "done_count", 0) + 1
+        if on_step is not None:
+            on_step(s)
+
     def measure(self, s, plan):
         sg, link = self.sg, self.link
         chans = list(self.channels)
@@ -381,9 +394,18 @@ class ScanRun:
         s["clock"] = float(self.clock())
         s["files"], s["hits"] = [], []
         if s["kind"] not in ("dark", "background"):
-            s["landed"] = float(self.rot.approach(
-                s["target"], backoff=plan.get("backoff_deg", 3.0)))
-            s["mount"] = float(self.rot.dev.position() + self.rot.zero) % 360.0
+            here = self.here
+            if here is not None and here.get("target") == float(s["target"]):
+                # the analyzer is already there (another scan of the sequence
+                # measured this angle just now): stay
+                s["landed"], s["mount"], s["stayed"] = here["landed"], here["mount"], True
+            else:
+                s["landed"] = float(self.rot.approach(
+                    s["target"], backoff=plan.get("backoff_deg", 3.0)))
+                s["mount"] = float(self.rot.dev.position() + self.rot.zero) % 360.0
+                if here is not None:
+                    here.update(target=float(s["target"]), landed=s["landed"],
+                                mount=s["mount"])
         override = s.get("pd_scale")
         saved = None
         if override:

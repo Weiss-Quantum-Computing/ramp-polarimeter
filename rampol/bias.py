@@ -994,50 +994,55 @@ def malus_scan(link, rot, roles, angles, window_s=None, plan=None, log=print,
     th, I, S, keys, vd, rng = [], [], [], [], [], []
     t_run, n = time.time(), len(angles)
     spread = 0.0
-    for i, a in enumerate(angles):
-        if progress is not None:
-            progress(i, n, f"Malus scan: analyzer {a:.1f} deg ({i + 1}/{n}{eta(t_run, i, n)})")
-        # the starting setting: predicted from the points so far
-        if autorange and len(I) >= 3:
-            f_ = malus_fit(th, I, S)
-            r = math.radians(a)
-            pred = f_["a0"] + f_["c2"] * math.cos(2 * r) + f_["s2"] * math.sin(2 * r)
-            setting = finest_for(min(0.5 * pred, z) - spread, 1.6 * pred + spread)
-        else:
-            setting = coarse
-        move = float(a) % 360.0
-        for _try in range(6):
-            t, s_ = br._acquire(move, setting)
-            move = None                       # retries at the same angle
-            mwin = (t >= w[0]) & (t <= w[1])
-            x = s_["PD"][:, mwin]
-            lo, hi = float(x.min()), float(x.max())
-            side = br._clip_side(s_["PD"], setting, t, w) if setting != coarse else None
-            if side == "low":
-                z = lo - 1.5 * setting[0]
-                setting = range_setting(setting[0], z)
-                continue
-            if side == "high":
-                ss = settings()
-                setting = ss[min(ss.index(setting) + 1, len(ss) - 1)]
-                continue
-            if autorange:
-                best = finest_for(lo, hi)
-                ss = settings()
-                if setting in ss and ss.index(best) <= ss.index(setting) - 2:
-                    setting = best            # two or more steps finer: worth a re-read
+    # every setting tried is the PD's; it goes back to the one it had
+    # (7 Oct 2026: left at 5 mV/div, the next ramp scan clipped)
+    try:
+        for i, a in enumerate(angles):
+            if progress is not None:
+                progress(i, n, f"Malus scan: analyzer {a:.1f} deg ({i + 1}/{n}{eta(t_run, i, n)})")
+            # the starting setting: predicted from the points so far
+            if autorange and len(I) >= 3:
+                f_ = malus_fit(th, I, S)
+                r = math.radians(a)
+                pred = f_["a0"] + f_["c2"] * math.cos(2 * r) + f_["s2"] * math.sin(2 * r)
+                setting = finest_for(min(0.5 * pred, z) - spread, 1.6 * pred + spread)
+            else:
+                setting = coarse
+            move = float(a) % 360.0
+            for _try in range(6):
+                t, s_ = br._acquire(move, setting)
+                move = None                       # retries at the same angle
+                mwin = (t >= w[0]) & (t <= w[1])
+                x = s_["PD"][:, mwin]
+                lo, hi = float(x.min()), float(x.max())
+                side = br._clip_side(s_["PD"], setting, t, w) if setting != coarse else None
+                if side == "low":
+                    z = lo - 1.5 * setting[0]
+                    setting = range_setting(setting[0], z)
                     continue
-            break
-        m_, se = br._window(t, s_["PD"], w)
-        spread = max(spread * 0.5, hi - lo)
-        th.append(float(a))
-        I.append(m_)
-        S.append(max(se, 1e-7))
-        keys.append(_key(setting))
-        vd.append(setting[0])
-        rng.append(list(setting))
-        log(f"  analyzer {a:7.2f}: PD {m_*1e3:10.3f} +- {se*1e3:.3f} mV raw at "
-            f"{setting[0]*1e3:g} mV/div")
+                if side == "high":
+                    ss = settings()
+                    setting = ss[min(ss.index(setting) + 1, len(ss) - 1)]
+                    continue
+                if autorange:
+                    best = finest_for(lo, hi)
+                    ss = settings()
+                    if setting in ss and ss.index(best) <= ss.index(setting) - 2:
+                        setting = best            # two or more steps finer: worth a re-read
+                        continue
+                break
+            m_, se = br._window(t, s_["PD"], w)
+            spread = max(spread * 0.5, hi - lo)
+            th.append(float(a))
+            I.append(m_)
+            S.append(max(se, 1e-7))
+            keys.append(_key(setting))
+            vd.append(setting[0])
+            rng.append(list(setting))
+            log(f"  analyzer {a:7.2f}: PD {m_*1e3:10.3f} +- {se*1e3:.3f} mV raw at "
+                f"{setting[0]*1e3:g} mV/div")
+    finally:
+        link.set_channel(pd, *coarse)
     if progress is not None:
         progress(n, n, "Malus scan done")
     out = {"kind": "scan", "theta": th, "I_raw": I, "sem": S, "keys": keys, "vdivs": vd,
@@ -1100,15 +1105,22 @@ def measure_offsets(link, rot, roles, keys_settings, window_s, plan, log=print,
     br.pd_only = True
     w = window_s if window_s is not None else (-1e9, 1e9)
     out, t_run, n = {}, time.time(), len(keys_settings)
-    for i, (key, setting) in enumerate(sorted(keys_settings.items())):
-        if progress is not None:
-            progress(i, n, f"{label} at {setting[0]*1e3:g} mV/div ({i + 1}/{n}"
-                           f"{eta(t_run, i, n)})")
-        t, s_ = br._acquire(None, tuple(setting))
-        m_, se = br._window(t, s_["PD"], w)
-        out[key] = {"level": m_, "sem": se, "n": int(s_["PD"].shape[0])}
-        log(f"  {label} at {setting[0]*1e3:g} mV/div, offset {setting[1]*1e3:+.1f} mV: "
-            f"{m_*1e3:+.3f} +- {se*1e3:.3f} mV")
+    pd = roles["PD"]
+    saved = link.channel_state([pd])[pd]
+    try:
+        for i, (key, setting) in enumerate(sorted(keys_settings.items())):
+            if progress is not None:
+                progress(i, n, f"{label} at {setting[0]*1e3:g} mV/div ({i + 1}/{n}"
+                               f"{eta(t_run, i, n)})")
+            t, s_ = br._acquire(None, tuple(setting))
+            m_, se = br._window(t, s_["PD"], w)
+            out[key] = {"level": m_, "sem": se, "n": int(s_["PD"].shape[0])}
+            log(f"  {label} at {setting[0]*1e3:g} mV/div, offset {setting[1]*1e3:+.1f} mV: "
+                f"{m_*1e3:+.3f} +- {se*1e3:.3f} mV")
+    finally:
+        # the PD back where it was (it was left at the last setting read, and
+        # the next ramp scan clipped - 7 Oct 2026)
+        link.set_channel(pd, *saved)
     if progress is not None:
         progress(n, n, f"{label} done")
     return out

@@ -810,10 +810,84 @@ def main():
     check("a ramp scan with the AWG playing: the manifest says this window's AWG drives",
           (man.get("drive") or {}).get("label", "").startswith("ramp to 60")
           and man["drive"]["dry_run_passed"] and all(app.bench.awg_on.values())
-          and app.result["pol"] is not None, man.get("drive", {}).get("label"))
+          and app.result["pol"] is not None
+          and 55 < float(np.max(np.abs(app.result["pol"]["rotation"]))) < 65,
+          (man.get("drive", {}).get("label"),
+           app.result and float(np.max(np.abs(app.result["pol"]["rotation"])))))
+    check("the AWG-hold Find put the PD's V/div back (the scan was not clipped)",
+          man["steps"][0]["scales"][str(app.result["d"].roles["PD"])][0] == 1.0,
+          man["steps"][0]["scales"])
     row = [r for r in lablog.read(app.outdir.get()) if r["name"] == "awg_driven"]
     check("... and so does its lab-log row", row and row[0]["ilc"].startswith("AWG (this window)"),
           row and row[0]["ilc"])
+
+    # saving a figure: a name and the scan's saved_figures folder filled in
+    asked = {}
+
+    def fake_save(**k):
+        asked.update(k)
+        return os.path.join(k["initialdir"], k["initialfile"])
+    gui.filedialog.asksaveasfilename = fake_save
+    app.nb.select(app.fig_ext._frame)
+    root.update()
+    app.fig_ext._toolbar._buttons["Save"].invoke()
+    root.update()
+    check("Save (toolbar): the scan's saved_figures folder and a filled-in name",
+          asked.get("initialdir") == os.path.join(app.result["d"].folder, "saved_figures")
+          and asked.get("initialfile", "").startswith("awg_driven_Extinction_vs_")
+          and os.path.isfile(os.path.join(asked["initialdir"], asked["initialfile"])),
+          f"{asked.get('initialdir')} | {asked.get('initialfile')}")
+
+    print("\nAWG sequence: X1 / X2 end points, one ramp scan each, with the analyzer")
+    app.av["seq_x1"].set("30")
+    app.av["seq_x2"].set("0, 30")
+    app.a_choice["seq_how"].set("pairs")
+    app.a_choice["seq_order"].set(gui.SEQ_ORDERS[0])
+    root.update()
+    check("the sequence is listed under its fields", app.awg_seq_lbl.cget("text").startswith("2 ramps"),
+          app.awg_seq_lbl.cget("text"))
+    app.scan_name.set("seq test")
+    app.do_seq_start()               # not dry-run yet: asks, then dry-runs all (stubbed yes)
+    settle(root, app, timeout=300)
+    s_ = app.awg_sess
+    _c = app.gather()
+    _e, waves_, _f = app._seq_waves(_c)
+    check("Start asks for the dry run first; both ramps then pass it",
+          all(s_.is_verified(w) for w in waves_), [w.label for w in waves_])
+    app.do_seq_start()
+    settle(root, app, timeout=600)
+    import json as _js
+    mans = {}
+    for n_ in ("seq_test_X1_30_X2_0", "seq_test_X1_30_X2_30"):
+        mp_ = os.path.join(app.outdir.get(), n_, f"{n_}_scan.json")
+        mans[n_] = _js.load(open(mp_, encoding="utf-8")) if os.path.isfile(mp_) else {}
+    ok_ = all(m and all(x["status"] == "done" for x in m["steps"]) for m in mans.values())
+    check("two ramp scans, every step measured, each recording its own end points",
+          ok_ and [m["drive"]["ends_deg"] for m in mans.values()] == [{"X1": 30.0, "X2": 0.0},
+                                                                     {"X1": 30.0, "X2": 30.0}],
+          {k: (m.get("drive") or {}).get("ends_deg") for k, m in mans.items()})
+    second = mans["seq_test_X1_30_X2_30"]
+    check("interleaved: the analyzer stayed put for the second ramp at each angle",
+          all(x.get("stayed") for x in second["steps"] if x["kind"] == "scan"))
+    check("the AWG is parked at the end, on the ILC's 11 ms record",
+          s_.parked and abs(s_.wave.period - 11.002e-3) < 1e-9 and all(app.bench.awg_on.values()))
+    rots = {r["d"].name: float(np.max(np.abs(r["pol"]["rotation"]))) for r, _c2 in app._compared()}
+    rots.update({app.result["d"].name: float(np.max(np.abs(app.result["pol"]["rotation"])))}
+                if app.result else {})
+    check("both in the Compare tab afterwards, at their own rotations (30 and 60 deg)",
+          len(app.cmp_sel) == 2 and sorted(round(abs(v)) for k, v in rots.items()
+                                           if k.startswith("seq_test")) == [30, 60], rots)
+    # nothing loaded, scans compared: the Compare tab and the overlay tabs draw them
+    saved_res = app.result
+    app.result = None
+    app.redraw(app.fig_cmp)
+    check("nothing loaded: Compare draws the compared scans, the difference from the first",
+          len(app.fig_cmp.axes) == 3, len(app.fig_cmp.axes))
+    app.redraw(app.fig_ext)
+    t_ = app.fig_ext.axes[0].get_title() if app.fig_ext.axes else ""
+    check("nothing loaded: Extinction draws the first compared scan and the other",
+          t_.startswith("Extinction ratio along the ramp (seq_test") and "with 1 compared" in t_, t_)
+    app.result = saved_res
     # the record follows its parts; the scope's span is set apart
     app.av["hold_ms"].set("19")
     app.av["tail_ms"].set("0.5")

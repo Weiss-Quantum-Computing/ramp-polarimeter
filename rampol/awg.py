@@ -86,6 +86,7 @@ class Wave:
         self.label, self.hold, self.rotation = label, hold, rotation
         self.target = target or {}
         self.source, self.files = source, files or {}
+        self.ends = None          # a sequence ramp: {EO1, EO2} end points, deg
 
     @property
     def n(self):
@@ -117,12 +118,14 @@ def record_ms(p):
     return sum(float(p[k]) for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms"))
 
 
-def ramp_hold(rotation_deg, p, idle=None, chan=None):
+def ramp_hold(rotation_deg, p, idle=None, chan=None, ends=None):
     """Idle -> the commanded rotation -> idle: `lead` at idle, `rise` edge,
     hold, `fall` edge, `after` (tail_ms) at idle - the record is their sum,
     on a `dt_us` grid (N = record / dt + 1, EOM-ILC's convention: 11 ms ->
     5501). The rotation is split split : 1 - split between EO1 and EO2
-    (awg_volts) and is relative to idle. Both ends are exactly idle."""
+    (awg_volts) and is relative to idle. Both ends are exactly idle.
+    ends={'EO1': deg, 'EO2': deg}: each crystal's own end point instead
+    (rotation and split are then ignored)."""
     p = dict(DEFAULTS, **(p or {}))
     idle = idle or {"EO1": 0.0, "EO2": 0.0}
     split = float(p["split"])
@@ -145,13 +148,44 @@ def ramp_hold(rotation_deg, p, idle=None, chan=None):
         # the fall's first sample is the hold level, its last just above 0
         prof[nl + nr + nh:nl + nr + nh + nf] = 1.0 - edge(nf, p["edge"])
     prof[[0, -1]] = 0.0
-    amps = biasmod.awg_volts(rotation_deg, split, **({"chan": chan} if chan else {}))
+    kw = {"chan": chan} if chan else {}
+    if ends is not None:
+        e1, e2 = float(ends["EO1"]), float(ends["EO2"])
+        amps = {"EO1": biasmod.awg_volts(e1, 1.0, **kw)["EO1"],
+                "EO2": biasmod.awg_volts(e2, 0.0, **kw)["EO2"]}
+        what = f"X1 {e1:g} / X2 {e2:g} deg"
+        rotation_deg = e1 + e2
+    else:
+        amps = biasmod.awg_volts(rotation_deg, split, **kw)
+        what = f"{rotation_deg:g} deg"
     u = {k: float(idle.get(k, 0.0)) + amps[k] * prof for k in CHANNELS}
     t = np.arange(n) * dt
     hold = ((nl + nr) * dt, (nl + nr + nh) * dt)
-    return Wave(t, u, dt, f"ramp to {rotation_deg:g} deg ({p['edge']} edges "
-                f"{p['rise_ms']:g}/{p['fall_ms']:g} ms, hold {p['hold_ms']:g} ms)",
-                hold=hold, rotation=float(rotation_deg), source="ramp")
+    w = Wave(t, u, dt, f"ramp to {what} ({p['edge']} edges "
+             f"{p['rise_ms']:g}/{p['fall_ms']:g} ms, hold {p['hold_ms']:g} ms)",
+             hold=hold, rotation=float(rotation_deg), source="ramp")
+    w.ends = None if ends is None else {"EO1": e1, "EO2": e2}
+    return w
+
+
+def parse_ends(x1, x2, how="pairs"):
+    """The (X1, X2) end points of a sequence, deg. Each list is
+    start:stop:step or comma-separated. 'pairs': taken together (a list of
+    one goes with every entry of the other); 'grid': every X1 with every
+    X2, X1 the outer loop."""
+    a, b = biasmod.parse_biases(x1), biasmod.parse_biases(x2)
+    if not a or not b:
+        raise ValueError("give X1 and X2 end points (deg)")
+    if how == "grid":
+        return [(p, q) for p in a for q in b]
+    if len(a) == 1:
+        a = a * len(b)
+    if len(b) == 1:
+        b = b * len(a)
+    if len(a) != len(b):
+        raise ValueError(f"{len(a)} X1 and {len(b)} X2 end points: pairs need as many of "
+                         f"each (or one of either), or choose 'grid'")
+    return list(zip(a, b))
 
 
 def idle_flat(idle, like):
