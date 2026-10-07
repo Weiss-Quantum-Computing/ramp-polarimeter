@@ -173,6 +173,21 @@ sign (not built in yet).
    A scan records the spin-echo sequence fields with its plan when its
    preset is built from them.
 
+   **Stray light at a fine V/div** (on by default, 5 mV/div): when the
+   scan measures both a dark and a background, each prompt also reads its
+   kind at that V/div (0 V one division below centre). There the scope's
+   offset error is the same in both and cancels, and background - dark is
+   the stray light to ~0.05 mV - at 1 V/div each is +-1.2-1.5 mV and their
+   difference said nothing (a background 0.83 mV below the dark, 7 Oct).
+   What is subtracted is then the offset at the scan's V/div (from the dark
+   there and from the background there minus the stray light, weighted by
+   their errors) plus the stray light; the corrections line shows each
+   part. With the background reused, the newest such pair is reused too.
+   A dark or background at another V/div gets files of its own
+   (`<name>_bg_5mVdiv_001`): before 7 Oct 2026 it took the scan's own
+   names and wrote over them (null refine's background did; no bench scan
+   had one).
+
    **Rename / edit...** (next to the Scan box) corrects the shown scan
    after the fact: its name, the preset and spin-echo sequence it actually
    ran (leg spacing, motion, before / after), and notes. A rename moves the
@@ -521,7 +536,7 @@ at the same TIME, which means the same thing only for the same sequence.
 | Traces | PD at every analyzer angle (colour = angle), dark dashed; monitors below |
 | Map | I(t, theta) / Imax(t), with the fitted null psi + 90 drawn over it; or the Malus-fit residual (mV, or per standard error) per angle and time, with the rms per angle beside it: a bad angle, clipping, a missed lock or drift shows as a row or a patch |
 | Malus | I vs analyzer angle at the cursor time, the fit, residuals |
-| Angle | rotation from rest with +-1 SD, the monitor prediction, their difference in mdeg |
+| Angle | rotation from rest with +-1 SD, the monitor prediction (zero at rest before the first motion, like the light), their difference in mdeg - so it starts at zero and shows where they part; with *compare scans*, each compared scan's rotation and its own light - monitors (a hold-time series side by side). Before 7 Oct 2026 the offset was the whole record's mean difference, which long holds pulled 0.35-0.8 deg off at rest |
 | Extinction | the extinction ratio along the record by method (marker): measured at a crossing (circles), dip fit (triangles), measured static (squares; grey hollow where the angle was too far from crossed), null refine (diamonds), the per-sample Malus fit as a grey line with its drift limit; colour = leg (first / second transport, shaded on the time axis), filled = on a ramp out from rest, hollow = on the ramp back, half-filled = standing still (rest, hold, after) - taken from the point's segment; +-1 sigma bars (asymmetric: ER goes as 1/Imin); a lower bound is its marker with a dotted line going up (not an arrow: its head read as the dip fit's triangle) (the true ER is above it; a method with smaller noise gives a higher bound for the same unresolved Imin, so dip-fit bounds sit above the measured ones), hidden by unticking *lower bounds*. *What are these?* opens the explanation of every family. x = time or rotation (rotation lines the two legs up). **Export CSV... / Copy CSV**: every value as a table (`analysis.er_csv`) - method, leg, direction, time, rotation, analyzer angle, ER, +-1 sigma, lower-bound flag, Imin, Imax, and the per-sample fit's ER in 2-deg rotation bins - under a '#' header saying what the scan was, what was subtracted, the crossings' Imin spread across analyzer angles and the ER it limits to, and the drift limit; `pandas.read_csv(path, comment='#')` reads it |
 | Poincaré | the linear Stokes parameters in the rest frame on the sphere (coloured by time), |S3| and the ellipticity angle chi vs time assuming full polarization (handedness not measured), the ellipse at the cursor against the rest ellipse |
 | Diagnostics | ref returns vs time, per-angle transmission (or 1-theta and 4-theta amplitudes with it off), residual vs block SEM, landing error and off-screen samples per step; a line under each panel says what it shows and what it should look like |

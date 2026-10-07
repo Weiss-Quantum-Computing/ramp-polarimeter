@@ -139,6 +139,10 @@ def scan_checks(sg):
     mon = an.monitor_prediction(d, pol, config.DEG_PER_MON_V)
     check("monitor prediction tracks the light", mon is not None and np.std(mon[1]) < 0.05,
           f"{np.std(mon[1]) * 1e3:.1f} mdeg rms")
+    first = next(s_ for s_ in an.segments(pol["t"], pol["rotation"]) if s_["base"] in ("up", "down"))
+    pre = pol["t"] < first["t0"] - 0.2e-3
+    check("light - monitors is zero at rest (the offset is matched there, not over the record)",
+          abs(np.mean(mon[1][pre])) < 1e-9, f"{np.mean(mon[1][pre]) * 1e3:.3f} mdeg")
     check("windows parse", an.parse_windows("-1.5-0.5, 4.8-5.6") == [(-1.5e-3, 0.5e-3), (4.8e-3, 5.6e-3)])
 
 

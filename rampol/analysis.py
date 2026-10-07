@@ -303,13 +303,73 @@ def offset_levels(d, vdiv=None):
     return out
 
 
+def _step_level(d, s):
+    y = s["v"]["PD"]
+    return float(np.mean(y)), float(np.mean(s["sem"]["PD"]) / np.sqrt(len(y) / 20))
+
+
+def stray_light(d):
+    """Stray light on the PD = background - dark, from a pair taken at the
+    same V/div and offset - the finest such pair of this scan's own steps,
+    else what its manifest borrowed ('stray'). At 1 V/div each of the two is
+    +-1.2-1.5 mV (7 Oct 2026) and their difference says nothing; at a few
+    mV/div it is known to ~0.05 mV, and the scope's offset error, the same
+    in both, cancels. Returns info (level, sem, vdiv, offset, source,
+    measured, dark, background) or None."""
+    pairs = {}
+    for s in d.steps:
+        if s["kind"] in OFFSET_KINDS and "PD" in s.get("v", {}):
+            v, off = _scale_of(d, s)[:2]
+            if np.isfinite(v):
+                pairs.setdefault((round(float(v), 9), round(float(off), 5)), {})[s["kind"]] = s
+    full = [(v, off, p) for (v, off), p in pairs.items() if len(p) == 2]
+    if full:
+        v, off, p = min(full, key=lambda x: x[0])
+        lb, sb = _step_level(d, p["background"])
+        ld, sd = _step_level(d, p["dark"])
+        return {"level": lb - ld, "sem": float(np.hypot(sb, sd)), "vdiv": v, "offset": off,
+                "source": "this scan", "measured": p["background"].get("t_start", ""),
+                "dark": ld, "background": lb}
+    b = (d.manifest.get("borrowed") or {}).get("stray")
+    return dict(b) if b else None
+
+
 def dark_level(d, vdiv=None):
-    """What is subtracted from the PD: (level V, info) - the background if
-    there is one, else the dark, own steps before borrowed ones; (0.0, None)
-    when there is neither or d.subtract_dark is off."""
+    """What is subtracted from the PD: (level V, info).
+
+    With a stray-light pair at a V/div at least 4x finer than `vdiv`
+    (stray_light): the scope's offset at `vdiv` - from the dark there and
+    from the background there minus the stray light, inverse-variance
+    weighted when both exist - plus the stray light. Otherwise the
+    background if there is one, else the dark, own steps before borrowed
+    ones. (0.0, None) when there is nothing or d.subtract_dark is off."""
     if not getattr(d, "subtract_dark", True):
         return 0.0, None
     lv = offset_levels(d, vdiv)
+    st = stray_light(d)
+    if st and vdiv and np.isfinite(st.get("vdiv", np.nan)) and st["vdiv"] * 4 <= vdiv:
+        ests = []
+        for k in ("dark", "background"):
+            e = lv.get(k)
+            v = e and e.get("vdiv")
+            if not e or not v or not np.isfinite(v) or abs(np.log(v / vdiv)) > 1e-6:
+                continue
+            ests.append((e["level"] - (st["level"] if k == "background" else 0.0),
+                         e.get("sem") or 0.0, k, e))
+        if ests:
+            sems = np.array([x[1] for x in ests])
+            w = 1 / sems ** 2 if np.all(sems > 0) else np.ones(len(ests))
+            O = float(np.sum(w * [x[0] for x in ests]) / np.sum(w))
+            sO = float(1 / np.sqrt(np.sum(w))) if np.all(sems > 0) else float(np.max(sems))
+            srcs = sorted({x[3]["source"] for x in ests} | {st["source"]})
+            info = {"kind": "dark + stray light", "level": O + st["level"],
+                    "sem": float(np.hypot(sO, st["sem"])), "offset_est": O, "offset_sem": sO,
+                    "from": [x[2] for x in ests], "stray": st, "vdiv": vdiv,
+                    "offset": ests[0][3].get("offset"),
+                    "source": "this scan" if srcs == ["this scan"] else " + ".join(srcs),
+                    "what": "the scope / PD offset at this V/div plus the stray light "
+                            "read at a fine V/div"}
+            return float(info["level"]), info
 
     def dist(info):
         # a measurement at another V/div is the wrong one (the scope's offset
@@ -348,8 +408,18 @@ def corrections_summary(d, pol=None):
     else:
         src = "" if info["source"] == "this scan" else f" from {info['source']}"
         old = " (beam blocked: a scan before 6 Oct 2026)" if "before 6 Oct" in info["what"] else ""
-        parts.append(f"subtract {info['kind']}{old} {sub*1e3:+.2f} mV{src}")
-    if "dark" in lv and "background" in lv:
+        if info["kind"] == "dark + stray light":
+            st = info["stray"]
+            out["light"], out["light_sem"] = st["level"], st["sem"]
+            parts.append(
+                f"subtract {sub*1e3:+.2f} +- {info['sem']*1e3:.2f} mV{src} = offset at "
+                f"{info['vdiv']:g} V/div {info['offset_est']*1e3:+.2f} +- "
+                f"{info['offset_sem']*1e3:.2f} (from the {' and '.join(info['from'])}) + stray "
+                f"light {st['level']*1e3:+.3f} +- {st['sem']*1e3:.3f} mV (read at "
+                f"{st['vdiv']*1e3:g} mV/div)")
+        else:
+            parts.append(f"subtract {info['kind']}{old} {sub*1e3:+.2f} mV{src}")
+    if "dark" in lv and "background" in lv and not (info and info["kind"] == "dark + stray light"):
         out["light"] = lv["background"]["level"] - lv["dark"]["level"]
         # with its error: at 1 V/div the two are each ~1.3 mV uncertain, and
         # a background below the dark (7 Oct 2026: -0.83 mV) is that noise
@@ -403,6 +473,67 @@ def step_shots(d, step, load_capture, trim=10):
             out.setdefault(role, []).append(data[:n, j])
         files.append(f)
     return t, {r: np.array([y[:len(t)] for y in v]) for r, v in out.items()}, files
+
+
+def find_stray(outdir, load_capture, finer_than, exclude=None):
+    """The newest stray-light pair (dark and background at one V/div and
+    offset, the V/div at least 4x finer than `finer_than`) among the scans
+    in outdir: an info dict for a manifest's borrowed['stray'], or None."""
+    best = None
+    try:
+        names = os.listdir(outdir)
+    except OSError:
+        return None
+    for name in names:
+        folder = os.path.join(outdir, name)
+        mp = os.path.join(folder, f"{name}_scan.json")
+        if not os.path.isfile(mp) or (exclude and os.path.normcase(folder) ==
+                                      os.path.normcase(exclude)):
+            continue
+        try:
+            with open(mp, encoding="utf-8") as fh:
+                man = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not man.get("offsets_v2"):
+            continue                       # before 6 Oct 2026 'dark' was beam-blocked
+        pd_ch = str(next((k for k, v in man.get("channels", {}).items()
+                          if v.get("role") == "PD"), ""))
+        pairs = {}
+        for s in man.get("steps", []):
+            if s.get("kind") in OFFSET_KINDS and s.get("status") == "done" and s.get("files"):
+                v, off = (s.get("scales", {}).get(pd_ch) or [np.nan, np.nan])[:2]
+                if np.isfinite(v) and v * 4 <= finer_than:
+                    pairs.setdefault((round(v, 9), round(off, 5)), {})[s["kind"]] = s
+        for (v, off), p in pairs.items():
+            if len(p) < 2:
+                continue
+            lev = {}
+            for k, s in p.items():
+                ys = []
+                for f in s["files"]:
+                    try:
+                        cols, data = load_capture(os.path.join(folder, f))
+                    except Exception:
+                        continue
+                    j = next((i for i, c in enumerate(cols)
+                              if c.startswith(f"CH{pd_ch}_") or c == f"CH{pd_ch}_V"), None)
+                    if j is not None:
+                        ys.append(float(np.mean(data[10:, j])))
+                if not ys:
+                    break
+                lev[k] = (float(np.mean(ys)), float(np.std(ys, ddof=1) / np.sqrt(len(ys)))
+                          if len(ys) > 1 else 0.0)
+            if len(lev) < 2:
+                continue
+            when = p["background"].get("t_start", man.get("created", ""))
+            if best is None or when > best["measured"]:
+                best = {"level": lev["background"][0] - lev["dark"][0],
+                        "sem": float(np.hypot(lev["background"][1], lev["dark"][1])),
+                        "vdiv": float(v), "offset": float(off),
+                        "source": man.get("name", name), "measured": when,
+                        "dark": lev["dark"][0], "background": lev["background"][0]}
+    return best
 
 
 def find_offsets(outdir, vdiv, offset, load_capture, kinds=OFFSET_KINDS,
@@ -1341,9 +1472,16 @@ def refine_result(d, pol, polarizer_er=None):
 
 def monitor_prediction(d, pol, deg_per_mon_v):
     """Rotation predicted from the Trek monitors, sum_i k_i V_i(t) averaged
-    over the scan steps, with its sign and offset matched to the measured
-    rotation by least squares (the light fixes neither). Returns
-    (pred_rotation, residual, sign) or None without monitors."""
+    over the scan steps. Its sign comes from the light (least squares); its
+    offset makes it zero at rest before the first motion, where the light's
+    rotation is zero by definition - so light - monitors starts at zero and
+    shows where they part. Returns (pred_rotation, residual, sign) or None
+    without monitors.
+
+    Before 7 Oct 2026 the offset was the whole record's mean difference.
+    With long holds the light creeps away from the monitors (-20..-33
+    mdeg/ms at -180 deg) and stays off for ~100 ms after the ramp back, and
+    that mean moved the rest by 0.35 deg (20 ms holds) to 0.8 deg (50 ms)."""
     roles = [r for r in ("MonX1", "MonX2") if r in d.roles]
     if not roles:
         return None
@@ -1352,10 +1490,16 @@ def monitor_prediction(d, pol, deg_per_mon_v):
     for r in roles:
         k = float(deg_per_mon_v.get(r, 0.0))
         pred += k * np.mean([s["v"][r] for s in steps if r in s["v"]], axis=0)
+    segs = segments(pol["t"], pol["rotation"])
+    t = pol["t"]
+    first = next((s for s in segs if s["base"] in ("up", "down")), None)
+    rest = (t < first["t0"] - 0.2e-3) if first else np.ones(len(t), bool)
+    if rest.sum() < 10:
+        rest = np.ones(len(t), bool)       # no rest before the first motion
     best = None
     for sign in (1.0, -1.0):
         p = sign * pred
-        c = float(np.mean(pol["rotation"] - p))
+        c = float(np.mean(pol["rotation"][rest] - p[rest]))
         res = pol["rotation"] - (p + c)
         cost = float(np.mean(res ** 2))
         if best is None or cost < best[0]:

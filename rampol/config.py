@@ -225,6 +225,10 @@ DEFAULTS = {
         # from another scan) / none. Background = beam blocked (subtracted when
         # there is one); dark = PD covered (shows the stray light apart)
         "dark_mode": "none", "bg_mode": "measure",
+        # with both measured: each also read at this fine PD V/div, where
+        # background - dark is the stray light to ~0.05 mV (at 1 V/div each
+        # is +-1.3 mV); with the background reused, the latest such pair is
+        "stray_on": True, "stray_vdiv": 0.005,
         "backoff_deg": 3.0,       # approach every angle from below by this much
         "points": 100000,         # single-shot readout points
         "wait_s": 30.0,           # trigger stall limit (> the repetition period)

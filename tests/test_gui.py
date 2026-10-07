@@ -371,6 +371,46 @@ def main():
     app.reanalyse()
     settle(root, app)
 
+    print("\nstray light read at a fine V/div")
+    app.scan_name.set("stray test")
+    app.dark_mode.set("measure")
+    app.bg_mode.set("measure")
+    app.stray_on.set(True)
+    app.stray_vdiv.set("5")
+    for k, v in {"start": "0", "stop": "90", "step": "30", "ref_every": "0",
+                 "shots": "8", "blocks": "4"}.items():
+        app.sv[k].set(v)
+    scope_ = app._sim_parts[0]
+    scope_.offset_err = -0.013               # the bench's: -35 mV at a 2.7 V offset
+    app.bench.ambient = 0.004
+    app.do_start_scan()
+    settle(root, app, timeout=300)
+    scope_.offset_err = 0.0
+    res = app.result
+    st = an.stray_light(res["d"])
+    check("stray light: dark and background also read at 5 mV/div, their difference "
+          "is the 4 mV on the bench", st is not None and abs(st["vdiv"] - 0.005) < 1e-9
+          and abs(st["level"] - 0.004) < 0.3e-3 and st["sem"] < 0.2e-3,
+          st and f"{st['level']*1e3:.3f} +- {st['sem']*1e3:.3f} mV")
+    sub, info = an.dark_level(res["d"], an._pd_vdiv(res["d"], "scan"))
+    off_ = [s_ for s_ in res["d"].steps if s_["kind"] == "dark" and "pd_scale" not in s_][0]
+    o_set = an._scale_of(res["d"], off_)[1]
+    want = app.bench.dark + 0.004 - 0.013 * o_set
+    check("subtracted: the offset at the scan's V/div plus the fine stray light",
+          info is not None and info["kind"] == "dark + stray light" and abs(sub - want) < 3e-3,
+          info and f"{sub*1e3:.2f} mV vs {want*1e3:.2f}; {app.corr_label.cget('text')[:170]}")
+    names_ = sorted(os.listdir(res["d"].folder))
+    check("the fine dark / background have files of their own",
+          any(n_.startswith("stray_test_dark_5mVdiv_") for n_ in names_)
+          and any(n_.startswith("stray_test_dark_0") for n_ in names_), names_[:6])
+    app.bench.ambient = 0.0
+    app.dark_mode.set("measure")
+    app.bg_mode.set("reuse latest")
+    # the rest of the test works on gui_test_2
+    app.refresh_scan_list(select="gui_test_2")
+    app.do_load_shown()
+    settle(root, app)
+
     print("\nextinction with the direct points, residual map, Poincare")
     app.nb.select(app.fig_ext._frame)
     root.update()

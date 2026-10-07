@@ -317,6 +317,10 @@ def make_scope_class(sg):
             # (the PD) and 0.012 div here (12 uV at 1 mV/div) - which the
             # window's simulator uses (gui.ensure_sim) and test_bias sets.
             self.noise_per_div = 0.0
+            # the scope's offset error as a fraction of the offset setting
+            # (the bench's: about -1.3 %, -35 mV at a 2.7 V offset; 0 here
+            # unless a test asks for it)
+            self.offset_err = 0.0
 
         def connect(self, addr=None):
             p = self.prof
@@ -422,6 +426,7 @@ def make_scope_class(sg):
             if self.noise_per_div and self.roles.get(channel) == "PD":
                 v = v + self.bench.rng.normal(0, self.noise_per_div * scale
                                               / math.sqrt(max(shots, 1)), v.size)
+            v = v + self.offset_err * off
             # per-code error pattern, smeared by noise when averaged
             smear = math.exp(-0.5 * (2 * math.pi * 0.012 / code) ** 2) if shots > 1 else 1.0
             v = v + 0.0017 * scale * smear * np.sin(2 * np.pi * (v - off) / code)

@@ -7,6 +7,9 @@ A scan is a folder <outdir>/<name>/ holding
     <name>_ref003_001.npz/.txt   returns to the reference angle (drift)
     <name>_dark_001.npz/.txt     PD covered (before 6 Oct 2026: beam blocked)
     <name>_bg_001.npz/.txt       beam blocked, room as during the scan
+    <name>_bg_5mVdiv_001...      one taken at another PD V/div (stray light,
+                                 null refine): its own name, so it does not
+                                 overwrite the scan's own
     <name>_n1_a137.25_001...     null-refine captures for window 1
 The capture names split as Scope Grab expects (prefix_NNN), so its Compare box
 opens any angle: KEY:RUNS with KEY = <name>_a045.00.
@@ -226,10 +229,16 @@ def build_steps(angles, ref_every=0, ref_angle=45.0):
 
 def stem(name, step):
     kind = step["kind"]
-    if kind == "dark":
-        return f"{name}_dark"
-    if kind == "background":
-        return f"{name}_bg"
+    if kind in ("dark", "background"):
+        base = f"{name}_dark" if kind == "dark" else f"{name}_bg"
+        # A dark / background at its own PD V/div (stray light, null refine)
+        # is named for it. Before 7 Oct 2026 it was not, and it wrote over
+        # the scan's own files of that kind - both steps then read the last
+        # one written (found by the stray-light test; no bench scan had one).
+        ps = step.get("pd_scale")
+        if ps:
+            return f"{base}_{float(ps['vdiv']) * 1e3:g}mVdiv".replace(".", "p")
+        return base
     if kind == "ref":
         return f"{name}_ref{step['ref']:03d}"
     a = step["target"] % 360.0

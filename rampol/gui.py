@@ -426,6 +426,14 @@ class App:
                          values=("measure", "reuse latest", "none")).pack(side="left",
                                                                          padx=(2, 8))
         rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        self.stray_on = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rr, text="stray light at", variable=self.stray_on).pack(side="left")
+        self.stray_vdiv = tk.StringVar(value="5")
+        ttk.Entry(rr, textvariable=self.stray_vdiv, width=4).pack(side="left", padx=2)
+        ttk.Label(rr, text="mV/div (dark and background both read there too)",
+                  foreground="#666").pack(side="left")
+        rr = ttk.Frame(f)
         rr.pack(fill="x", padx=6, pady=(4, 2))
         self._btn(rr, "Check scope", self.do_check_scope)
         self._btn(rr, "Start scan", self.do_start_scan, padx=(4, 0))
@@ -1935,6 +1943,19 @@ class App:
             self.offsets_then(run, kinds, after)
         self.worker(lambda: run.run(kinds={kind}), done=undone)
 
+    def _stray_scale(self, c):
+        """The PD setting the stray light is read at, or None: the ramp
+        tab's mV/div, 0 V one division below centre (a PD a few mV
+        negative stays on screen)."""
+        s = c["scan"]
+        if not s.get("stray_on", True):
+            return None
+        pd = next((ch for ch, (r, _n) in cfgmod.channel_roles(c).items() if r == "PD"), None)
+        v = float(s.get("stray_vdiv", 0.005) or 0)
+        if pd is None or v <= 0:
+            return None
+        return {"ch": pd, "vdiv": v, "offset": 1.0 * v}
+
     def borrow_latest(self, run, kinds, then):
         """Worker: the newest dark/background of other scans at this PD
         V/div and offset, written into the run's manifest (borrowed)."""
@@ -1947,7 +1968,19 @@ class App:
             vdiv, off = self.link.channel_state([pd])[pd]
             found = an.find_offsets(outdir, vdiv, off, sg.load_capture, exclude=run.folder)
             got = {}
+            if "stray" in kinds:
+                st = an.find_stray(outdir, sg.load_capture, vdiv, exclude=run.folder)
+                if st is None:
+                    self.log(f"  no earlier stray-light pair (dark and background at a fine "
+                             f"V/div) in {outdir}")
+                else:
+                    got["stray"] = st
+                    self.log(f"  stray light: reusing {st['level']*1e3:+.3f} +- "
+                             f"{st['sem']*1e3:.3f} mV from {st['source']} (read at "
+                             f"{st['vdiv']*1e3:g} mV/div, {st['measured']})")
             for kind in kinds:
+                if kind == "stray":
+                    continue
                 f = next((x for x in found if x["kind"] == kind), None)
                 if f is None:
                     self.log(f"  no earlier {kind} at {vdiv:g} V/div, offset {off:+.4g} V in "
@@ -3024,6 +3057,8 @@ class App:
             v.set(str(s.get(k, "")))
         self.dark_mode.set(s.get("dark_mode", "none"))
         self.bg_mode.set(s.get("bg_mode", "measure"))
+        self.stray_on.set(bool(s.get("stray_on", True)))
+        self.stray_vdiv.set(f"{float(s.get('stray_vdiv', 0.005)) * 1e3:g}")
         for k, v in self.fv.items():
             v.set(str(c["find"].get(k, "")))
         self.find_kind.set(c["find"].get("kind", "min"))
@@ -3082,6 +3117,9 @@ class App:
                 pass
         s["order"], s["mode"] = self.order.get(), self.mode.get()
         s["dark_mode"], s["bg_mode"] = self.dark_mode.get(), self.bg_mode.get()
+        s["stray_on"] = bool(self.stray_on.get())
+        if _isnum(self.stray_vdiv.get()) and float(self.stray_vdiv.get()) > 0:
+            s["stray_vdiv"] = float(self.stray_vdiv.get()) * 1e-3
         fd = c["find"]
         for k, v in self.fv.items():
             fd[k] = v.get().strip()
@@ -3730,7 +3768,17 @@ class App:
         steps = scanmod.build_steps(angles, int(s["ref_every"]), s["ref_angle"])
         dm, bm = self.dark_mode.get(), self.bg_mode.get()
         pre = [k for k, m in (("dark", dm), ("background", bm)) if m == "measure"]
-        steps = [{"kind": k, "target": 0.0} for k in pre] + steps
+        offs = [{"kind": k, "target": 0.0} for k in pre]
+        stray = self._stray_scale(c) if len(pre) == 2 else None
+        if stray:
+            # each also read at a fine V/div, in the same prompt: their
+            # difference there is the stray light (dark_level). The order
+            # puts the fine background next to the fine dark.
+            offs = [{"kind": "dark", "target": 0.0}, {"kind": "dark", "target": 0.0,
+                                                      "pd_scale": stray},
+                    {"kind": "background", "target": 0.0, "pd_scale": stray},
+                    {"kind": "background", "target": 0.0}]
+        steps = offs + steps
         plan = dict(s, preset=c["preset"], software=f"rampol {__version__}",
                     dark_mode=dm, bg_mode=bm)
         if (cfgmod.PRESETS.get(c["preset"]) or {}).get("sequence"):
@@ -3741,6 +3789,8 @@ class App:
         self.run = run
         self.log(f"Scan {run.name}: {len(angles)} angles, {len(steps)} steps -> {run.folder}")
         reuse = [k for k, m in (("dark", dm), ("background", bm)) if m == "reuse latest"]
+        if bm == "reuse latest" and self._stray_scale(c):
+            reuse.append("stray")
 
         def start():
             self.worker(lambda: self._run_scan(run), done=self.scan_done)
@@ -4945,7 +4995,7 @@ class App:
         if res["mon"] is not None:
             # the monitors' green would read as a compared scan
             ax.plot(t, res["mon"][0], color="#2ca02c" if not ov else "0.4", lw=0.8, ls="--",
-                    label="from Trek monitors (offset matched)")
+                    label="from Trek monitors (zero at rest, like the light)")
         for r_, c_ in ov:
             tt_, rr_ = self._decimate(r_["d"].t, r_["pol"]["rotation"], 4000)
             ax.plot(tt_ * 1e3, rr_, color=c_, lw=0.8, label=r_["d"].name)
@@ -4957,7 +5007,13 @@ class App:
         self._cursor(ax)
         ax2 = fig.add_subplot(212, sharex=ax)
         if res["mon"] is not None:
-            ax2.plot(t, res["mon"][1] * 1e3, color="#2ca02c", lw=0.7, label="measured - monitor prediction")
+            ax2.plot(t, res["mon"][1] * 1e3, color="#2ca02c" if not ov else "#1f77b4", lw=0.7,
+                     label="measured - monitor prediction" + (f" ({d.name})" if ov else ""))
+        for r_, c_ in ov:
+            if r_.get("mon") is not None:
+                tt_, rr_ = self._decimate(r_["d"].t, self.smooth(r_["mon"][1], r_["d"].t) * 1e3,
+                                          4000)
+                ax2.plot(tt_ * 1e3, rr_, color=c_, lw=0.7, label=f"{r_['d'].name} (smoothed)")
         ax2.plot(t, sig * 1e3, color="k", lw=0.6, ls="--", label="+-1 SD of the fit")
         ax2.plot(t, -sig * 1e3, color="k", lw=0.6, ls="--")
         ax2.set_ylabel("difference (mdeg)")
