@@ -129,20 +129,26 @@ def rename(outdir, old, new, log=print):
                       f"whatever holds its files (a viewer, Excel, Explorer's preview "
                       f"pane, OneDrive syncing) and try again.") from exc
     log(f"Renamed {old} -> {new} ({len(done) - 1} files)")
-    # other scans that cite it by name: a borrowed dark / background
+    # scans that cite it by name: a borrowed dark / background, and a
+    # sequence's member list (its own included)
     for n in sorted(os.listdir(outdir)):
         p = os.path.join(outdir, n, f"{n}_scan.json")
-        if n == new or not os.path.isfile(p):
+        if not os.path.isfile(p):
             continue
         try:
             with open(p, encoding="utf-8") as fh:
                 m = json.load(fh)
             hit = [k for k, e in (m.get("borrowed") or {}).items()
-                   if isinstance(e, dict) and e.get("source") == old]
-            if hit:
-                for k in hit:
-                    m["borrowed"][k]["source"] = new
+                   if n != new and isinstance(e, dict) and e.get("source") == old]
+            for k in hit:
+                m["borrowed"][k]["source"] = new
+            ser = (m.get("plan") or {}).get("series") or {}
+            member = old in (ser.get("members") or [])
+            if member:
+                ser["members"] = [new if x == old else x for x in ser["members"]]
+            if hit or member:
                 _write_json(p, m)
+            if hit:
                 log(f"  {n}: borrowed {', '.join(hit)} now cites {new}")
         except (OSError, ValueError) as exc:
             log(f"  {n}: could not update its reference to {old} ({exc})")

@@ -1000,8 +1000,18 @@ def main():
     app.bg_mode.set("reuse latest")
     app.scan_name.set("seq reuse")
     app.link.scope.put(":TIMebase:SCALe", "0.0005")   # a preset's span, too short
+    cmp_seen = []
+    _lcd = app._live_cmp_done
+    app._live_cmp_done = lambda p, k, r: (cmp_seen.append((os.path.basename(p), r["n_done"])),
+                                          _lcd(p, k, r))
     app.do_seq_start()
     settle(root, app, timeout=600)
+    app._live_cmp_done = _lcd
+    check("while it runs, the scan not shown is re-analysed after its steps and drawn over "
+          "the shown one (compare ticked)",
+          len(cmp_seen) >= 3 and {n.lower() for n, _ in cmp_seen} == {"seq_reuse_x1_30_x2_30"}
+          and cmp_seen[0][1] < cmp_seen[-1][1] and app.fig_ext._cmp_on.get(),
+          cmp_seen[:4])
     mans = {}
     for n_ in ("seq_reuse_X1_30_X2_0", "seq_reuse_X1_30_X2_30"):
         mp_ = os.path.join(app.outdir.get(), n_, f"{n_}_scan.json")
@@ -1020,6 +1030,26 @@ def main():
     check("the sequence set the scope to the AWG tab's span around the longest record",
           span_ is not None and span_[0] <= -b_ + 1e-9 and span_[1] >= longest_ + a_ - 1e-9,
           (span_, longest_))
+    import shutil as _sh
+    _o = app.outdir.get()
+    for n_ in ("seq_reuse_X1_30_X2_0", "seq_reuse_X1_30_X2_30"):
+        _sh.copytree(os.path.join(_o, n_), os.path.join(_o, "cp" + n_))
+        for f_ in os.listdir(os.path.join(_o, "cp" + n_)):
+            if f_.startswith(n_):
+                os.rename(os.path.join(_o, "cp" + n_, f_), os.path.join(_o, "cp" + n_, "cp" + f_))
+        mp_ = os.path.join(_o, "cp" + n_, f"cp{n_}_scan.json")
+        m_ = _js.load(open(mp_, encoding="utf-8"))
+        m_["name"] = "cp" + n_
+        m_["plan"]["series"]["members"] = ["cpseq_reuse_X1_30_X2_0", "cpseq_reuse_X1_30_X2_30"]
+        _js.dump(m_, open(mp_, "w", encoding="utf-8"))
+    gui.scanmod.rename(_o, "cpseq_reuse_X1_30_X2_0", "renamed_X1_30_X2_0", log=lambda *_: None)
+    sib = _js.load(open(os.path.join(_o, "cpseq_reuse_X1_30_X2_30",
+                                     "cpseq_reuse_X1_30_X2_30_scan.json"), encoding="utf-8"))
+    own = _js.load(open(os.path.join(_o, "renamed_X1_30_X2_0", "renamed_X1_30_X2_0_scan.json"),
+                        encoding="utf-8"))
+    check("renaming a sequence member: its own and its sibling's member lists follow",
+          sib["plan"]["series"]["members"] == own["plan"]["series"]["members"]
+          == ["renamed_X1_30_X2_0", "cpseq_reuse_X1_30_X2_30"], sib["plan"]["series"]["members"])
     app.dark_mode.set("none")
     app.bg_mode.set("none")
     # nothing loaded, scans compared: the Compare tab and the overlay tabs draw them

@@ -94,10 +94,21 @@ run / run). What is set once lives behind each tab's **Settings...**.
 Sequence's *Preview* (AWG) and *Preview* (Fixed rotations) lay out every step
 in the order it will be taken - the analyzer angle, what the AWG puts on X1
 and X2, the shots - against the estimated time, and log it as a table
-(`rampol/plan.py`). Which tab does what with the AWG: a **Ramp scan** never
+(`rampol/plan.py`). The time is counted in trigger periods, as a single
+shot waits for the first trigger after the scope re-arms: a shot is
+readout (~0.6 s) + the screen's span rounded up to whole periods, and what
+happens between steps (analyzer ~0.75 s, an AWG change ~0.6 s + the settle)
+runs in that wait. On 7 Oct this gave 689 s for a sequence that took 690 s
+(at a 0.27 s trigger and a 270 ms screen, a shot every 1.08 s, not 0.6 s),
+and the spin-echo scans to the second once the trigger period was entered
+as the measured 6.26 s (the setting said 5.6). The screen's span is the AWG
+tab's (when *set the scope from* is ticked and the AWG drives) or the
+preset's timebase. Which tab does what with the AWG: a **Ramp scan** never
 touches it (it records whatever plays; its plan says so); the **AWG tab's
 Sequence** loads one ramp per (X1, X2) end point and runs a ramp scan for
-each at the Ramp scan tab's angles - the same absolute angles for every
+each at the Ramp scan tab's angles (while it runs, the scan shown is drawn
+in full and every other one over it, *compare scans* ticked, each
+re-analysed as its steps come in) - the same absolute angles for every
 ramp; **Fixed rotations** holds each rotation and steps the analyzer around
 the null it finds there (angles counted from that null, marked * in the
 table). So "+-2 deg around the null at X1 = 0, 10 ... 40 deg, 16 shots" is

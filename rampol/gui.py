@@ -563,7 +563,8 @@ class App:
         note = ("this window's AWG plays " + self.awg_sess.wave.label if drive else
                 "this window's AWG is not driving: the scan records whatever plays (the ILC "
                 "panel's drive) - for one scan per AWG ramp use the AWG tab's Sequence")
-        self._show_plan(f"Ramp scan {c.get('scan_name') or ''}", steps, s, note)
+        self._show_plan(f"Ramp scan {c.get('scan_name') or ''}", steps, s, note,
+                        span_s=self._plan_span(c, [self.awg_sess.wave] if drive else None))
 
     def build_analyzer_mode(self, f):
         """The two ways the analyzer goes near crossed: find an angle in the
@@ -1032,13 +1033,30 @@ class App:
         )).pack(anchor="w", padx=6, pady=(2, 4))
 
     # -- the Plan tab -------------------------------------------------------------------
-    def _show_plan(self, title, steps, s, note="", settle_s=1.0):
+    def _plan_span(self, c, waves=None):
+        """The scope screen's width (s) a run will capture at: the AWG tab's
+        span around the longest of `waves` when 'set the scope from' is
+        ticked, else the preset's timebase (0 when it has none)."""
+        if waves and c["awg"].get("fit_timebase"):
+            div, _pos = self._awg_scope_tb(c, max(waves, key=lambda w: w.period))
+            return 10 * div
+        try:
+            scale = (cfgmod.all_presets(self.cfg).get(c["preset"]) or {}).get(
+                "scope", {}).get(":TIMebase:SCALe")
+            return 10 * float(scale) if scale else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _show_plan(self, title, steps, s, note="", settle_s=1.0, span_s=0.0):
         from . import plan as planmod
-        total = planmod.timeline(steps, s, settle_s)
+        total = planmod.timeline(steps, s, settle_s, span_s)
+        rep = float(s.get("rep_s", 0.27))
+        per = planmod.shot_period(s, span_s)
         self.plan_view = {"title": title, "steps": steps, "total": total, "note": note,
-                          "rep": float(s.get("rep_s", 0.27))}
-        self.log(f"Plan - {title}: {len(steps)} steps, ~{total / 60:.0f} min at "
-                 f"{float(s.get('rep_s', 0.27)):g} s per shot" + (f"; {note}" if note else ""))
+                          "rep": rep}
+        self.log(f"Plan - {title}: {len(steps)} steps, ~{total / 60:.0f} min: a shot every "
+                 f"{per:.2f} s ({per / rep:.0f} x the {rep:g} s trigger: readout + the "
+                 f"{span_s * 1e3:.0f} ms screen)" + (f"; {note}" if note else ""))
         for ln in planmod.table(steps):
             self.log("  " + ln)
         self.plot_dirty.add(self.fig_plan._frame)
@@ -1785,6 +1803,7 @@ class App:
             shown = os.path.normcase(os.path.abspath(self._scan_path(self.show_scan.get()) or ""))
             watch = next((k for k, r in enumerate(runs)
                           if os.path.normcase(os.path.abspath(r.folder)) == shown), 0)
+            self._seq_live_setup(runs, watch)
             self.worker(lambda: self._run_seq(runs, waves, c, watch), done=self._seq_done)
 
         def after_offsets():
@@ -1793,6 +1812,67 @@ class App:
             else:
                 start()
         self.offsets_then(runs[0], pre, after_offsets)
+
+    def _seq_live_setup(self, runs, watch):
+        """Tk thread: the sequence's other scans go into the Compare set and
+        every tab's 'compare scans' is ticked, so all of them are drawn as
+        they come in - the shown one in full, the others over it."""
+        key = self._cmp_key()
+        self.refresh_scan_list()
+        others = [r for k, r in enumerate(runs) if k != watch]
+        self.cmp_sel = [(os.path.normcase(os.path.abspath(r.folder)), key) for r in others]
+        self.cmp_results = {k: v for k, v in self.cmp_results.items() if k in self.cmp_sel}
+        names = {r.name for r in others}
+        self.cmp_lb.selection_clear(0, "end")
+        for i, n in enumerate(self.cmp_lb.get(0, "end")):
+            if n in names:
+                self.cmp_lb.selection_set(i)
+        for f in (self.fig_malus, self.fig_angle, self.fig_ext, self.fig_poin, self.fig_diag):
+            if getattr(f, "_cmp_on", None) is not None:
+                f._cmp_on.set(True)
+        self._seq_live = {"key": key, "pending": [], "thread": None,
+                          "lock": threading.Lock()}
+        self._cmp_dirty()
+
+    def live_cmp_refresh(self, folder):
+        """Tk thread: a sequence scan that is not the shown one finished a
+        step - re-analysed in a thread of its own (only its new steps are
+        read), then drawn over the shown one. Asked for while one runs, it
+        is queued once."""
+        L = getattr(self, "_seq_live", None)
+        if L is None:
+            return
+        p = os.path.normcase(os.path.abspath(folder))
+        with L["lock"]:
+            if p not in L["pending"]:
+                L["pending"].append(p)
+            if L["thread"] is not None and L["thread"].is_alive():
+                return
+        drift, opts = L["key"][0], dict(L["key"][1])
+
+        def bg():
+            while True:
+                with L["lock"]:
+                    if not L["pending"]:
+                        L["thread"] = None
+                        return
+                    q = L["pending"].pop(0)
+                try:
+                    res = self.analyse(q, drift, opts)
+                except Exception as exc:
+                    self.log(f"  live view ({os.path.basename(q)}): {exc}")
+                    continue
+                self.call(self._live_cmp_done, q, L["key"], res)
+        L["thread"] = threading.Thread(target=bg, daemon=True, name="seq-live")
+        L["thread"].start()
+
+    def _live_cmp_done(self, p, key, res):
+        if (p, key) not in self.cmp_sel:
+            return
+        self.cmp_results[(p, key)] = res
+        self._cmp_dirty()
+        self.plot_dirty.add(self.fig_cmp._frame)
+        self.draw_visible()
 
     def _seq_share_offsets(self, runs):
         """Worker: the first scan's dark / background / stray light, lent to
@@ -1877,8 +1957,8 @@ class App:
                                                 f"{st['target']:.2f} deg ({done + 1}/{len(todo)}"
                                                 f"{eta(t0, done, len(todo))})")
                 f = runs[k].folder
-                runs[k].run_step(st, on_step=(lambda _s, f=f: self.call(self.live_refresh, f))
-                                 if k == watch else None)
+                show = self.live_refresh if k == watch else self.live_cmp_refresh
+                runs[k].run_step(st, on_step=lambda _s, f=f, show=show: self.call(show, f))
                 done += 1
             self._progress(len(todo), len(todo), "sequence done")
         except hw.Cancelled:
@@ -2681,7 +2761,8 @@ class App:
         steps = planmod.fixed_rotations(p, biases, c["bias"].get("name") or "bias")
         self._show_plan(f"Fixed rotations {c['bias'].get('name') or ''}", steps, c["scan"],
                         "angles marked * are counted from the null the run finds at each "
-                        "rotation; the plateaus themselves: AWG tab")
+                        "rotation; the plateaus themselves: AWG tab",
+                        span_s=self._plan_span(c, waves))
 
     def do_seq_preview(self):
         """Every ramp of the AWG tab's sequence, drawn together."""
@@ -2710,7 +2791,8 @@ class App:
         self._show_plan(f"AWG sequence {base}", steps, c["scan"],
                         "the analyzer angles are the Ramp scan tab's, the same for every ramp "
                         "(the null moves with the rotation); the ramps themselves: AWG tab",
-                        settle_s=float(c["awg"].get("seq_settle_s", 1.0) or 0))
+                        settle_s=float(c["awg"].get("seq_settle_s", 1.0) or 0),
+                        span_s=self._plan_span(c, waves))
 
     def _draw_awg_set(self, fig, S):
         """A set of waveforms: the AWG outputs (solid CH1 -> X1, dashed CH2
@@ -4220,19 +4302,19 @@ class App:
         if getattr(self, "_loading", True):
             return
         try:
-            s = self.gather()["scan"]
+            from . import plan as planmod
+            c = self.gather()
+            s = c["scan"]
             angles = scanmod.angle_list(s["start"], s["stop"], s["step"])
-            refs = (len(angles) // max(s["ref_every"], 1) + 2) if s["ref_every"] > 0 else 0
-            n = len(angles) + refs
-            rep = max(float(s.get("rep_s", 0.27)), 0.01)
-            # a single shot cannot be re-armed faster than it is read out (~0.6 s)
-            per = (s["shots"] * rep + s["blocks"] * 0.8 if s["mode"] == "average"
-                   else s["shots"] * max(rep, 0.6)) + 1.5
-            mins = n * per / 60
+            steps = planmod.ramp_scan(s, "none", "none")
+            refs = sum(1 for st in steps if st["kind"] == "ref")
+            span = self._plan_span(c)
+            mins = planmod.timeline(steps, s, span_s=span) / 60
+            per = planmod.shot_period(s, span)
             self.est_label.configure(
                 text=f"{len(angles)} angles + {refs} refs, ~"
                      + (f"{mins:.0f} min" if mins < 90 else f"{mins / 60:.1f} h")
-                     + f" at {rep:g} s/shot")
+                     + f" at {per:.2f} s/shot")
         except Exception:
             self.est_label.configure(text="")
 

@@ -10,18 +10,32 @@ rotation the AWG puts on each crystal, deg; None when this window's AWG does
 not drive), shots, scan (which scan it belongs to), note, then t0 and dur
 (s) from timeline().
 """
+import math
+
 from . import scan as scanmod
 
-MOVE_S = 1.5                # analyzer move and settle (ELL14, with the backoff)
-READOUT_S = 0.6             # a single shot cannot be re-armed faster than it reads out
+# Fitted to the capture times of 7 Oct 2026 (two 5-ramp AWG sequences at a
+# 0.27 s bench trigger, 550 shots each, and three spin-echo scans). A single
+# shot waits for the first trigger after the scope is re-armed, so every
+# shot is a whole number of trigger periods: readout + the screen's span,
+# rounded UP to periods - 0.81 s (3 periods) at a 15 ms screen and 1.08 s (4)
+# at 270 ms, where "one per 0.6 s" had said 0.6 s. Whatever happens between
+# steps (analyzer, AWG) runs during that wait, so at a 5.6 s trigger it costs
+# nothing and at 0.27 s it costs whole periods.
+READOUT_S = 0.6             # re-arm + read out one shot (20000 points, 4 channels)
+MOVE_S = 0.75               # analyzer step (ELL14, 22.5 deg + the 3 deg backoff)
+AWG_LOAD_S = 0.6            # select a stored waveform + the step's bookkeeping
 
 
-def _shot_s(s):
-    """Seconds of acquisition for `shots` at the scan settings `s`."""
+def periods(t, rep):
+    """`t` s rounded up to whole trigger periods of `rep` s (at least one)."""
+    return max(1, math.ceil(t / rep - 1e-6)) * rep
+
+
+def shot_period(s, span_s=0.0):
+    """Seconds between single shots: readout + the screen span, in periods."""
     rep = max(float(s.get("rep_s", 0.27)), 0.01)
-    if s.get("mode") == "average":
-        return lambda shots: shots * rep + int(s.get("blocks", 4)) * 0.8
-    return lambda shots: shots * max(rep, READOUT_S)
+    return periods(READOUT_S + float(span_s or 0), rep)
 
 
 def _offsets(dark_mode, bg_mode, stray_vdiv, scan_name, drive):
@@ -97,20 +111,31 @@ def fixed_rotations(p, biases, name="bias", ladder=4):
     return steps
 
 
-def timeline(steps, s, settle_s=1.0):
-    """Fill in t0 and dur (s): the shots, a move when the angle changes, and
-    `settle_s` when what the AWG plays changes. Returns the total (s)."""
-    shot = _shot_s(s)
+def timeline(steps, s, settle_s=1.0, span_s=None):
+    """Fill in t0 and dur (s): a move when the angle changes, a load and
+    `settle_s` when what the AWG plays changes, then the shots - all on the
+    trigger's periods (module constants). span_s: the scope screen's width
+    (default s['span_s'], else 0). Returns the total (s)."""
+    rep = max(float(s.get("rep_s", 0.27)), 0.01)
+    span = float(s.get("span_s", 0.0) if span_s is None else span_s or 0.0)
+    per = shot_period(s, span)
+    avg = s.get("mode") == "average"
     t, last_a, last_d = 0.0, object(), None
     for st in steps:
-        dur = shot(st.get("shots", 1))
+        over = 0.0
         if st["angle"] is not None and st["angle"] != last_a:
-            dur += MOVE_S
+            over += MOVE_S
             last_a = st["angle"]
         d = (st.get("x1"), st.get("x2"))
         if st["angle"] is not None and d != last_d and d != (None, None):
-            dur += settle_s
+            over += AWG_LOAD_S + settle_s
             last_d = d
+        n = int(st.get("shots", 1))
+        if avg:
+            dur = over + n * rep + int(s.get("blocks", 4)) * 0.8
+        else:
+            # the first shot waits out the step's own overhead too
+            dur = periods(over + READOUT_S + span, rep) + (n - 1) * per
         st["t0"], st["dur"] = t, dur
         t += dur
     return t
