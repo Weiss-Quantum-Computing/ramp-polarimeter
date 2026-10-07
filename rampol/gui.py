@@ -971,7 +971,7 @@ class App:
 
         def box(text):
             b = ttk.LabelFrame(f, text=text)
-            b.pack(fill="x", padx=4, pady=(3, 0))
+            b.pack(fill="x", padx=4, pady=(1, 0))
             return b
 
         def row(parent, pady=1):
@@ -1025,11 +1025,11 @@ class App:
                            ("fall", "fall_ms"), ("after", "tail_ms")):
             entry(r2, key, 4, label)
         ttk.Label(r2, text="ms").pack(side="left")
-        self.a_reach = CopyLabel(self.a_ramp, text="", foreground="#666", width=46)
+        self.a_reach = CopyLabel(self.a_ramp, text="", foreground="#666", width=54)
         self.a_reach.pack(anchor="w", padx=6)
         for k in ("rotation", "split", "idle1", "idle2"):
             self.av[k].trace_add("write", lambda *_: self._awg_reach_text())
-        self.a_record = CopyLabel(self.a_ramp, text="", foreground="#666", width=46)
+        self.a_record = CopyLabel(self.a_ramp, text="", foreground="#666", width=54)
         self.a_record.pack(anchor="w", padx=6, pady=(0, 2))
         for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms", "dt_us"):
             self.av[k].trace_add("write", lambda *_: self._awg_record_text())
@@ -1103,13 +1103,12 @@ class App:
         x1, x2 = rot * split, rot * (1 - split)
         v = {k: abs(awgmod.biasmod.awg_volts(d, 1.0 if k == "EO1" else 0.0)[k])
              for k, d in (("EO1", x1), ("EO2", x2))}
-        txt = (f"X1 {x1:g} deg ({v['EO1']:.2f} V), X2 {x2:g} deg ({v['EO2']:.2f} V); "
-               f"each reaches at most X1 {m['EO1']:.1f}, X2 {m['EO2']:.1f} deg "
-               f"({awgmod.AWG_CAP:g} V cap)")
+        txt = (f"X1 {x1:g}° = {v['EO1']:.2f} V, X2 {x2:g}° = {v['EO2']:.2f} V "
+               f"(reach {m['EO1']:.1f}° / {m['EO2']:.1f}°)")
         bad = abs(x1) > m["EO1"] + 1e-9 or abs(x2) > m["EO2"] + 1e-9 or not 0 <= split <= 1
         if bad:
             rng = awgmod.share_range(rot, idle)
-            txt = ("PAST THE AWG'S REACH - " + txt + ". " + (
+            txt = ("PAST THE AWG'S REACH (" + f"{awgmod.AWG_CAP:g} V): " + txt + ". " + (
                 f"{rot:g} deg works with an X1 share of {rng[0]:.2f} to {rng[1]:.2f}"
                 if rng else f"the pair reaches at most {m['EO1'] + m['EO2']:.1f} deg"))
         self.a_reach.configure(text=txt, foreground="#c00000" if bad else "#666")
@@ -1265,10 +1264,9 @@ class App:
             return
         rec = awgmod.record_ms(p)
         n = int(round(rec / (p["dt_us"] * 1e-3))) + 1 if p["dt_us"] > 0 else 0
-        note = (" - the ILC's own record" if abs(rec - awgmod.ILC_RECORD_MS) < 1e-9
+        note = (" (the ILC's)" if abs(rec - awgmod.ILC_RECORD_MS) < 1e-9
                 and abs(p["dt_us"] - awgmod.ILC_DT_US) < 1e-9 else
-                " - not the ILC's 11 ms: with the outputs live the change goes through "
-                "idle; Park returns to 11 ms")
+                " - not the ILC's 11 ms: changed live through idle; Park returns to 11 ms")
         self.a_record.configure(text=f"record {rec:g} ms = {n} points at {p['dt_us']:g} us"
                                      + note)
 
