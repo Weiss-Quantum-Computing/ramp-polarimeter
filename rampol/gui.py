@@ -1859,16 +1859,20 @@ class App:
         self.do_compare_load()
 
     def do_connect_awg(self):
-        """Connect the 4063B now rather than on first use. Only *IDN? is sent:
-        the outputs are left exactly as they are (nothing of this window's is
-        loaded, so even the never-float rule has nothing to park)."""
+        """Connect the 4063B now rather than on first use. The outputs are
+        left exactly as they are; ones found ON playing this program's
+        waveforms (the window was closed and opened again) are taken over."""
         c = self.gather()
         roles = self.roles()
 
         def go():
             if c["simulate"] and self.bench is None:
                 self.ensure_sim(roles)
-            self._awg_session(c)
+            s = self._awg_session(c)
+            try:
+                s.take_over()
+            except RuntimeError as exc:
+                self.log(f"AWG: {exc}")
         self.worker(go, done=lambda _r: self._awg_status())
 
     def _awg_close(self):
@@ -1901,7 +1905,10 @@ class App:
         self.awg_hw.configure(text=where + ("; outputs ON" if s.owned else ""),
                               foreground="#060")
         on = bool(s.owned)
-        if s.wave is None:
+        if s.wave is None and s.adopted:
+            what = "taken over (" + ", ".join(f"CH{ch} {n or '?'}"
+                                              for ch, n in sorted(s.adopted.items())) + ")"
+        elif s.wave is None:
             what = "nothing of this window's loaded"
         else:
             what = s.wave.label + ("" if s.wave.source == "park" else
@@ -2128,7 +2135,8 @@ class App:
 
     def do_awg_park(self):
         """Stop driving without letting anything float: an idle-level
-        waveform, outputs ON."""
+        waveform, outputs ON. Outputs found ON with another program's
+        waveform are taken over (pressing Park says nothing else drives)."""
         c = self.gather()
         try:
             idle = self._awg_idle(c)
@@ -2138,9 +2146,9 @@ class App:
         base = awgmod.ramp_hold(0.0, c["awg"], idle=idle)
         s = self.awg_sess
         if s is not None:
-            self._bg_awg(lambda: s.park(like=s.wave or base), "park")
+            self._bg_awg(lambda: s.park(like=s.wave or base, take_over=True), "park")
         else:
-            self.worker(lambda: self._awg_session(c).park(like=base),
+            self.worker(lambda: self._awg_session(c).park(like=base, take_over=True),
                         done=lambda _o: self._awg_status())
 
     def do_awg_off(self):

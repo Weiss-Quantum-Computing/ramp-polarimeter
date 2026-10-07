@@ -264,6 +264,11 @@ class FakeAWG:
     def list_waveforms(self, user_only=False):
         return list(self.stored)
 
+    def get_arb(self, ch):
+        """As the 4063B: a user waveform reads back as NAME,<name>.bin."""
+        name = self.selected.get(ch, "")
+        return {"NAME": name + ".bin"} if name else {}
+
     def write(self, command):
         """Only what the session sends raw: C<ch>:ARWV NAME,<name>."""
         head, _, arg = command.partition(" ")

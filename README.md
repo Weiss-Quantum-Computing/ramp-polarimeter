@@ -426,7 +426,9 @@ The order, each step its own button:
 
 1. **Preview**: the waveform per channel and the rotation it gives (from the
    EOM calibration), and the checks: Trek limits, the 9.6 V cap, the 100 mV
-   idle cap, <= 16384 points (5501 proven), the record under 80 % of the
+   idle cap, <= 16384 points (the count itself does not matter: in DDS mode
+   the channel plays the whole record in 1/FRQ, and FRQ is set to 1/record
+   on load and checked there), the record under 80 % of the
    trigger period, a warning for long holds at kV.
    - **ramp**: idle -> the rotation -> idle, split between the crystals
      (`split` on X1), cosine or linear edges, lead / rise / hold / fall /
@@ -518,10 +520,15 @@ are carried out in the order pressed. After the AWG has been used here it
 plays idle (parked): the experiment's own ramps come back when its drive is
 put back (the ILC panel uploads it).
 
-A waveform's name is a hash of its samples, so the same one is selected
-again rather than stored again (the 4063B cannot delete over SCPI). A channel
-that is ON but was not switched on by this window (the ILC panel) is
-refused. Outputs are switched one at a time and read back; if either fails,
+A waveform's name is a hash of its samples (`RP<ch><8 hex>`), so the same
+one is selected again rather than stored again (the 4063B cannot delete over
+SCPI). A channel found ON that this window did not switch on is taken over,
+left ON, when it plays one of this program's waveforms (the window was closed
+- it parks on close - and opened again; `Connect` does it at once). One
+playing another program's waveform (the ILC panel's) is refused; **Park**
+takes it over without switching it off, for when nothing else drives it. With
+what the AWG holds unknown, a record-length change plays the new waveform's
+flat idle first - a flat record plays the same at any length. Outputs are switched one at a time and read back; if either fails,
 nothing is left on.
 
 ## EOM calibration (EOM calibration... button)

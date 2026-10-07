@@ -330,7 +330,11 @@ def check(wave, eomilc=None, trig_hz=None, chan=None):
     if wave.n > MAX_PTS:
         out.append(("FAIL", f"{wave.n} points: past the 4063B's {MAX_PTS}"))
     elif wave.n > PROVEN_PTS:
-        out.append(("WARN", f"{wave.n} points: more than the {PROVEN_PTS} played so far"))
+        # the count itself does not matter: in DDS mode the channel plays the
+        # whole record in 1/FRQ, and FRQ is set to 1/record on load (checked
+        # against the generator there, and the dry run times it on the scope)
+        out.append(("INFO", f"{wave.n} points ({wave.period*1e3:.3f} ms at "
+                            f"{wave.dt*1e6:g} us): FRQ set to {1/wave.period:.4f} Hz on load"))
     for k, u in wave.u.items():
         pk = float(np.max(np.abs(u)))
         if pk > AWG_CAP:
@@ -425,6 +429,14 @@ def names(wave):
     return (wave_name(wave.u["EO1"], 1), wave_name(wave.u["EO2"], 2))
 
 
+OURS = re.compile(r"^RP[12][0-9a-f]{8}$")
+
+
+def ours(name):
+    """True for a waveform name this program gives (wave_name)."""
+    return bool(OURS.match(str(name or "").strip()))
+
+
 class NotVerified(RuntimeError):
     pass
 
@@ -447,6 +459,7 @@ class Session:
         self.require_dry_run = require_dry_run
         self.verified = {}        # names(wave) -> dry-run summary
         self.dry = False
+        self.adopted = {}         # ch -> the waveform it held when taken over
 
     def is_verified(self, wave):
         return wave.source == "park" or names(wave) in self.verified
@@ -465,6 +478,41 @@ class Session:
 
     def foreign_on(self):
         return [ch for ch, on in self.outputs().items() if on and ch not in self.owned]
+
+    def held(self, ch):
+        """The name of the waveform channel `ch` plays ('' when unknown)."""
+        try:
+            got = self.awg.get_arb(ch)
+        except Exception:
+            return ""
+        got = {str(k).upper(): v for k, v in (got or {}).items()}
+        name = str(got.get("NAME", "") or "").strip()
+        # a user waveform reads back as NAME,<name>.bin (bk4063b.restore)
+        return name[:-4] if name.lower().endswith(".bin") else name
+
+    def take_over(self, force=False):
+        """Count outputs found ON as this session's, leaving them ON. Without
+        `force` only when what they play is this program's (an RP name: the
+        window was closed and opened again - it parks on close); a foreign
+        waveform (the ILC panel's) raises. Returns {ch: held name}."""
+        with self.lock:
+            found = {ch: self.held(ch) for ch in self.foreign_on()}
+            if not found:
+                return {}
+            theirs = {ch: n for ch, n in found.items() if not ours(n)}
+            if theirs and not force:
+                raise RuntimeError(
+                    "AWG " + ", ".join(f"CH{ch}" for ch in sorted(found)) + " is ON with "
+                    + ", ".join(f"'{n or '?'}'" for n in theirs.values())
+                    + ", not a waveform of this program - another program (the ILC panel?) "
+                    "may be driving the Treks. If nothing else is, press Park on the AWG "
+                    "tab: it takes the outputs over without switching them off.")
+            self.owned |= set(found)
+            self.adopted.update(found)
+            self.log("AWG: outputs found ON (" + ", ".join(
+                f"CH{ch} {n or '?'}" for ch, n in sorted(found.items()))
+                + ") - taken over, left ON")
+            return found
 
     # -- loading a waveform -----------------------------------------------
     def setup_ok(self, ch, period):
@@ -518,12 +566,7 @@ class Session:
         OFF for the change unless keep_on (park policy: the X2 stage must not
         float) - then the upload happens live, as EOM-ILC's does."""
         with self.lock:
-            foreign = self.foreign_on()
-            if foreign:
-                raise RuntimeError(
-                    f"AWG CH{', CH'.join(map(str, foreign))} is ON and this window did not "
-                    f"switch it on - another program (the ILC panel?) may be driving the "
-                    f"Treks. Switch it off there first.")
+            self.take_over()
             live = [ch for ch, on in self.outputs().items() if on]
             keep_on = keep_on or self.never_float
             if live:
@@ -535,19 +578,24 @@ class Session:
             if need and live:
                 # Setting up stops the burst for a moment and the channel
                 # free-runs what it holds: make that a flat idle first, on
-                # the grid the channel is at now (module docstring)
+                # the grid the channel is at now (module docstring). Taken
+                # over, the grid is not known - but a flat record plays the
+                # same at any length: the new wave's idle, on its grid
                 cur = self.wave
                 if cur is None:
-                    raise RuntimeError(
-                        "the record length changes with the outputs live, and what the AWG "
-                        "holds now is unknown to this window - so it cannot be put to idle "
-                        "first. Park (or Load something) on the current record first.")
-                if cur.source != "park":
+                    flat = idle_flat(wave.idle(), wave)
+                    for name, ch in CHANNELS.items():
+                        self._put(ch, flat.u[name])
+                    self.wave, self.parked = flat, True
+                    if not self.dry:
+                        self.log(f"  record -> {wave.period*1e3:.3f} ms with the outputs live: "
+                                 f"held at idle while the channels are set up")
+                elif cur.source != "park":
                     flat = idle_flat(cur.idle(), cur)
                     for name, ch in CHANNELS.items():
                         self._put(ch, flat.u[name])
                     self.wave, self.parked = flat, True
-                if not self.dry:
+                if not self.dry and cur is not None:
                     self.log(f"  record {cur.period*1e3:.3f} -> {wave.period*1e3:.3f} ms with "
                              f"the outputs live: held at idle while the channels are set up")
             for ch in need:
@@ -603,11 +651,14 @@ class Session:
             self.log("AWG outputs OFF")
         return not errs
 
-    def park(self, like=None, ilc=True):
+    def park(self, like=None, ilc=True, take_over=False):
         """An idle-level waveform with the outputs ON (the X2 FPGA stage must
         not see a floating input) - on EOM-ILC's 11 ms grid (ilc=True), so
-        the ILC panel finds its FRQ, else on `like`'s grid."""
+        the ILC panel finds its FRQ, else on `like`'s grid. take_over: also
+        outputs ON with another program's waveform (Park pressed)."""
         with self.lock:
+            if take_over:
+                self.take_over(force=True)
             base = like or self.wave
             if base is None:
                 raise RuntimeError("no waveform to take the grid and idle from")

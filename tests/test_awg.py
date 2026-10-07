@@ -142,9 +142,12 @@ def session_checks():
     check("a change under the 'off' policy switches the outputs off first",
           not any(bench.awg_on.values()) and not s.owned)
     bench.awg_on[1] = True                     # someone else's
-    check("a channel ON that this session did not switch on is refused",
-          "did not" in (raises(s.load, w) or ""))
+    mine = a.selected[1]
+    a.selected[1] = "ILCdrive01"
+    check("a channel ON playing another program's waveform is refused",
+          "ILC panel" in (raises(s.load, w) or "") and not s.owned)
     bench.awg_on[1] = False
+    a.selected[1] = mine
     s.on()
     s.end("park")
     flat = bench.awg_drive[1][1]
@@ -177,6 +180,29 @@ def session_checks():
           s.parked and abs(s.wave.period - 11.002e-3) < 1e-9 and s.wave.n == 5501
           and abs(1 / s.awg.frq[1] - s.wave.period) < 1e-12, f"{s.wave.period*1e3:.3f} ms")
     s.off()
+    # the window closed with the outputs parked ON, then opened again
+    s.load(awg.ramp_hold(30.0, {"tail_ms": 3.5}), keep_on=False)
+    s.on()
+    s.park()
+    logs = []
+    s2 = awg.Session(a, None, log=logs.append, never_float=True, require_dry_run=False)
+    w9 = awg.ramp_hold(45.0, {"tail_ms": 2.5})
+    seen = []
+    put0 = s2._put
+    s2._put = lambda ch, u: (seen.append((ch, float(np.ptp(u)))), put0(ch, u))[1]
+    s2.load(w9, keep_on=True)
+    check("reopened: outputs ON with this program's park are taken over, never switched off",
+          all(bench.awg_on.values()) and s2.owned == {1, 2}
+          and any("taken over" in m for m in logs), logs[:2])
+    check("... and the record change is held at a flat idle first (the old grid unknown)",
+          [p_ for _c, p_ in seen[:2]] == [0.0, 0.0] and len(seen) == 4
+          and abs(1 / a.frq[1] - w9.period) < 1e-12, seen)
+    s3 = awg.Session(a, None, log=lambda *_: None, never_float=True, require_dry_run=False)
+    a.selected[2] = "ILCdrive02"
+    check("another program's waveform: Park takes it over, outputs left ON",
+          raises(s3.park, w9, True, True) is None and s3.owned == {1, 2}
+          and s3.parked and all(bench.awg_on.values()))
+    s3.off(force=True)
     fb = sim.Bench(seed=2)
     fs = awg.Session(FlakyAWG(fb), None, log=lambda *_: None, never_float=False,
                      require_dry_run=False)
