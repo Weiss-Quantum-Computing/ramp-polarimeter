@@ -145,13 +145,15 @@ def find_row(out, when=None):
     if out["kind"] == "scan":
         kind = "malus scan"
         res = (f"maximum at analyzer {out['angle_max']:.2f} deg, minimum at "
-               f"{out['angle_min']:.2f} deg ({where}); Imax {out['imax']:.3f} V, Imin "
-               f"{out['imin']*1e3:.1f} mV at {out['vdiv']:g} V/div")
+               f"{out['angle_min']:.2f} deg ({where}); Imax {out['imax']:.4f} V, Imin "
+               f"{out['imin']*1e3:.3f} +- {out.get('sig_imin', 0)*1e3:.3f} mV, ER "
+               f"{'>' if out.get('er_lower') else ''}{out.get('er', 0):.0f}; "
+               f"{out.get('offset_note', '')}")
     else:
         kind = f"find {out['kind']}"
         res = (f"{out['kind']} transmission at analyzer {out['angle']:.3f} +- "
-               f"{out['sig']*1e3:.0f} mdeg ({where}), {out['level']*1e3:.2f} mV raw "
-               f"at {out['vdiv']*1e3:g} mV/div")
+               f"{out['sig']*1e3:.0f} mdeg ({where}), level {out['level']*1e3:.3f} mV "
+               f"at {out['vdiv']*1e3:g} mV/div; {out.get('offset_note', 'raw')}")
     return {"kind": kind, "name": f"{kind.replace(' ', '-')}-{when.replace(':', '')}",
             "measured": when, "status": "done", "result": res}
 

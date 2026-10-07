@@ -68,16 +68,22 @@ ROLE_CHANNELS = {
 # written for every recorded channel). Built-ins here; ones saved from the
 # Scope settings window go to the config under "user_presets" and override
 # these by name.
+SPIN_ECHO = "Spin echo"
+OLD_SPIN_ECHO = "Spin echo 16.7 ms (2 legs)"      # its name before 7 Oct 2026
+
 PRESETS = {
-    "Spin echo 16.7 ms (2 legs)": {
-        "note": "Experiment-control sequence, both legs in one record: ramps "
-                "4.5 ms up / 0.5 ms hold / 4.5 ms down, legs 16.667 ms apart, "
-                "trigger before leg 1, ~10 s repetition. 5 ms/div = 50 ms "
-                "record from -12 ms to +38 ms: 12 ms of locked light before "
-                "the trigger, both legs, and ~12 ms after leg 2 (the intensity "
-                "lock switches off at the end of leg 2, so later data is not "
-                "wanted). Trigger sweep NORMAL: AUTO would self-trigger in a "
-                "10 s gap.",
+    SPIN_ECHO: {
+        "note": "Experiment-control spin-echo sequence, both legs in one record, "
+                "trigger at the start of the first motion, ~10 s repetition. The "
+                "record runs from 'before' ms before the trigger to 'after' ms after "
+                "the second motion ends (spacing + motion): the timebase is "
+                "computed from the sequence fields (defaults: legs 16.667 ms apart, "
+                "9.5 ms motions - 4.5 up / 0.5 hold / 4.5 down - 12 ms before and "
+                "after: about 5 ms/div). The intensity lock switches off at the end "
+                "of leg 2, so much later data is not wanted. Trigger sweep NORMAL: "
+                "AUTO would self-trigger in a 10 s gap.",
+        # the timebase comes from cfg["sequence"] (sequence_timebase)
+        "sequence": True,
         "scope": {":ACQuire:TYPE": "HRESolution",
                   ":TIMebase:SCALe": "5.0E-03", ":TIMebase:REFerence": "LEFT",
                   # LEFT starts the record one division before the position
@@ -102,8 +108,33 @@ PRESETS = {
 }
 
 
+def sequence_timebase(seq):
+    """(s/div, position) for REFerence LEFT covering a spin-echo record:
+    from `before_ms` before the trigger to `after_ms` after the second
+    motion ends (spacing + motion), on 10 divisions; the scale rounded UP to
+    two significant figures (the MSO-X takes fine values: 1.5 ms/div has run
+    on it)."""
+    import math
+    before = float(seq.get("before_ms", 12.0)) * 1e-3
+    end = (float(seq.get("spacing_ms", 16.667)) + float(seq.get("motion_ms", 9.5))
+           + float(seq.get("after_ms", 12.0))) * 1e-3
+    span = before + end
+    raw = span / 10.0
+    e = math.floor(math.log10(raw)) - 1
+    scale = math.ceil(raw / 10 ** e - 1e-9) * 10 ** e
+    return scale, -before + scale          # LEFT: the record starts 1 div before
+
+
 def all_presets(cfg):
-    out = dict(PRESETS)
+    """Every preset by name, the built-ins with a sequence's timebase worked
+    out from cfg['sequence'], then the user's."""
+    out = copy.deepcopy(PRESETS)
+    seq = cfg.get("sequence") or DEFAULTS["sequence"]
+    for p in out.values():
+        if p.get("sequence"):
+            scale, pos = sequence_timebase(seq)
+            p["scope"][":TIMebase:SCALe"] = f"{scale:.4E}"
+            p["scope"][":TIMebase:POSition"] = f"{pos:.4E}"
     out.update(cfg.get("user_presets") or {})
     return out
 
@@ -161,13 +192,21 @@ DEFAULTS = {
              # write the selected preset and run the scan's settings check first
              "use_preset": True,
              # the timebase zoomed onto the window while measuring, then put back
-             "zoom": True},
+             "zoom": True,
+             # measure after / reuse latest / none, at every V/div the readings used
+             "dark_mode": "none", "background_mode": "measure after"},
     # the ILC target comparison (rampol.ilc_target)
     "ilc": {"x1": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX1H.state.npz"),
             "x2": os.path.join(PROJECTS, "EOM-ILC", "run", "drive_P92PX2A.state.npz"),
             "f_cut": 2000.0, "pd_delay_us": 0.0, "split": 0.5, "line_ref": ""},
     "scan_name": "scan",
-    "preset": "Spin echo 16.7 ms (2 legs)",
+    "preset": "Spin echo",
+    # the spin-echo sequence the "Spin echo" preset's record covers (ms):
+    # the legs' spacing (the echo time), one motion's length, and how much of
+    # the record to keep before the trigger and after the second motion ends.
+    # The ILC-target comparison takes its leg gap from here too.
+    "sequence": {"spacing_ms": 16.667, "motion_ms": 9.5, "before_ms": 12.0,
+                 "after_ms": 12.0},
     "user_presets": {},
     "scan": {
         # Malus repeats every 180 deg, so 0-170 is a full set; 360 deg of
@@ -230,6 +269,9 @@ def load():
             cfg = _merge(DEFAULTS, json.load(fh))
     except (OSError, ValueError):
         return copy.deepcopy(DEFAULTS)
+    # the spin-echo preset was renamed 7 Oct 2026 (it is generic now)
+    if cfg.get("preset") == OLD_SPIN_ECHO:
+        cfg["preset"] = SPIN_ECHO
     # a config saved before 6 Oct 2026 carries the old wide-band floor
     if cfg["analysis"].get("polarizer_er") == 1.0e4:
         cfg["analysis"]["polarizer_er"] = DEFAULTS["analysis"]["polarizer_er"]

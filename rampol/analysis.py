@@ -820,11 +820,13 @@ def direct_er(d, pol, box_us=4.0, correct_drift=False, gains=None):
             m = a + nb + int(np.argmin(Is[k, a + nb:b - nb + 1]))
             imin, s_min = float(Is[k, m]), float(sems[k, m])
             imax = float(np.mean([Is[j, m] for j in orth[k]]))
+            s_max = float(np.sqrt(np.mean([sems[j, m] ** 2 for j in orth[k]]) / len(orth[k])))
             lower = bool(imin < 2 * s_min)
             pts.append(dict(kind="crossing", seg=seg_of(t[m]), t_ms=float(t[m] * 1e3),
                             theta=float(th[k]), rotation=float(rot[m]),
                             rate=float(rate_all[m]), imin_mV=imin * 1e3, sig_mV=s_min * 1e3,
-                            imax_V=imax, er=imax / (2 * s_min) if lower else imax / imin,
+                            imax_V=imax, sig_imax_V=s_max,
+                            er=imax / (2 * s_min) if lower else imax / imin,
                             lower=lower))
     # one crossing can show up as several sign flips of the azimuth where it
     # creeps through crossed slowly (noise): keep one per angle per 0.1 ms
@@ -846,7 +848,9 @@ def direct_er(d, pol, box_us=4.0, correct_drift=False, gains=None):
         if not orth[k]:
             continue
         imax = float(np.mean([means[j] for j in orth[k]]))
-        s_min = float(np.mean(sem[k, w]) / np.sqrt(w.sum() / max(1, int(1e-6 / dt))))
+        n_ind = w.sum() / max(1, int(1e-6 / dt))
+        s_min = float(np.mean(sem[k, w]) / np.sqrt(n_ind))
+        s_max = float(np.mean([np.mean(sem[j, w]) for j in orth[k]]) / np.sqrt(n_ind * len(orth[k])))
         off = float(np.median(wrap(psi[w] - th[k] - 90)))
         imin = float(means[k])
         lower = bool(imin < 2 * s_min)
@@ -854,10 +858,33 @@ def direct_er(d, pol, box_us=4.0, correct_drift=False, gains=None):
         pts.append(dict(kind="static", seg=s["kind"], t_ms=float(t[w].mean() * 1e3),
                         theta=float(th[k]), rotation=float(np.median(rot[w])), rate=0.0,
                         imin_mV=imin * 1e3, sig_mV=s_min * 1e3, imax_V=imax,
+                        sig_imax_V=s_max,
                         er=imax / (2 * s_min) if lower else imax / imin, lower=lower,
                         off_deg=off, imin_from_offset_mV=from_off * 1e3,
                         offset_limited=bool(from_off > 0.5 * max(imin, 0.0))))
     return pts
+
+
+def er_sigma(er, imin, sig_imin, imax=None, sig_imax=0.0):
+    """(down, up) error of ER = Imax / Imin from the statistical errors -
+    asymmetric because ER goes as 1/Imin; up is inf where Imin is within
+    1 sigma of zero."""
+    r = abs(sig_imin / imin) if imin else np.inf
+    q = abs(sig_imax / imax) if imax else 0.0
+    if r >= 1:
+        return er * (1 - 1 / (1 + r)), np.inf
+    lo = er - er * (1 - q) / (1 + r)
+    hi = er * (1 + q) / (1 - r) - er
+    return float(lo), float(hi)
+
+
+def leg_of(segs, t):
+    """The transport (leg) a time belongs to, from segments(): 'up 2' ->
+    2; a record with one transport, or a time before it, is leg 1."""
+    for s in segs:
+        if s["t0"] <= t <= s["t1"]:
+            return max(1, int(s.get("leg", 1) or 1))
+    return 1
 
 
 # -- the fit's residual, and the polarization state ---------------------------

@@ -426,11 +426,19 @@ class BiasRun:
         return float(per.mean()), float(per.std(ddof=1) / math.sqrt(len(per))) if len(per) > 1 else 0.0
 
     def _clipped(self, stack, setting, t, w):
+        return self._clip_side(stack, setting, t, w) is not None
+
+    def _clip_side(self, stack, setting, t, w):
+        """'high' or 'low' when any shot leaves the screen in the window,
+        else None (the screen is +-4 div about the offset)."""
         sc, off = setting
         m = (t >= w[0]) & (t <= w[1])
-        hi, lo = off + 3.9 * sc, off - 3.9 * sc
         x = stack[:, m]
-        return bool((x > hi).any() or (x < lo).any())
+        if (x > off + 3.9 * sc).any():
+            return "high"
+        if (x < off - 3.9 * sc).any():
+            return "low"
+        return None
 
     # -- the AWG -----------------------------------------------------------
     def _wave(self, bias_deg):
@@ -774,11 +782,12 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
             f"Imin {imin4*1e3:.1f} mV (raw, coarse) in "
             + ("the whole record" if window_s is None else
                f"{w[0]*1e3:.2f}..{w[1]*1e3:.2f} ms"))
+        z = 0.0         # the floor kept on screen: offset = z + 3 V/div (see range_setting)
         if kind == "min":
             center = (psi + 90) % 180
             ladder = _ladder(amp, half, coarse[0])
             est = amp * math.sin(math.radians(half + 1)) ** 2
-            sets = [(v, imin4 + 3 * v) for v in ladder] + [coarse]
+            sets = [range_setting(v, z) for v in ladder] + [coarse]
             k = next((i for i, s_ in enumerate(sets) if est < 5.5 * s_[0]), len(sets) - 1)
         else:
             center = psi % 180
@@ -790,12 +799,26 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
             I, S, clipped = [], [], False
             for a in th:
                 t, s = acquire(a % 180, setting, f"analyzer {a % 180:.2f} deg")
-                if setting != coarse and br._clipped(s["PD"], setting, t, w):
+                side = br._clip_side(s["PD"], setting, t, w) if setting != coarse else None
+                if side == "low" and kind == "min":
+                    # below the screen: the floor (PD dark) is under 0 V -
+                    # lower it and take the same V/div again
+                    mwin = (t >= w[0]) & (t <= w[1])
+                    z = float(np.min(s["PD"][:, mwin])) - 1.5 * setting[0]
+                    sets = [range_setting(v, z) for v in ladder] + [coarse]
+                    log(f"  below the screen at {setting[0]*1e3:g} mV/div - floor now "
+                        f"{z*1e3:+.1f} mV")
+                    clipped = True
+                    prog["total"] += npts
+                    break
+                if side is not None:
                     clipped = True
                     break
                 m_, se = br._window(t, s["PD"], w)
                 I.append(m_)
                 S.append(max(se, 1e-6))
+            if clipped and side == "low":
+                continue
             if clipped:
                 prog["total"] += npts
                 k = min(k + 1, len(sets) - 1)
@@ -825,9 +848,11 @@ def find_extremum(link, rot, roles, kind="min", window_s=None, bias_deg=None,
             f"mdeg ({level*1e3:.2f} mV raw at {setting[0]*1e3:g} mV/div); analyzer now "
             f"at {got:.3f}")
         return {"kind": kind, "angle": float(angle), "sig": fit["sig_theta_n"],
-                "level": float(level), "psi_coarse": psi, "theta": th.tolist(),
+                "level": float(level), "level_raw": float(level),
+                "psi_coarse": psi, "theta": th.tolist(),
                 "I": [float(x) for x in I], "sem": S, "vdiv": setting[0], "fit": fit,
-                "window": None if window_s is None else list(w), "bias": bias_deg}
+                "window": None if window_s is None else list(w), "bias": bias_deg,
+                "setting": list(setting), "keys": [_key(coarse), _key(setting)]}
     finally:
         if on:
             br.sess.end(p.get("end", "off"))
@@ -886,13 +911,64 @@ class static_light:
         return False
 
 
+def range_setting(vdiv, z=0.0):
+    """(V/div, offset) with the floor z three divisions below the centre:
+    the screen holds z - 1 div .. z + 7 div. The floor has to be on screen at
+    every setting, or the dark / background (beam blocked: ~z) could not be
+    measured there - and it is measured at the same setting because the
+    scope's own offset error moves with V/div and offset (-34 mV at 1 V/div,
+    2.65 V offset on 5 Oct 2026)."""
+    return (float(vdiv), round(float(z) + 3.0 * float(vdiv), 6))
+
+
+def vdiv_ladder(coarse_vdiv, finest=1e-3):
+    """Every 1-2-5 V/div from `finest` up to just under the coarse one."""
+    out, v = [], float(finest)
+    while v < coarse_vdiv * 0.99 and len(out) < 14:
+        out.append(v)
+        v = _nice_up(v * 1.5)
+    return out
+
+
+def malus_fit(theta_deg, I, sem=None):
+    """I = a0 + c2 cos 2theta + s2 sin 2theta, weighted by 1/sem^2 when
+    given. Returns dict(psi (max), imax, imin, sig_imin, er, er_lower, a0,
+    c2, s2): Imin = a0 - B with its error through the full covariance."""
+    th = np.deg2rad(np.asarray(theta_deg, float))
+    I = np.asarray(I, float)
+    A = np.column_stack([np.ones_like(th), np.cos(2 * th), np.sin(2 * th)])
+    w = np.ones_like(I)
+    if sem is not None:
+        se = np.maximum(np.asarray(sem, float), 1e-7)
+        w = 1.0 / se
+    coef, *_ = np.linalg.lstsq(A * w[:, None], I * w, rcond=None)
+    a0, c2, s2 = coef
+    B = math.hypot(c2, s2)
+    res = (I - A @ coef) * w
+    dof = max(len(I) - 3, 1)
+    chi2 = float(res @ res / dof)
+    cov = np.linalg.pinv((A * w[:, None]).T @ (A * w[:, None])) * max(chi2, 1.0)
+    g = np.array([1.0, -c2 / B, -s2 / B]) if B > 0 else np.array([1.0, 0, 0])
+    sig = float(np.sqrt(max(g @ cov @ g, 0.0)))
+    imax, imin = a0 + B, a0 - B
+    lower = imin < 2 * sig
+    er = imax / (2 * sig) if lower else imax / imin
+    return {"psi": math.degrees(0.5 * math.atan2(s2, c2)) % 180, "imax": float(imax),
+            "imin": float(imin), "sig_imin": sig, "er": float(er), "er_lower": bool(lower),
+            "a0": float(a0), "c2": float(c2), "s2": float(s2), "chi2": chi2}
+
+
 def malus_scan(link, rot, roles, angles, window_s=None, plan=None, log=print,
-               cancelled=None, progress=None):
+               cancelled=None, progress=None, autorange=True):
     """The analyzer stepped over `angles` (deg), the PD mean in the window at
-    each (the PD's own V/div: a coarse look, not an ER measurement), fitted
-    to I = a0 + c2 cos 2theta + s2 sin 2theta. Returns dict(theta, I, sem,
-    psi (max transmission), angle_max, angle_min, imax, imin, er_coarse,
-    window). Leaves the analyzer at the last angle."""
+    each. With `autorange` every angle is read at the most sensitive V/div
+    that holds it - predicted from the Malus fit of the points so far, one
+    step coarser on a clip, re-read finer when a much finer setting would
+    hold it - so the points near crossed are resolved instead of sitting at
+    one ADC code of the coarse V/div. Offsets follow range_setting (the floor
+    on screen), so a dark / background can be measured at each setting used
+    afterwards (`keys`, apply_offsets). Returns the raw result; apply_offsets
+    subtracts and fits. Leaves the analyzer at the last angle."""
     import tempfile
     p = dict(PLAN, **(plan or {}))
     br = BiasRun(tempfile.gettempdir(), "scan", link, rot, None, roles, plan=p, log=log,
@@ -901,25 +977,195 @@ def malus_scan(link, rot, roles, angles, window_s=None, plan=None, log=print,
     pd = roles["PD"]
     coarse = link.channel_state([pd])[pd]
     w = window_s if window_s is not None else (-1e9, 1e9)
-    th, I, S = [], [], []
+    vs = vdiv_ladder(coarse[0]) if autorange else []
+    z = 0.0
+
+    def settings():
+        return [range_setting(v, z) for v in vs] + [coarse]      # finest first
+
+    def finest_for(lo, hi):
+        """The finest setting whose screen holds lo..hi with 0.5 div spare."""
+        for st_ in settings():
+            v, off = st_
+            if st_ == coarse or (lo > off - 3.5 * v and hi < off + 3.5 * v):
+                return st_
+        return coarse
+
+    th, I, S, keys, vd, rng = [], [], [], [], [], []
     t_run, n = time.time(), len(angles)
+    spread = 0.0
     for i, a in enumerate(angles):
         if progress is not None:
             progress(i, n, f"Malus scan: analyzer {a:.1f} deg ({i + 1}/{n}{eta(t_run, i, n)})")
-        t, s = br._acquire(float(a) % 360.0, coarse)
-        m, se = br._window(t, s["PD"], w)
+        # the starting setting: predicted from the points so far
+        if autorange and len(I) >= 3:
+            f_ = malus_fit(th, I, S)
+            r = math.radians(a)
+            pred = f_["a0"] + f_["c2"] * math.cos(2 * r) + f_["s2"] * math.sin(2 * r)
+            setting = finest_for(min(0.5 * pred, z) - spread, 1.6 * pred + spread)
+        else:
+            setting = coarse
+        move = float(a) % 360.0
+        for _try in range(6):
+            t, s_ = br._acquire(move, setting)
+            move = None                       # retries at the same angle
+            mwin = (t >= w[0]) & (t <= w[1])
+            x = s_["PD"][:, mwin]
+            lo, hi = float(x.min()), float(x.max())
+            side = br._clip_side(s_["PD"], setting, t, w) if setting != coarse else None
+            if side == "low":
+                z = lo - 1.5 * setting[0]
+                setting = range_setting(setting[0], z)
+                continue
+            if side == "high":
+                ss = settings()
+                setting = ss[min(ss.index(setting) + 1, len(ss) - 1)]
+                continue
+            if autorange:
+                best = finest_for(lo, hi)
+                ss = settings()
+                if setting in ss and ss.index(best) <= ss.index(setting) - 2:
+                    setting = best            # two or more steps finer: worth a re-read
+                    continue
+            break
+        m_, se = br._window(t, s_["PD"], w)
+        spread = max(spread * 0.5, hi - lo)
         th.append(float(a))
-        I.append(m)
-        S.append(se)
-        log(f"  analyzer {a:7.2f}: PD {m*1e3:9.2f} +- {se*1e3:.2f} mV")
+        I.append(m_)
+        S.append(max(se, 1e-7))
+        keys.append(_key(setting))
+        vd.append(setting[0])
+        rng.append(list(setting))
+        log(f"  analyzer {a:7.2f}: PD {m_*1e3:10.3f} +- {se*1e3:.3f} mV raw at "
+            f"{setting[0]*1e3:g} mV/div")
     if progress is not None:
         progress(n, n, "Malus scan done")
-    psi, imax, imin = malus4(th, I)
-    out = {"kind": "scan", "theta": th, "I": I, "sem": S, "psi": psi % 180,
-           "angle_max": psi % 180, "angle_min": (psi + 90) % 180, "imax": imax,
-           "imin": imin, "er_coarse": imax / imin if imin > 0 else None,
-           "window": None if window_s is None else list(w), "vdiv": coarse[0]}
-    log(f"Malus scan: maximum at analyzer {out['angle_max']:.2f} deg, minimum at "
-        f"{out['angle_min']:.2f} deg; Imax {imax:.3f} V, Imin {imin*1e3:.1f} mV at "
-        f"{coarse[0]:g} V/div (coarse - Find min refines the minimum at a sensitive V/div)")
+    out = {"kind": "scan", "theta": th, "I_raw": I, "sem": S, "keys": keys, "vdivs": vd,
+           "settings": rng, "window": None if window_s is None else list(w),
+           "vdiv": coarse[0], "offsets": {}, "offset_note": "nothing subtracted"}
+    return apply_offsets(out, {}, log=log)
+
+
+# ------------------------------------- dark / background for the analyzer scans
+OFFSETS_FILE = "analyzer_offsets.json"
+
+
+def apply_offsets(out, picked, log=None):
+    """Subtract the dark / background measured at each reading's own
+    setting (picked: {key: {level, sem, kind, when}}) and fit. Readings at a
+    setting with nothing picked stay raw and are counted. Works for a Malus
+    scan (kind 'scan') and a Find result (its level)."""
+    if out["kind"] == "scan":
+        I_raw = np.asarray(out["I_raw"], float)
+        sub = np.array([picked[k]["level"] if k in picked else 0.0 for k in out["keys"]])
+        ssub = np.array([picked[k].get("sem", 0.0) if k in picked else 0.0
+                         for k in out["keys"]])
+        I = I_raw - sub
+        S = np.sqrt(np.asarray(out["sem"], float) ** 2 + ssub ** 2)
+        fit = malus_fit(out["theta"], I, S)
+        miss = sorted({k for k in out["keys"] if k not in picked})
+        out.update(I=I.tolist(), sem_corr=S.tolist(), subtracted=sub.tolist(),
+                   psi=fit["psi"], angle_max=fit["psi"], angle_min=(fit["psi"] + 90) % 180,
+                   imax=fit["imax"], imin=fit["imin"], sig_imin=fit["sig_imin"],
+                   er=fit["er"], er_lower=fit["er_lower"], fit=fit,
+                   er_coarse=fit["er"], missing=miss)
+        if log:
+            log(f"Malus scan: maximum at analyzer {out['angle_max']:.2f} deg, minimum at "
+                f"{out['angle_min']:.2f} deg; Imax {fit['imax']:.4f} V, Imin "
+                f"{fit['imin']*1e3:.3f} +- {fit['sig_imin']*1e3:.3f} mV, ER "
+                f"{'>' if fit['er_lower'] else ''}{fit['er']:.0f}"
+                + (f" ({len(miss)} setting(s) without an offset - raw)" if miss and picked
+                   else ""))
+    else:
+        k = out["keys"][-1]
+        lv = picked.get(k)
+        out["level"] = out["level_raw"] - (lv["level"] if lv else 0.0)
+        out["missing"] = [] if lv else [k]
+    out["offsets"] = picked
+    kinds = sorted({v["kind"] for v in picked.values()})
+    out["offset_note"] = (f"{' / '.join(kinds)} subtracted at {len(picked)} setting(s)"
+                          if picked else "nothing subtracted")
+    return out
+
+
+def measure_offsets(link, rot, roles, keys_settings, window_s, plan, log=print,
+                    cancelled=None, progress=None, label=""):
+    """The PD's level with no light (dark: PD covered; background: beam
+    blocked) at each setting in {key: (V/div, offset)}, in the window, as
+    the readings were taken. Returns {key: {level, sem, n}}."""
+    import tempfile
+    p = dict(PLAN, **(plan or {}))
+    br = BiasRun(tempfile.gettempdir(), "offs", link, rot, None, roles, plan=p, log=log,
+                 cancelled=cancelled, session=object())
+    br.pd_only = True
+    w = window_s if window_s is not None else (-1e9, 1e9)
+    out, t_run, n = {}, time.time(), len(keys_settings)
+    for i, (key, setting) in enumerate(sorted(keys_settings.items())):
+        if progress is not None:
+            progress(i, n, f"{label} at {setting[0]*1e3:g} mV/div ({i + 1}/{n}"
+                           f"{eta(t_run, i, n)})")
+        t, s_ = br._acquire(None, tuple(setting))
+        m_, se = br._window(t, s_["PD"], w)
+        out[key] = {"level": m_, "sem": se, "n": int(s_["PD"].shape[0])}
+        log(f"  {label} at {setting[0]*1e3:g} mV/div, offset {setting[1]*1e3:+.1f} mV: "
+            f"{m_*1e3:+.3f} +- {se*1e3:.3f} mV")
+    if progress is not None:
+        progress(n, n, f"{label} done")
+    return out
+
+
+def save_offsets(outdir, kind, mode, levels, settings):
+    """Append a measurement to <outdir>/analyzer_offsets.json (newest last)."""
+    import datetime
+    from .config import replace_retrying
+    path = os.path.join(outdir, OFFSETS_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            db = json.load(fh)
+    except (OSError, ValueError):
+        db = {"records": []}
+    db["records"].append({"kind": kind, "mode": mode,
+                          "when": datetime.datetime.now().isoformat(timespec="seconds"),
+                          "levels": levels,
+                          "settings": {k: list(v) for k, v in settings.items()}})
+    os.makedirs(outdir, exist_ok=True)
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(db, fh, indent=1)
+    replace_retrying(tmp, path)
+    return path
+
+
+def pick_offsets(outdir, settings, mode, measured=None, kinds=("background", "dark")):
+    """{key: {level, sem, kind, when}} for each setting {key: (V/div, offset)}:
+    `measured` (this run's, {kind: {key: ...}}) first, else the newest stored
+    measurement in the same mode at the same V/div with an offset within
+    max(2 div, 5 %) (the scope's offset error moves ~1.3 % of the offset).
+    Background before dark (it includes the stray light)."""
+    measured = measured or {}
+    try:
+        with open(os.path.join(outdir, OFFSETS_FILE), encoding="utf-8") as fh:
+            recs = json.load(fh).get("records", [])
+    except (OSError, ValueError):
+        recs = []
+    out = {}
+    for key, (v, off) in settings.items():
+        for kind in [k for k in ("background", "dark") if k in kinds]:
+            got = (measured.get(kind) or {}).get(key)
+            if got:
+                out[key] = dict(got, kind=kind, when="this run")
+                break
+            best = None
+            for r in reversed(recs):
+                if r.get("kind") != kind or r.get("mode") != mode:
+                    continue
+                for k2, (v2, off2) in r.get("settings", {}).items():
+                    if abs(v2 / v - 1) < 1e-6 and abs(off2 - off) <= max(2 * v, 0.05 * abs(off)):
+                        best = dict(r["levels"][k2], kind=kind, when=r["when"])
+                        break
+                if best:
+                    break
+            if best:
+                out[key] = best
+                break
     return out

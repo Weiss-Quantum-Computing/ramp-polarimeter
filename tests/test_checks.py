@@ -14,7 +14,7 @@ from rampol import checks, config, hw, sim  # noqa: E402
 
 FAILS = []
 ROLES = {1: "CmdX1", 2: "PD", 3: "MonX1", 4: "MonX2"}
-PRESET = config.PRESETS["Spin echo 16.7 ms (2 legs)"]
+PRESET = config.PRESETS[config.SPIN_ECHO]
 PLAN = {**config.DEFAULTS["scan"], **PRESET["scan"], "dither_codes": 3, "points": 20000}
 
 

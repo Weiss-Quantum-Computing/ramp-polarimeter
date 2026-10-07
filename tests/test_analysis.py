@@ -160,7 +160,7 @@ def spin_echo_checks(sg):
                       lock_miss=1 / 6)
     scope, ell, bench = sim.make(sg, bench=bench,
                                  roles={1: "CmdX1", 2: "PD", 3: "MonX1", 4: "MonX2"})
-    for k, v in config.PRESETS["Spin echo 16.7 ms (2 legs)"]["scope"].items():
+    for k, v in config.PRESETS[config.SPIN_ECHO]["scope"].items():
         scope.put(k, v)
     link, rot = hw.ScopeLink(scope, log=lambda *_: None), hw.Rotator(ell, log=lambda *_: None)
     chans = {1: ("CmdX1", "Trek X1 command"), 2: ("PD", "Analyzer PD"), 3: ("MonX1", "X1"),

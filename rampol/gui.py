@@ -53,6 +53,35 @@ AWG_HELP = (
     "(close, Disconnect, a bias run) is Park: an idle waveform with the outputs ON, because "
     "the FPGA/buffer stage drives high (-4 to -5.7 kV) on a floating input. Outputs OFF "
     "then asks first.")
+ER_HELP = """Every point is Imax / Imin of the light at one moment: how far from perfectly linear the light is. They differ only in HOW Imin and Imax are obtained.
+
+MEASURED AT A CROSSING (circles)
+During a ramp the polarization sweeps past the crossed position of each analyzer angle the scan used. At that instant:
+  Imin = that analyzer angle's own trace at its lowest point (4 us average),
+  Imax = the trace of the analyzer angle 90 deg away, at the same instant.
+Both numbers are read straight off the photodiode; the Malus fit only says WHEN the crossing happens. The most direct number there is.
+
+DIP FIT (triangles)
+The same crossings, analysed differently: the dip I(t) = Imin + Imax sin^2(psi(t) - theta) is fitted over +-8 deg around the crossing, with psi(t) and Imax taken from the per-sample Malus fit. It uses many samples, so it is less noisy, but it leans on the fit. The older plot's "dip, rising" / "dip, falling" were these points split by which way the rotation was moving. Circles and triangles at the same time should agree; where they do not, trust the circle.
+
+MEASURED, STATIC (squares)
+At rest, in the holds and after the ramp nothing sweeps through crossed, so the scan angle nearest crossed is used: Imin = its trace averaged over the stretch, Imax = its 90-deg partner. If that angle sat a few degrees off crossed, the offset alone puts Imax sin^2(offset) into Imin: hollow grey squares are those, where the offset explains over half of Imin - they say how far the angle was, not what the light is.
+
+NULL REFINE (diamonds)
+The static stretches again, measured properly: extra analyzer angles stepped within a few degrees of crossed, read at a sensitive V/div (Analyzer tab, Refine), Imin fitted. The best static number.
+
+PER-SAMPLE MALUS FIT (grey line, "ER_fit")
+At every time sample, all analyzer angles fitted to a0 + B cos 2(theta - psi): Imax = a0 + B, Imin = a0 - B. It needs the light level to be identical for every angle, so intensity drift between angles limits it: the dotted line is 1 / (how well the reference returns predict each other). Above that line ER_fit means nothing - which is why the other methods exist.
+
+COLOURS, FILL, ARROWS, BARS
+  Colour = which transport: leg 1 (the first motion) blue, leg 2 (the second) orange. The time axis is shaded per leg.
+  Filled = the rotation is moving away from rest (ramp out); hollow = moving back toward rest (ramp back).
+  An arrow pointing up = a lower bound: Imin is under 2 sigma of its own noise, so the ER is at least Imax / (2 sigma).
+  Error bars = +-1 sigma from the statistical errors of Imin (and of Imax for the measured points); asymmetric, because ER goes as 1 / Imin. They do not include systematic errors (the dark / background subtraction, the analyzer's per-angle transmission, the scope's gain).
+
+x axis "rotation" puts both legs and both directions on one axis, so a property of the optics (the same at the same rotation) lines up, and one of the dynamics does not.
+"""
+ANALYZER_OFFSETS = ("measure after", "reuse latest", "none")
 FIND_LIGHT = ("record window", "static light (line trigger)")
 MAP_MODES = ("transmission", "fit residual (mV)", "residual / standard error")
 PLOT_HINT = ("Click a time on the Map, Angle or Extinction tab to move the "
@@ -318,6 +347,21 @@ class App:
         cb.bind("<<ComboboxSelected>>", lambda _e: self.preset_picked())
         self._btn(r, "Apply to scope", self.do_apply_preset)
         self.sv = {}
+        # the spin-echo sequence: shown when the preset is built from it
+        self.seq_row = ttk.Frame(f)
+        self.seq = {}
+        for label, key, w in (("legs", "spacing_ms", 7), ("ms apart, motion", "motion_ms", 5),
+                              ("ms; keep", "before_ms", 4), ("before /", "after_ms", 4)):
+            ttk.Label(self.seq_row, text=label).pack(side="left", padx=(0, 2))
+            v = tk.StringVar()
+            e = ttk.Entry(self.seq_row, textvariable=v, width=w)
+            e.pack(side="left", padx=(0, 4))
+            e.bind("<Return>", lambda _e: self.sequence_changed())
+            e.bind("<FocusOut>", lambda _e: self.sequence_changed())
+            self.seq[key] = v
+        ttk.Label(self.seq_row, text="ms after").pack(side="left")
+        self.seq_lbl = CopyLabel(f, text="", foreground="#666", width=48)
+        self._seq_anchor = r
 
         def row(items):
             rr = ttk.Frame(f)
@@ -487,9 +531,11 @@ class App:
                           width=9, state="readonly")
         cb.pack(side="left", padx=4)
         cb.bind("<<ComboboxSelected>>", lambda _e: self.redraw(self.fig_ext))
+        ttk.Button(ctl, text="What are these?", command=self.show_er_help).pack(
+            side="left", padx=(8, 0))
         self.ext_show = {}
-        for key, text in (("fit", "ER_fit"), ("dips", "dips (fitted Imax)"),
-                          ("direct", "direct (both measured)"), ("refine", "null refine")):
+        for key, text in (("direct", "measured"), ("dips", "dip fit"),
+                          ("refine", "null refine"), ("fit", "ER_fit line")):
             v = tk.BooleanVar(value=True)
             ttk.Checkbutton(ctl, text=text, variable=v,
                             command=lambda: self.redraw(self.fig_ext)).pack(side="left",
@@ -1160,10 +1206,11 @@ class App:
                     self.link, self.rot, roles, kind, window_s=(t0, t1), plan=plan,
                     log=self.log, cancelled=self.stop_flag.is_set, ask=self.ask_main,
                     progress=self._progress)
+            post = self._analyzer_offsets(c, roles, plan)
             if zoom:
                 plan["points"] = 20000
                 with biasmod.window_timebase(self.link, (t0, t1), self.log):
-                    out = run()
+                    out = post(run(), (t0, t1), "awg hold")
             else:
                 # the AWG's whole record on screen, whatever the preset's timebase
                 div, pos = awgmod.timebase_for(wave)
@@ -1172,7 +1219,7 @@ class App:
                 sc.put(":TIMebase:SCALe", f"{div:.6g}")
                 sc.put(":TIMebase:POSition", f"{pos:.6g}")
                 self._window_in_record(sc.read_settings(), (t0, t1), "hold window")
-                out = run()
+                out = post(run(), (t0, t1), "awg hold")
             out["bias"] = rotation
             return out
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
@@ -2353,28 +2400,98 @@ class App:
         ttk.Checkbutton(rr, text="timebase to the window", variable=self.find_zoom).pack(
             side="left", padx=(6, 0))
         self._btn(rr, "Set scope as ramp scan", self.do_apply_preset, padx=(6, 0))
+        rr = ttk.Frame(f)
+        rr.pack(fill="x", padx=6, pady=1)
+        self.find_off = {}
+        for label, kind, default in (("Dark", "dark", "none"),
+                                     ("Background", "background", "measure after")):
+            ttk.Label(rr, text=label).pack(side="left", padx=(0, 2))
+            v = tk.StringVar(value=default)
+            ttk.Combobox(rr, textvariable=v, values=ANALYZER_OFFSETS, width=12,
+                         state="readonly").pack(side="left", padx=(0, 8))
+            self.find_off[kind] = v
         ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
-            "Static light: nothing ramping - LINE trigger, PD mean over one line "
-            "period. Record window: a time in the experiment's record (rest "
-            "-10:-0.5, a hold). Malus scan: the whole curve; Find refines it.")).pack(
+            "Static light: nothing ramping, LINE trigger, PD mean over one line period. "
+            "Dark/background: measured after, at every V/div used, and subtracted.")).pack(
             anchor="w", padx=6, pady=(2, 4))
 
-    def _run_in_window(self, run, static, win, line_hz, zoom, st):
+    def _run_in_window(self, run, static, win, line_hz, zoom, st, post=None):
         """Worker: run(window) with the scope set for it - static light (LINE
         trigger, one line period), or the record window with the timebase
-        zoomed onto it (zoom) or checked to cover it - and everything changed
-        put back afterwards."""
+        zoomed onto it (zoom) or checked to cover it - then post(out, window)
+        (the dark / background) in the same scope state, and everything
+        changed put back afterwards."""
         from . import bias as biasmod
+        post = post or (lambda o, w_, mode: o)
         if static:
             with biasmod.static_light(self.link, line_hz, self.log) as w:
                 out = run(w)
-            out["static"] = True
-            return out
+                out["static"] = True
+                return post(out, w, "static")
         if zoom and win is not None:
             with biasmod.window_timebase(self.link, win, self.log):
-                return run(win)
+                return post(run(win), win, "window")
         self._window_in_record(st, win)
-        return run(win)
+        return post(run(win), win, "window")
+
+    def _analyzer_offsets(self, c, roles, plan):
+        """post() for Find and the Malus scan: the dark (PD covered) and / or
+        background (beam blocked) at every setting the readings used -
+        measured now, with prompts, or the newest stored ones - subtracted
+        (background before dark: it includes the stray light)."""
+        from . import bias as biasmod
+        modes = {k: c["find"].get(f"{k}_mode", d) for k, d in
+                 (("dark", "none"), ("background", "measure after"))}
+        outdir = c["outdir"]
+        b = self.bench
+
+        def post(out, w, light):
+            if out["kind"] == "scan":
+                sets = {k: tuple(st_) for k, st_ in zip(out["keys"], out["settings"])}
+            else:
+                sets = {out["keys"][-1]: tuple(out["setting"])}
+            kinds = [k for k in ("background", "dark") if modes[k] != "none"]
+            if not kinds:
+                return biasmod.apply_offsets(out, {}, log=self.log)
+            measured = {}
+            for kind in ("dark", "background"):
+                if modes[kind] != "measure after":
+                    continue
+                title, ask, undo = self.OFFSET_PROMPTS[kind]
+                if not self.ask_main(title, ask + f"\n\n({len(sets)} setting(s); the "
+                                     f"analyzer stays where it is.)"):
+                    self.log(f"  {kind} skipped")
+                    continue
+                if b is not None:
+                    if kind == "dark":
+                        b.covered = True
+                    else:
+                        b._imax_saved, b.imax = b.imax, 0.0
+                try:
+                    measured[kind] = biasmod.measure_offsets(
+                        self.link, self.rot, roles, sets, w, plan, log=self.log,
+                        cancelled=self.stop_flag.is_set, progress=self._progress, label=kind)
+                finally:
+                    if b is not None:
+                        if kind == "dark":
+                            b.covered = False
+                        else:
+                            b.imax = b._imax_saved
+                self.ask_main(title, undo)
+                try:
+                    biasmod.save_offsets(outdir, kind, light, measured[kind], sets)
+                except OSError as exc:
+                    self.log(f"  {kind} not stored ({exc})")
+            picked = biasmod.pick_offsets(outdir, sets, light, measured, kinds)
+            for k, v in picked.items():
+                self.log(f"  subtract {v['kind']} {v['level']*1e3:+.3f} mV at {k} "
+                         f"({v['when']})")
+            out = biasmod.apply_offsets(out, picked, log=self.log)
+            if out.get("missing"):
+                self.log(f"  no {' / '.join(kinds)} for {', '.join(out['missing'])} - those "
+                         f"readings stay raw ('measure after' measures them)")
+            return out
+        return post
 
     def _find_setup(self, c, zoom=False):
         """(static, window s, line Hz, plan) from the Find settings. The
@@ -2485,7 +2602,8 @@ class App:
                     self.link, self.rot, roles, kind, window_s=w, plan=plan, half_deg=half,
                     points=points, log=self.log, cancelled=self.stop_flag.is_set,
                     ask=self.ask_main, progress=self._progress)
-            return self._run_in_window(run, static, win, line_hz, zoom, st)
+            return self._run_in_window(run, static, win, line_hz, zoom, st,
+                                       self._analyzer_offsets(c, roles, plan))
 
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
 
@@ -2519,7 +2637,8 @@ class App:
                                           plan=plan, log=self.log,
                                           cancelled=self.stop_flag.is_set,
                                           progress=self._progress)
-            return self._run_in_window(run, static, win, line_hz, zoom, st)
+            return self._run_in_window(run, static, win, line_hz, zoom, st,
+                                       self._analyzer_offsets(c, roles, plan))
 
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
 
@@ -2530,16 +2649,18 @@ class App:
             out["angle"] = out["angle_min"]
             self.find_lbl.configure(
                 text=f"Malus scan: maximum at {out['angle_max']:.2f} deg, minimum at "
-                     f"{out['angle_min']:.2f} deg (coarse, {out['vdiv']:g} V/div) - Find "
-                     f"min refines it")
+                     f"{out['angle_min']:.2f} deg; ER {'>' if out['er_lower'] else ''}"
+                     f"{out['er']:.0f} from the fit ({out['offset_note']})")
             self.find_zero_btn.configure(state="normal")
             if self.rot is not None:
                 self.show_pos(self.rot.position())
         else:
+            sub = out.get("level_raw", out["level"]) - out["level"]
             self.find_lbl.configure(
                 text=f"{out['kind']} at analyzer {out['angle']:.3f} +- "
-                     f"{out['sig']*1e3:.0f} mdeg ({out['level']*1e3:.2f} mV raw); "
-                     f"the analyzer is there now")
+                     f"{out['sig']*1e3:.0f} mdeg; level {out['level']*1e3:.3f} mV"
+                     + (f" ({out['offset_note']}: {sub*1e3:+.3f} mV)" if out.get("offsets")
+                        else " (raw)") + "; the analyzer is there now")
             self.find_zero_btn.configure(state="normal" if out["kind"] == "min" else "disabled")
             self.show_pos(out["angle"])
         self.plot_dirty.add(self.fig_find._frame)
@@ -2579,17 +2700,46 @@ class App:
         ax.errorbar(th, I * 1e3, np.array(out["sem"]) * 1e3, fmt="o", ms=4,
                     label="PD mean per angle")
         if out["kind"] == "scan":
-            xx = np.linspace(0, 180, 361)
-            model = out["imin"] + (out["imax"] - out["imin"]) * np.cos(
-                np.deg2rad(xx - out["angle_max"])) ** 2
-            ax.plot(xx, model * 1e3, color="k", lw=0.9, label="a0 + B cos 2(theta - psi)")
-            ax.axvline(out["angle_max"], color="#2ca02c", lw=0.8, ls="--",
-                       label=f"maximum {out['angle_max']:.2f} deg")
-            ax.axvline(out["angle_min"], color="#9467bd", lw=0.8, ls="--",
-                       label=f"minimum {out['angle_min']:.2f} deg")
-            ax.set_ylabel(f"PD (mV, raw, at {out['vdiv']:g} V/div)")
-            ax.set_title(f"Malus scan ({where})", fontsize=9)
-            ax.legend(fontsize=7)
+            fig.clear()
+            ax = fig.add_subplot(211)
+            ax2 = fig.add_subplot(212, sharex=ax)
+            Ic = np.asarray(out["I"]) * 1e3
+            Sc = np.asarray(out.get("sem_corr", out["sem"])) * 1e3
+            vds = np.asarray(out.get("vdivs", [out["vdiv"]] * len(th)))
+            xx = np.linspace(0, 180, 721)
+            f_ = out["fit"]
+            model = (f_["a0"] + f_["c2"] * np.cos(np.deg2rad(2 * xx))
+                     + f_["s2"] * np.sin(np.deg2rad(2 * xx))) * 1e3
+            cmap = matplotlib.colormaps["viridis"]
+            levels = sorted(set(vds))
+            for i_, v in enumerate(levels):
+                m = vds == v
+                col = cmap(i_ / max(len(levels) - 1, 1))
+                for a_ in (ax, ax2):
+                    a_.errorbar(th[m], Ic[m], Sc[m], fmt="o", ms=4, color=col,
+                                label=f"read at {v*1e3:g} mV/div" if a_ is ax else None)
+            for a_ in (ax, ax2):
+                a_.plot(xx, model, color="k", lw=0.8)
+                a_.axvline(out["angle_max"], color="#2ca02c", lw=0.8, ls="--")
+                a_.axvline(out["angle_min"], color="#9467bd", lw=0.8, ls="--")
+                a_.grid(alpha=0.3, which="both")
+            ax.plot([], [], color="k", lw=0.8, label="a0 + B cos 2(theta - psi), weighted")
+            ax.set_ylabel("PD (mV)")
+            ax.set_title(f"Malus scan ({where}); {out['offset_note']}", fontsize=9)
+            ax.legend(fontsize=6, ncol=2, loc="upper right")
+            ax.tick_params(labelbottom=False)
+            pos = Ic > 0
+            ax2.set_yscale("log")
+            lo = max(min(np.min(Ic[pos]) if pos.any() else 1e-3, model.min() if model.min() > 0
+                         else 1e9) * 0.3, 1e-3)
+            ax2.set_ylim(lo, max(Ic.max(), model.max()) * 2)
+            ax2.set_ylabel("PD (mV, log)")
+            ax2.set_xlabel("analyzer angle (deg)")
+            ax2.set_title(f"maximum {out['angle_max']:.2f} deg, minimum {out['angle_min']:.2f} "
+                          f"deg; Imax {out['imax']:.4f} V, Imin {out['imin']*1e3:.3f} +- "
+                          f"{out['sig_imin']*1e3:.3f} mV, ER {'>' if out['er_lower'] else ''}"
+                          f"{out['er']:.0f}", fontsize=8)
+            return
         else:
             f_ = out["fit"]
             xx = np.linspace(th.min(), th.max(), 300)
@@ -2620,6 +2770,7 @@ class App:
                 lock_tol=float(c["analysis"].get("lock_tol", 0.006)),
                 pd_delay_us=float(i["pd_delay_us"]), split=float(i["split"]),
                 line_ref=i.get("line_ref") or None,
+                leg_gap_ms=float(c.get("sequence", {}).get("spacing_ms", 16.667)),
                 scope_grab_path=c["scope_grab_path"], eomilc_path=c["eomilc_path"],
                 log=self.log)
 
@@ -2693,6 +2844,8 @@ class App:
         self.find_light.set(c["find"].get("light", FIND_LIGHT[0]))
         self.find_preset.set(bool(c["find"].get("use_preset", True)))
         self.find_zoom.set(bool(c["find"].get("zoom", True)))
+        for k, v in self.find_off.items():
+            v.set(c["find"].get(f"{k}_mode", v.get()))
         self.order.set(s["order"])
         self.mode.set(s["mode"])
         self.preset.set(c["preset"])
@@ -2708,6 +2861,10 @@ class App:
         a = c["awg"]
         for k, v in self.av.items():
             v.set(str(a.get(k, "")))
+        seq = c.get("sequence") or cfgmod.DEFAULTS["sequence"]
+        for k, v in self.seq.items():
+            v.set(f"{float(seq.get(k, cfgmod.DEFAULTS['sequence'][k])):g}")
+        self.root.after_idle(self._show_sequence)
         for k in self.a_choice:
             self.a_choice[k].set(str(a.get(k, awgmod.DEFAULTS.get(k, ""))))
         self.a_fit_tb.set(bool(a.get("fit_timebase", True)))
@@ -2744,6 +2901,8 @@ class App:
         fd["kind"], fd["light"] = self.find_kind.get(), self.find_light.get()
         fd["use_preset"] = bool(self.find_preset.get())
         fd["zoom"] = bool(self.find_zoom.get())
+        for k, v in self.find_off.items():
+            fd[f"{k}_mode"] = v.get()
         c["preset"] = self.preset.get()
         c["outdir"] = self.outdir.get().strip()
         c["scan_name"] = self.scan_name.get().strip()
@@ -2757,6 +2916,10 @@ class App:
             elif _isnum(txt):
                 b[k] = int(float(txt)) if k in ("shots", "null_points") else float(txt)
         b["order"] = self.bias_order.get() or "up"
+        seq = c.setdefault("sequence", dict(cfgmod.DEFAULTS["sequence"]))
+        for k, v in self.seq.items():
+            if _isnum(v.get()) and float(v.get()) >= 0:
+                seq[k] = float(v.get())
         a = c["awg"]
         for k, v in self.av.items():
             txt = v.get().strip()
@@ -2804,7 +2967,37 @@ class App:
         except Exception:
             self.est_label.configure(text="")
 
+    def _show_sequence(self):
+        """The sequence fields under the preset, for a preset built from them."""
+        p = cfgmod.all_presets(self.cfg).get(self.preset.get()) or {}
+        if p.get("sequence"):
+            if not self.seq_row.winfo_ismapped():
+                self.seq_row.pack(fill="x", padx=6, pady=1, after=self._seq_anchor)
+                self.seq_lbl.pack(anchor="w", padx=6, after=self.seq_row)
+            sc = p["scope"]
+            from .config import record_span
+            t0, t1 = record_span(sc[":TIMebase:SCALe"], sc[":TIMebase:POSition"], "LEFT")
+            self.seq_lbl.configure(text=f"record {t0*1e3:+.1f} .. {t1*1e3:+.1f} ms at "
+                                        f"{float(sc[':TIMebase:SCALe'])*1e3:g} ms/div "
+                                        f"('Apply to scope' writes it)")
+        else:
+            self.seq_row.pack_forget()
+            self.seq_lbl.pack_forget()
+
+    def sequence_changed(self):
+        seq = self.cfg.setdefault("sequence", dict(cfgmod.DEFAULTS["sequence"]))
+        for k, v in self.seq.items():
+            try:
+                x = float(v.get())
+                if x < 0:
+                    raise ValueError
+                seq[k] = x
+            except ValueError:
+                v.set(f"{seq.get(k, cfgmod.DEFAULTS['sequence'][k]):g}")
+        self._show_sequence()
+
     def preset_picked(self):
+        self._show_sequence()
         p = cfgmod.all_presets(self.cfg).get(self.preset.get())
         if not p:
             return
@@ -4415,71 +4608,161 @@ class App:
         self._cursor(ax2)
 
     def draw_extinction(self, fig):
+        """Extinction ratio along the ramp, each measurement method a marker,
+        each transport (leg) a colour, +-1 sigma error bars, lower bounds as
+        arrows. 'What are these?' explains every family (ER_HELP)."""
         res = self.result
         pol, d = res["pol"], res["d"]
         by_rot = self.ext_x.get() == "rotation"
         x = pol["rotation"] if by_rot else d.t * 1e3
         ax = fig.add_subplot(111)
         show = {k: v.get() for k, v in self.ext_show.items()}
-        er, ok, us = self.smoothed_er(pol, d.t)
+        segs = an.segments(pol["t"], pol["rotation"])
+        legs = sorted({an.leg_of(segs, s["t0"]) for s in segs if s["base"] in ("up", "down")})
+        leg_col = {1: "#1f77b4", 2: "#ff7f0e", 3: "#2ca02c", 4: "#9467bd"}
+        # leg shading on the time axis
+        if not by_rot:
+            for s in segs:
+                if s["base"] in ("up", "down"):
+                    ax.axvspan(s["t0"] * 1e3, s["t1"] * 1e3, lw=0, alpha=0.06,
+                               color=leg_col.get(an.leg_of(segs, s["t0"]), "0.5"))
         if show["fit"]:
-            lbl = f"ER_fit ({us:g} us mean)" if us else "ER_fit (per sample)"
-            ax.plot(x, np.where(ok, er, np.nan), color="#1f77b4", lw=0.7, label=lbl)
-            ax.plot(x, np.where(~ok, er, np.nan), color="#1f77b4", lw=0.5, alpha=0.35,
-                    label="ER_fit lower bound (Imin < 2 sigma)")
-        dips = res["dips"] if show["dips"] else []
-        if dips:
-            for sign, mk, lbl in ((1, "^", "dip, rising"), (-1, "v", "dip, falling")):
-                pts = [p for p in dips if np.sign(p["rate"]) == sign]
-                if not pts:
-                    continue
-                xx = [p["rotation"] if by_rot else p["t"] * 1e3 for p in pts]
-                ax.plot(xx, [p["er"] for p in pts], mk, ms=5,
-                        color="#d62728", ls="none", label=f"{lbl} ({len(pts)})")
-        direct = res.get("direct", []) if show["direct"] else []
-        for kind, lower, mk, col, lbl in (
-                ("crossing", False, "o", "k", "direct: crossing (Imin, and Imax at +90 deg, measured)"),
-                ("crossing", True, "^", "k", "direct: crossing, lower bound"),
-                ("static", False, "D", "#2ca02c", "direct: static, angle nearest crossed"),
-                ("static", True, "^", "#2ca02c", "direct: static, lower bound"),
-                ("offset", False, "D", "#2ca02c",
-                 "direct: static, angle too far from crossed (offset-limited)")):
-            if kind == "offset":
-                pts = [p for p in direct if p.get("offset_limited")]
-                lower = True                      # drawn hollow
-            else:
-                pts = [p for p in direct if p["kind"] == kind and p["lower"] == lower
-                       and not p.get("offset_limited")]
-            if pts:
-                ax.plot([p["rotation"] if by_rot else p["t_ms"] for p in pts],
-                        [p["er"] for p in pts], mk, ms=4, color=col,
-                        mfc=col if not lower else "none", ls="none",
-                        label=f"{lbl} ({len(pts)})")
-        for r in (res["refine"] if show["refine"] else []):
-            if "er" in r:
-                m = (d.t >= r["t0"]) & (d.t <= r["t1"])
-                xx = float(np.mean(pol["rotation"][m])) if by_rot else 0.5 * (r["t0"] + r["t1"]) * 1e3
-                ax.plot([xx], [r["er"]], "D", ms=6, color="#9467bd",
-                        label=f"null refine: {r['label']}")
-        dr = pol.get("drift_resid")
-        if dr and show["fit"]:
-            ax.axhline(1 / dr, color="#1f77b4", lw=0.8, ls=":",
-                       label=f"1 / ref leave-one-out scatter ({1 / dr:.0f})")
+            er, ok, us = self.smoothed_er(pol, d.t)
+            ax.plot(x, np.where(ok, er, np.nan), color="0.55", lw=0.6, zorder=1)
+            ax.plot(x, np.where(~ok, er, np.nan), color="0.55", lw=0.5, alpha=0.35, zorder=1)
+            dr = pol.get("drift_resid")
+            if dr:
+                ax.axhline(1 / dr, color="0.55", lw=0.8, ls=":", zorder=1)
+
+        def pts(family):
+            """[(x, er, (lo, hi), lower, leg, up)] for a method."""
+            out = []
+            if family == "crossing" or family == "static":
+                for p in res.get("direct", []):
+                    if p["kind"] != family or p.get("offset_limited"):
+                        continue
+                    t_s = p["t_ms"] * 1e-3
+                    e = an.er_sigma(p["er"], p["imin_mV"], p["sig_mV"], p["imax_V"] * 1e3,
+                                    p.get("sig_imax_V", 0.0) * 1e3)
+                    out.append((p["rotation"] if by_rot else p["t_ms"], p["er"], e,
+                                p["lower"], an.leg_of(segs, t_s), self._going_up(pol, t_s)))
+            elif family == "dip":
+                for p in res["dips"]:
+                    e = an.er_sigma(p["er"], p["imin"], p["sig_imin"])
+                    out.append((p["rotation"] if by_rot else p["t"] * 1e3, p["er"], e,
+                                p["er_lower"], an.leg_of(segs, p["t"]),
+                                self._going_up(pol, p["t"])))
+            elif family == "refine":
+                for r in res["refine"]:
+                    if "er" not in r:
+                        continue
+                    m = (d.t >= r["t0"]) & (d.t <= r["t1"])
+                    tm = 0.5 * (r["t0"] + r["t1"])
+                    e = an.er_sigma(r["er"], r["imin"], r["sig_imin"])
+                    out.append((float(np.mean(pol["rotation"][m])) if by_rot else tm * 1e3,
+                                r["er"], e, r["er_lower"], an.leg_of(segs, tm), True))
+            return out
+
+        fams = [("crossing", "o", "direct", "Measured at a crossing: Imin and Imax both read"),
+                ("dip", "^", "dips", "Dip fit: Imin fitted around the crossing, Imax from the fit"),
+                ("static", "s", "direct", "Measured, static: analyzer angle nearest crossed"),
+                ("refine", "D", "refine", "Null refine: angles stepped around crossed")]
+        n_fam = {}
+        top_needed = 0.0
+        for fam, mk, key, _lbl in fams:
+            if not show[key]:
+                continue
+            P = pts(fam)
+            n_fam[fam] = len(P)
+            for xx, er_, (lo, hi), lower, leg, up in P:
+                col = leg_col.get(leg, "0.3")
+                mfc = col if up else "white"
+                if lower:
+                    ax.plot([xx], [er_], mk, ms=4.5, mfc="white", mec=col, zorder=3)
+                    top_needed = max(top_needed, er_ * 3.0)
+                    ax.annotate("", xy=(xx, er_ * 2.5), xytext=(xx, er_ * 1.12),
+                                arrowprops=dict(arrowstyle="-|>", color=col, lw=0.8,
+                                                mutation_scale=7), zorder=3)
+                else:
+                    hi_ = hi if np.isfinite(hi) else er_ * 2
+                    ax.errorbar([xx], [er_], yerr=[[lo], [hi_]], fmt=mk, ms=4.5, color=col,
+                                mfc=mfc, mec=col, elinewidth=0.8, capsize=1.5, zorder=3)
+        if show["direct"]:
+            off = [p for p in res.get("direct", []) if p.get("offset_limited")]
+            for p in off:
+                ax.plot([p["rotation"] if by_rot else p["t_ms"]], [p["er"]], "s", ms=4.5,
+                        mfc="none", mec="0.6", zorder=2)
         ax.set_yscale("log")
+        if top_needed > ax.get_ylim()[1]:
+            ax.set_ylim(top=top_needed)          # the lower-bound arrows stay on the plot
         lim = self.cfg["analysis"]["polarizer_er"]
-        top = ax.get_ylim()[1]
-        if lim <= 10 * top:
-            ax.axhline(lim, color="k", lw=0.8, ls="--", label=f"analyzer's own ER ({lim:.1e})")
+        if lim <= 10 * ax.get_ylim()[1]:
+            ax.axhline(lim, color="k", lw=0.8, ls="--")
+        # the key: methods (black), then legs (colour), then the lines
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch
+        H = []
+        for fam, mk, key, lbl in fams:
+            if show[key] and n_fam.get(fam):
+                H.append(Line2D([], [], marker=mk, color="k", ls="none", ms=5,
+                                label=f"{lbl} ({n_fam[fam]})"))
+        if show["direct"] and any(p.get("offset_limited") for p in res.get("direct", [])):
+            H.append(Line2D([], [], marker="s", mfc="none", mec="0.6", ls="none", ms=5,
+                            label="Static, angle too far from crossed (not the light's ER)"))
+        H.append(Line2D([], [], marker="o", mfc="k", mec="k", ls="none", ms=5,
+                        label="filled: rotation moving away from rest"))
+        H.append(Line2D([], [], marker="o", mfc="white", mec="k", ls="none", ms=5,
+                        label="hollow: moving back toward rest"))
+        H.append(Line2D([], [], marker="$\u2191$", color="k", ls="none", ms=8,
+                        label="arrow up: lower bound (Imin under 2 sigma)"))
+        for leg in legs or [1]:
+            H.append(Patch(color=leg_col.get(leg, "0.3"), label=f"leg {leg}"
+                           + (" (first transport)" if leg == 1 and len(legs) > 1 else
+                              " (second transport)" if leg == 2 else "")))
+        if show["fit"]:
+            H.append(Line2D([], [], color="0.55", lw=0.8,
+                            label="per-sample Malus fit (ER_fit)"))
+            if pol.get("drift_resid"):
+                H.append(Line2D([], [], color="0.55", lw=0.8, ls=":",
+                                label=f"ER_fit's drift limit ({1 / pol['drift_resid']:.0f})"))
+        if lim <= 10 * ax.get_ylim()[1]:
+            H.append(Line2D([], [], color="k", lw=0.8, ls="--",
+                            label=f"analyzer's own ER ({lim:.1e})"))
         else:
             ax.text(0.99, 0.01, f"analyzer's own ER at 843 nm: {lim:.1e}, off scale",
                     transform=ax.transAxes, ha="right", va="bottom", fontsize=7, color="#666")
+        ax.legend(handles=H, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=7,
+                  title="+-1 sigma bars; 'What are these?' explains", title_fontsize=7)
         ax.set_xlabel("rotation from rest (deg)" if by_rot else "time (ms)")
         ax.set_ylabel("extinction ratio Imax / Imin")
         ax.set_title(f"Extinction ratio along the ramp ({d.name})")
-        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=7)
         ax.grid(alpha=0.3, which="both")
         if not by_rot:
             self._cursor(ax)
+
+    @staticmethod
+    def _going_up(pol, t_s):
+        """True while |rotation| grows (moving away from rest) at time t_s."""
+        rot = pol["rotation"]
+        j = int(np.clip(np.searchsorted(pol["t"], t_s), 1, len(rot) - 1))
+        k = max(1, int(len(rot) / 2000))
+        a, b = rot[max(j - k, 0)], rot[min(j + k, len(rot) - 1)]
+        return abs(b) >= abs(a)
+
+    def show_er_help(self):
+        win = getattr(self, "er_help_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            return
+        w = tk.Toplevel(self.root)
+        w.title("Extinction ratio: what each point is")
+        self.er_help_win = w
+        txt = tk.Text(w, wrap="word", width=96, height=34, font=("TkDefaultFont", 9),
+                      relief="flat", padx=10, pady=8)
+        txt.insert("1.0", ER_HELP)
+        txt.configure(state="disabled")
+        txt.pack(fill="both", expand=True)
+        ttk.Button(w, text="Close", command=w.destroy).pack(pady=(0, 8))
 
     def draw_diagnostics(self, fig):
         res = self.result

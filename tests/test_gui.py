@@ -125,8 +125,17 @@ def main():
     app.do_save_preset("test preset")
     check("preset saved and selectable", "test preset" in app.preset_box["values"]
           and app.cfg["user_presets"]["test preset"]["scope"][":TIMebase:SCALe"] == "2.0E-03")
-    app.preset.set("Spin echo 16.7 ms (2 legs)")
+    app.preset.set("Spin echo")
     app.preset_picked()
+    app.seq["spacing_ms"].set("30")
+    app.sequence_changed()
+    sc = gui.cfgmod.all_presets(app.cfg)["Spin echo"]["scope"]
+    t0_, t1_ = gui.cfgmod.record_span(sc[":TIMebase:SCALe"], sc[":TIMebase:POSition"], "LEFT")
+    check("spin echo: the record follows the sequence fields (30 ms legs)",
+          abs(t0_ + 12e-3) < 1e-9 and t1_ >= (30 + 9.5 + 12) * 1e-3,
+          f"{t0_*1e3:.1f}..{t1_*1e3:.1f} ms; {app.seq_lbl.cget('text')}")
+    app.seq["spacing_ms"].set("16.667")
+    app.sequence_changed()
     check("picking a preset fills the shot settings",
           app.mode.get() == "single" and app.sv["rep_s"].get() == "10.0")
     app.mode.set("average")
@@ -355,14 +364,26 @@ def main():
     print("\nextinction with the direct points, residual map, Poincare")
     app.nb.select(app.fig_ext._frame)
     root.update()
-    labels = [ln.get_label() for ln in app.fig_ext.axes[0].lines]
-    check("Extinction shows the direct points", any(x.startswith("direct: crossing") for x in labels),
-          labels)
+    def key():
+        leg = app.fig_ext.axes[0].get_legend()
+        return [t.get_text() for t in leg.get_texts()] if leg else []
+    labels = key()
+    check("Extinction: the measured points, dip fits and both legs in the key",
+          any(x.startswith("Measured at a crossing") for x in labels)
+          and any(x.startswith("Dip fit") for x in labels)
+          and any(x.startswith("leg") for x in labels), labels)
+    check("error bars drawn", len(app.fig_ext.axes[0].collections) > 5,
+          len(app.fig_ext.axes[0].collections))
     app.ext_show["direct"].set(False)
     app.redraw(app.fig_ext)
-    labels = [ln.get_label() for ln in app.fig_ext.axes[0].lines]
-    check("and hides them when unticked", not any(x.startswith("direct") for x in labels))
+    check("and the measured points hidden when unticked",
+          not any(x.startswith("Measured") for x in key()))
     app.ext_show["direct"].set(True)
+    app.show_er_help()
+    root.update()
+    check("'What are these?' explains every family",
+          "DIP FIT" in gui.ER_HELP and app.er_help_win.winfo_exists())
+    app.er_help_win.destroy()
     app.nb.select(app.fig_map._frame)
     app.map_show.set(gui.MAP_MODES[2])
     app.redraw(app.fig_map)
@@ -510,6 +531,14 @@ def main():
           and err < 0.5 and fr.get("static"), f"{fr['angle_max']:.2f}")
     check("the Malus scan shows its progress with the time left",
           any(t.startswith("Malus scan: analyzer") and "left" in t for t in texts))
+    check("Malus scan autoranged: points near crossed read at a finer V/div",
+          min(fr["vdivs"]) < max(fr["vdivs"]) / 10, sorted(set(fr["vdivs"])))
+    check("the background was measured after, at every V/div used, and subtracted",
+          fr.get("offsets") and not fr.get("missing")
+          and all(v["kind"] == "background" for v in fr["offsets"].values()),
+          fr.get("offset_note"))
+    check("so the fitted ER is near the bench's 3333 (raw would be nonsense)",
+          not fr["er_lower"] and 2000 < fr["er"] < 5000, f"{fr['er']:.0f}")
     app.fig_find.savefig(os.path.join(out, "Malus_scan.png"))
     app.find_kind.set("min")
     app.do_find_angle()

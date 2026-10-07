@@ -113,10 +113,16 @@ sign (not built in yet).
    2 V/div +4 V, marker 2 V/div +2 V; DC, displayed), reads every value back
    and drains the scope's error queue - the scope takes a command it does not
    like without a word, so the log says which settings did not land.
-   `Spin echo 16.7 ms (2 legs)` is 5 ms/div from -12 to +38 ms (12 ms of
-   locked light before the trigger, both legs, ~12 ms after leg 2, where the
-   intensity lock switches off), HRES, trigger sweep NORMAL (AUTO would
-   self-trigger in a 10 s gap), 8 shots at 10 s. The **Scope settings** window is laid out from the profile's own
+   `Spin echo` is the experiment's two-leg sequence, its record set from
+   the **sequence fields** shown under the preset: legs `spacing` ms apart
+   (the echo time, 16.667 by default), each motion `motion` ms long (9.5),
+   and how much to keep `before` the trigger and `after` the second motion
+   ends (12 / 12). The timebase is worked out from them (rounded up to two
+   figures: 5.1 ms/div from -12 to +39 ms by default; the line under the
+   fields says what *Apply to scope* will write), HRES, trigger sweep NORMAL
+   (AUTO would self-trigger in a 10 s gap), 8 shots at 10 s. The ILC-target
+   comparison takes its leg gap from `spacing` too. (It was `Spin echo 16.7
+   ms (2 legs)` before 7 Oct 2026; a config naming it is moved over.) The **Scope settings** window is laid out from the profile's own
    tables (timebase, acquisition, trigger, every channel): Read, edit, Apply
    changes (only edited fields are written), and **Save as preset** keeps them
    with the shot settings under a name. It shows the time span the record
@@ -184,7 +190,27 @@ sign (not built in yet).
      trigger (the rest before the ramp, `-10:-0.5`; a hold).
 
    *Malus scan 0-180* steps the analyzer every `scan step` deg and fits the
-   whole curve: the maximum and minimum angles, coarse (at the PD's V/div).
+   whole curve, weighted by each point's error: the maximum and minimum
+   angles, Imax, Imin and the ER. It **autoranges**: each angle is read at
+   the most sensitive V/div that holds it (predicted from the points so
+   far, one step coarser on a clip, re-read when a much finer one would
+   hold it), with the offset putting the floor (no light) three divisions
+   below centre so a dark / background can be read at the same setting -
+   near crossed that is mV/div instead of one ADC code at 1 V/div. The plot
+   shows every point coloured by the V/div it was read at, linear and log.
+
+   **Dark and background for the analyzer** (*Dark* / *Background*: measure
+   after, reuse latest, none). The scope's own offset error moves with V/div
+   and offset (-34 mV at 1 V/div, 2.65 V offset), so what the PD reads with
+   no light has to be known at each setting a reading used. *Measure after*
+   does exactly that: once the readings are done it asks you to block the
+   beam (background) and / or cover the PD (dark), reads each setting used,
+   in the same trigger and timebase, subtracts it reading by reading (the
+   background when there is one - it contains the dark and the stray
+   light), and stores it in `<outdir>/analyzer_offsets.json`. *Reuse latest*
+   takes the newest stored one at the same V/div and an offset within
+   max(2 div, 5 %), measured in the same light mode. Find subtracts it from
+   the level it reports; the AWG tab's Find does the same.
    *Find and go there* refines one: 4 angles give the azimuth, then the
    analyzer steps +-deg around crossed (at the most sensitive V/div that
    holds it) or aligned, the dip is fitted and the analyzer is left there.
@@ -458,7 +484,7 @@ box opens any angle: key `<name>_a045.00`, runs `1-4`.
 | Map | I(t, theta) / Imax(t), with the fitted null psi + 90 drawn over it; or the Malus-fit residual (mV, or per standard error) per angle and time, with the rms per angle beside it: a bad angle, clipping, a missed lock or drift shows as a row or a patch |
 | Malus | I vs analyzer angle at the cursor time, the fit, residuals |
 | Angle | rotation from rest with +-1 SD, the monitor prediction, their difference in mdeg |
-| Extinction | ER_fit (smoothed by the plot bar's Smooth box), dip points (rising/falling), the direct points (crossings, lower bounds, static, offset-limited), refine points, the drift limit; each family switchable; x = time or rotation |
+| Extinction | the extinction ratio along the record by method (marker): measured at a crossing (circles), dip fit (triangles), measured static (squares; grey hollow where the angle was too far from crossed), null refine (diamonds), the per-sample Malus fit as a grey line with its drift limit; colour = leg (first / second transport, shaded on the time axis), filled = rotation moving away from rest, hollow = moving back; +-1 sigma bars (asymmetric: ER goes as 1/Imin); lower bounds as arrows. *What are these?* opens the explanation of every family. x = time or rotation (rotation lines the two legs up) |
 | Poincaré | the linear Stokes parameters in the rest frame on the sphere (coloured by time), |S3| and the ellipticity angle chi vs time assuming full polarization (handedness not measured), the ellipse at the cursor against the rest ellipse |
 | Diagnostics | ref returns vs time, 1-theta and 4-theta amplitudes, residual vs block SEM, landing error and off-screen samples per step |
 | Table | per-segment medians, every refine, dip and direct ER; Save CSV |
