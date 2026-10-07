@@ -298,6 +298,14 @@ def main():
     app.do_start_bias()
     settle(root, app)
     check("a bias run without a dry run of its plateaus is refused", app.bias_result is None)
+    app.do_bias_preview()
+    root.update()
+    ax_ = app.fig_awg.axes
+    check("Fixed rotations Preview: every plateau on the AWG tab, the window shaded",
+          len(ax_) >= 2 and ax_[0].get_title().startswith("Fixed rotations plan: 0, 45, 90")
+          and len(ax_[0].lines) == 6 and len(ax_[1].patches) == 1,
+          (ax_[0].get_title() if ax_ else "", len(ax_[0].lines) if ax_ else 0))
+    app.fig_awg.savefig(os.path.join(out, "AWG_fixed_rotations_preview.png"))
     app.do_bias_dry()
     settle(root, app, timeout=300)
     dry = getattr(app, "awg_dry_all", [])

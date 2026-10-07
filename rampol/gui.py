@@ -126,6 +126,7 @@ class App:
         self.awg_sess = None          # awg.Session once the AWG is connected
         self.awg_eom = None           # EOM-ILC's eomilc, loaded with the AWG
         self.awg_wave = None          # the AWG tab's previewed waveform
+        self.awg_set = None           # or a set of them (Fixed rotations, Sequence)
         self._worker_thread = None
         self.busy_widgets = []
 
@@ -888,7 +889,9 @@ class App:
         self.bias_order = tk.StringVar()
         ttk.Combobox(rr, textvariable=self.bias_order, values=("up", "updown"),
                      width=8, state="readonly").pack(side="left", padx=4)
-        self._btn(rr, "Dry run on scope", self.do_bias_dry, padx=(8, 0))
+        ttk.Button(rr, text="Preview", command=self.do_bias_preview).pack(
+            side="left", padx=(8, 0))
+        self._btn(rr, "Dry run on scope", self.do_bias_dry, padx=(4, 0))
         self._btn(rr, "Start", self.do_start_bias, padx=(4, 0))
         self._btn(rr, "Load...", self.do_load_bias, padx=(4, 0))
         ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
@@ -1038,7 +1041,9 @@ class App:
         combo(rr, "seq_how", ("pairs", "grid"), 5, "pairs")
         rr = row()
         combo(rr, "seq_order", SEQ_ORDERS, 19, SEQ_ORDERS[0])
-        self._btn(rr, "Dry run all", self.do_seq_dry, padx=(2, 0))
+        ttk.Button(rr, text="Preview", command=self.do_seq_preview).pack(
+            side="left", padx=(2, 0))
+        self._btn(rr, "Dry run all", self.do_seq_dry, padx=(4, 0))
         self._btn(rr, "Start sequence", self.do_seq_start, padx=(4, 0))
         self.awg_seq_lbl = CopyLabel(f, text="", foreground="#666", width=46)
         self.awg_seq_lbl.pack(anchor="w", padx=6)
@@ -1151,6 +1156,7 @@ class App:
             self.log(f"AWG preview: {exc}")
             return
         self.awg_wave, self.awg_found = wave, found
+        self.awg_set = None
         self.report_checks(found, f"AWG waveform: {wave.label}", popup=False)
         idle = wave.idle()
         _, rot = awgmod.predict(wave)
@@ -1570,6 +1576,7 @@ class App:
             self.log(f"Dry run: {exc}")
             return
         self.awg_wave, self.awg_found = wave, found
+        self.awg_set = None
         if self.report_checks(found, f"AWG waveform: {wave.label}") == "FAIL":
             self.log("Dry run not started.")
             return
@@ -1681,6 +1688,7 @@ class App:
             self.log(f"AWG: {exc}")
             return
         self.awg_wave, self.awg_found = wave, found
+        self.awg_set = None
         if self.report_checks(found, f"AWG waveform: {wave.label}") == "FAIL":
             self.log("Not loaded.")
             return
@@ -1840,6 +1848,8 @@ class App:
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
 
     def draw_awg(self, fig):
+        if self.awg_set:
+            return self._draw_awg_set(fig, self.awg_set)
         w = self.awg_wave
         if w is None and self.awg_sess is not None:
             w = self.awg_sess.wave
@@ -2180,6 +2190,117 @@ class App:
                 seen.add(b)
                 out.append(biasmod.plateau_wave(b, p))
         return out
+
+    def _show_awg_set(self, title, waves, window=None, found=()):
+        """Draw a set of waveforms on the AWG plot tab and log what each is."""
+        s = self.awg_sess
+        self.awg_set = {"title": title, "waves": waves, "window": window,
+                        "found": list(found)}
+        w0 = waves[0]
+        self.log(f"{title}: {len(waves)} waveforms, {w0.n} points at {w0.dt*1e6:g} us = "
+                 f"{w0.period*1e3:.3f} ms each" + (
+                     "" if all(abs(w.period - w0.period) < 1e-12 for w in waves)
+                     else " (records differ)"))
+        for w in waves:
+            _, rot = awgmod.predict(w)
+            pk = {k: float(np.max(np.abs(u))) for k, u in w.u.items()}
+            self.log(f"  {w.label}: CH1 peak {pk['EO1']:.3f} V, CH2 {pk['EO2']:.3f} V, "
+                     f"rotation {float(np.max(np.abs(rot))):.2f} deg; dry run "
+                     + ("passed" if s is not None and s.is_verified(w) else "not yet"))
+        self.plot_dirty.add(self.fig_awg._frame)
+        self.nb.select(self.fig_awg._frame)
+        self.draw_visible()
+
+    def do_bias_preview(self):
+        """Every plateau of the Fixed rotations plan, drawn on the AWG plot
+        tab with the window it measures in - before any dry run."""
+        c = self.gather()
+        from . import bias as biasmod
+        try:
+            plan = self._bias_plan(c)
+            p = dict(biasmod.PLAN, **plan)
+            biases = biasmod.parse_biases(p["biases"])
+            waves = self._bias_waves(plan)
+            window = biasmod.windows(p)[0]
+        except (ValueError, OSError) as exc:
+            self.log(f"Fixed rotations preview: {exc}")
+            return
+        if not waves:
+            self.log("Fixed rotations preview: no rotations in the plan")
+            return
+        found = []
+        try:
+            for _b, _pk, txt in biasmod.check_plateaus(biases, p, self._eom(c)):
+                found.append(("INFO", txt))
+        except ValueError as exc:
+            found.append(("FAIL", str(exc)))
+        self.report_checks(found, "Fixed rotations plan", popup=False)
+        order = biasmod.order_biases(biases, p["order"])
+        self._show_awg_set(f"Fixed rotations plan: {', '.join(f'{b:g}' for b in order[:10])}"
+                           f"{' ...' if len(order) > 10 else ''} deg ({p['order']})",
+                           waves, window, found)
+
+    def do_seq_preview(self):
+        """Every ramp of the AWG tab's sequence, drawn together."""
+        c = self.gather()
+        try:
+            ends, waves, found = self._seq_waves(c)
+        except (ValueError, OSError) as exc:
+            self.log(f"Sequence preview: {exc}")
+            return
+        self.report_checks(found, f"AWG sequence ({len(waves)} ramps)", popup=False)
+        win = None
+        w0 = waves[0]
+        try:
+            settle = float(self.av["settle_ms"].get())
+            if w0.hold and w0.hold[1] - w0.hold[0] > settle * 1e-3 + 0.5e-3:
+                win = (w0.hold[0] + settle * 1e-3, w0.hold[1] - 0.2e-3)
+        except (ValueError, KeyError):
+            pass
+        self._show_awg_set(f"AWG sequence: {len(waves)} ramps (X1/X2 deg)", waves, win, found)
+
+    def _draw_awg_set(self, fig, S):
+        """A set of waveforms: the AWG outputs (solid CH1 -> X1, dashed CH2
+        -> X2) and the rotation each gives, one colour per waveform."""
+        from matplotlib.lines import Line2D
+        waves = S["waves"]
+        n = len(waves)
+        cmap = matplotlib.colormaps["viridis"]
+        s = self.awg_sess
+        ax = fig.add_subplot(211)
+        ax2 = fig.add_subplot(212, sharex=ax)
+        for i, w in enumerate(waves):
+            col = cmap(0.9 * i / max(n - 1, 1))
+            t = w.t * 1e3
+            ax.plot(t, w.u["EO1"], color=col, lw=0.9)
+            ax.plot(t, w.u["EO2"], color=col, lw=0.9, ls="--")
+            _, rot = awgmod.predict(w)
+            ok = s is not None and s.is_verified(w)
+            ax2.plot(t, rot, color=col, lw=0.9,
+                     label=w.label.split(" (")[0] + (" - dry run passed" if ok else ""))
+        if S.get("window"):
+            a, b = S["window"]
+            ax2.axvspan(a * 1e3, b * 1e3, color="#9ecae1", alpha=0.5, lw=0,
+                        label="where it measures")
+        bad = [m for lv, m in S.get("found", ()) if lv == "FAIL"]
+        w0 = waves[0]
+        ax.set_title(S["title"] + (f" - FAILS: {bad[0][:80]}" if bad else
+                                   f"; {w0.period*1e3:.3f} ms records, {w0.n} points"),
+                     fontsize=9, color="#c00000" if bad else "black")
+        ax.set_ylabel("AWG output (V)")
+        ax.legend(handles=[Line2D([], [], color="k", lw=0.9, label="CH1 -> X1"),
+                           Line2D([], [], color="k", lw=0.9, ls="--", label="CH2 -> X2")],
+                  fontsize=7, loc="upper right")
+        ax.grid(alpha=0.3)
+        ax.tick_params(labelbottom=False)
+        ax2.set_xlabel("time from the trigger (ms)")
+        ax2.set_ylabel("rotation (deg, EOM calibration)")
+        if n <= 14:
+            ax2.legend(fontsize=6, loc="upper right", ncol=2 if n > 7 else 1)
+        else:
+            sm = matplotlib.cm.ScalarMappable(cmap=cmap, norm=matplotlib.colors.Normalize(0, n - 1))
+            fig.colorbar(sm, ax=[ax, ax2], label="waveform (in order)")
+        ax2.grid(alpha=0.3)
 
     def do_bias_dry(self):
         """Every plateau of the bias plan through the scope, before the run."""

@@ -504,6 +504,11 @@ null the scope resolves ~1 code: on test-4 the rest/hold minima (2.6-3 mV)
 were one step at 1 V/div - ER ~1800 there is the scope's floor. Mid-ramp
 (166-281 mV, ER 18-31) they were well resolved.
 
+*Preview* draws every plateau of the plan on the AWG plot tab - both AWG
+outputs and the rotation each gives, the window it measures in shaded, which
+have passed a dry run - and logs their peaks; the AWG tab's Sequence has
+the same button.
+
 Fixed rotations ("bias points") hold the EOMs at each rotation in a list with the AWG (4063B; close its
 GUI; CH1 -> X1, CH2 -> X2; plateaus on the bench trigger, EXT, each checked
 with EOM-ILC's limit check before upload). They use the AWG tab's session,
