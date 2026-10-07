@@ -492,7 +492,7 @@ class BiasRun:
             on = True                  # from here every exit ends the AWG
             self._play(biases[0])
             end = "parked at idle" if p.get("end") == "park" else "OFF"
-            if not self.ask("Bias points", "The AWG holds the plateaus. Switch "
+            if not self.ask("Fixed rotations", "The AWG holds the plateaus. Switch "
                             f"both outputs ON now? (At the end they go {end}.)"):
                 raise RuntimeError("outputs left off - nothing measured")
             self.sess.on()

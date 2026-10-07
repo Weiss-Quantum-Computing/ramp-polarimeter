@@ -1,7 +1,8 @@
 """The Ramp Polarimeter window.
 
 Controls on the left (hardware, analyzer, channel roles, then the measurement
-modes as tabs: ramp scan, analyzer (find angle, null refine), bias points, ILC target),
+modes as tabs: ramp scan, analyzer (find angle, null refine), fixed rotations
+(the code's 'bias points'), ILC target),
 plots on the right in Scope Grab's arrangement: a plot bar above a notebook of
 figure tabs, each with its matplotlib toolbar, and the log underneath.
 
@@ -50,7 +51,7 @@ AWG_HELP = (
     "hold, or a ramp scan in the Ramp scan tab. With 'require a dry run' nothing that has "
     "not passed one this session reaches live outputs. NEVER FLOAT (both outputs): the "
     "program never switches an output off - changes are made live and the end of anything "
-    "(close, Disconnect, a bias run) is Park: an idle waveform with the outputs ON, because "
+    "(close, Disconnect, a fixed-rotation run) is Park: an idle waveform with the outputs ON, because "
     "the FPGA/buffer stage drives high (-4 to -5.7 kV) on a floating input. Outputs OFF "
     "then asks first.")
 ER_HELP = """Every point is Imax / Imin of the light at one moment: how far from perfectly linear the light is. They differ only in HOW Imin and Imax are obtained.
@@ -143,7 +144,7 @@ class App:
         self.build_scan(self._mode_tab("Ramp scan"))
         self.build_analyzer_mode(self._mode_tab("Analyzer"))
         self.build_awg(self._mode_tab("AWG"))
-        self.build_bias(self._mode_tab("Bias points"))
+        self.build_bias(self._mode_tab("Fixed rotations"))
         self.build_ilc(self._mode_tab("ILC target"))
         self.bias_result = None
         self.ilc_summary = None
@@ -237,42 +238,50 @@ class App:
 
     # -- left column ----------------------------------------------------------
     def build_hardware(self, left):
+        """One row per instrument: what it is, its address (blank = find it),
+        Connect, and what is connected - the status sits in the row rather than
+        on a line of its own. Fixed widths with wrap: an identity or a VISA
+        address sized its label and once widened the whole left column."""
         f = ttk.LabelFrame(left, text="Hardware")
         f.pack(fill="x", padx=8, pady=(6, 3))
-        r = ttk.Frame(f)
-        r.pack(fill="x", padx=6, pady=2)
-        ttk.Label(r, text="Scope VISA:").pack(side="left")
+        g = ttk.Frame(f)
+        g.pack(fill="x", padx=6, pady=(2, 0))
+        g.columnconfigure(3, weight=1)
+
+        def row(i, label, addr, connect, status):
+            ttk.Label(g, text=label).grid(row=i, column=0, sticky="w", pady=1)
+            addr.grid(row=i, column=1, sticky="w", padx=(4, 4), pady=1)
+            b = ttk.Button(g, text="Connect", command=connect, width=8)
+            b.grid(row=i, column=2, sticky="w", pady=1)
+            self.busy_widgets.append(b)
+            lab = CopyLabel(g, text=status, foreground="#666", width=30)
+            lab.grid(row=i, column=3, sticky="ew", padx=(6, 0), pady=1)
+            return lab
         self.scope_addr = tk.StringVar()
-        ttk.Entry(r, textvariable=self.scope_addr, width=22).pack(side="left", padx=4)
-        self._btn(r, "Connect", self.do_connect_scope)
-        # Fixed width + wrap: an instrument's identity or a VISA address is long
-        # and a label sized to it widened the whole left column.
-        self.scope_status = CopyLabel(f, text="scope: not connected", foreground="#666",
-                                      width=48)
-        self.scope_status.pack(anchor="w", padx=6)
-        r = ttk.Frame(f)
-        r.pack(fill="x", padx=6, pady=2)
-        ttk.Label(r, text="ELL14 port:").pack(side="left")
+        self.scope_status = row(0, "Scope", ttk.Entry(g, textvariable=self.scope_addr, width=19),
+                                self.do_connect_scope, "not connected")
+        a = ttk.Frame(g)
         self.ell_port = tk.StringVar()
-        ttk.Entry(r, textvariable=self.ell_port, width=8).pack(side="left", padx=4)
-        ttk.Label(r, text="addr").pack(side="left")
+        ttk.Entry(a, textvariable=self.ell_port, width=7).pack(side="left")
+        ttk.Label(a, text=" addr").pack(side="left")
         self.ell_addr = tk.StringVar()
-        ttk.Entry(r, textvariable=self.ell_addr, width=3).pack(side="left", padx=4)
-        self._btn(r, "Connect", self.do_connect_ell)
-        self.ell_status = CopyLabel(f, text="analyzer: not connected", foreground="#666",
-                                    width=48)
-        self.ell_status.pack(anchor="w", padx=6)
+        ttk.Entry(a, textvariable=self.ell_addr, width=3).pack(side="left", padx=(2, 0))
+        self.ell_status = row(1, "ELL14", a, self.do_connect_ell, "not connected")
+        # the BK Precision 4063B: never connected on open (another program may
+        # hold it); the status shows the VISA session it is open on
+        self.awg_addr = tk.StringVar()
+        self.awg_hw = row(2, "AWG", ttk.Entry(g, textvariable=self.awg_addr, width=19),
+                          self.do_connect_awg, "not connected")
         r = ttk.Frame(f)
-        r.pack(fill="x", padx=6, pady=(2, 4))
+        r.pack(fill="x", padx=6, pady=(1, 3))
         self.simulate = tk.BooleanVar()
-        ttk.Checkbutton(r, text="Simulate both (no hardware)",
-                        variable=self.simulate).pack(side="left")
+        ttk.Checkbutton(r, text="Simulate", variable=self.simulate).pack(side="left")
         self.autoconnect = tk.BooleanVar(value=bool(self.cfg.get("autoconnect", True)))
-        ttk.Checkbutton(r, text="Connect on open", variable=self.autoconnect).pack(
-            side="left", padx=(8, 0))
-        self._btn(r, "Disconnect all", self.do_disconnect, padx=(12, 0))
+        ttk.Checkbutton(r, text="Connect on open (scope, ELL14)",
+                        variable=self.autoconnect).pack(side="left", padx=(6, 0))
+        self._btn(r, "Disconnect all", self.do_disconnect, padx=(8, 0))
         ttk.Button(r, text="Scope settings...", command=self.open_scope_settings).pack(
-            side="left", padx=(8, 0))
+            side="left", padx=(4, 0))
 
     def build_analyzer(self, left):
         f = ttk.LabelFrame(left, text="Analyzer (ELL14)")
@@ -421,12 +430,13 @@ class App:
 
     def build_analyzer_mode(self, f):
         """The two ways the analyzer goes near crossed: find an angle in the
-        light as it is and leave the analyzer there, or refine the shown
-        scan's static nulls (steps added to that scan)."""
+        light as it is and leave the analyzer there, or measure the shown
+        scan's extinction precisely where its rotation is flat (null refine:
+        extra angles near crossed, added to that scan)."""
         a = ttk.LabelFrame(f, text="Find the min / max transmission angle (and stay there)")
         a.pack(fill="x", padx=4, pady=(4, 2))
         self.build_find(a)
-        b = ttk.LabelFrame(f, text="Refine the shown scan's static nulls (adds steps to it)")
+        b = ttk.LabelFrame(f, text="Null refine: precise Imin of the shown scan where it is flat")
         b.pack(fill="x", padx=4, pady=(2, 4))
         self.build_refine(b)
 
@@ -444,11 +454,14 @@ class App:
             ttk.Entry(rr, textvariable=self.rv[key], width=w).pack(side="left")
         rr = ttk.Frame(f)
         rr.pack(fill="x", padx=6, pady=(2, 4))
-        self._btn(rr, "Plan", self.do_plan_refine)
-        self._btn(rr, "Run refine on shown scan", self.do_run_refine, padx=6)
-        ttk.Label(f, foreground="#666", justify="left", wraplength=330,
-                  text="auto = rest/hold/after. A window just after a bright "
-                       "excursion can carry overdrive recovery.").pack(anchor="w", padx=6, pady=(0, 4))
+        self._btn(rr, "Plan (log only)", self.do_plan_refine)
+        self._btn(rr, "Measure, add to shown scan", self.do_run_refine, padx=6)
+        ttk.Label(f, foreground="#666", justify="left", wraplength=440,
+                  text="Where the rotation stands still (rest, holds, after: 'auto', or "
+                       "ms ranges), steps the analyzer to these offsets from crossed at the "
+                       "sensitive V/div and adds the captures to the shown scan: the "
+                       "Extinction tab's null-refine points.").pack(anchor="w", padx=6,
+                                                                    pady=(0, 4))
 
     # -- right side -----------------------------------------------------------
     def build_right(self, right):
@@ -464,6 +477,7 @@ class App:
         self.scan_box.bind("<Return>", lambda _e: self.do_load_shown())
         ttk.Button(r, text="Open...", command=self.do_open_scan).pack(side="left")
         ttk.Button(r, text="Rescan folder", command=self.refresh_scan_list).pack(side="left", padx=4)
+        ttk.Button(r, text="Rename / edit...", command=self.open_edit_scan).pack(side="left")
         ttk.Button(r, text="Export brief", command=self.do_export_brief).pack(
             side="left", padx=(12, 0))
         ttk.Button(r, text="Lab log", command=self.open_lab_log).pack(side="left", padx=4)
@@ -555,7 +569,7 @@ class App:
                    command=self.do_borrow_dialog).pack(side="left")
         self.build_compare_tab()
         # these draw without a ramp scan loaded
-        self.fig_bias = self._fig_tab("Bias points", self.draw_bias)
+        self.fig_bias = self._fig_tab("Fixed rotations", self.draw_bias)
         self.fig_ilc = self._fig_tab("ILC target", self.draw_ilc)
         self.fig_find = self._fig_tab("Find angle", self.draw_find)
         self.fig_awg = self._fig_tab("AWG", self.draw_awg)
@@ -633,10 +647,15 @@ class App:
         self.progress_text.pack(anchor="w", pady=(0, 2))
 
     def build_bias(self, f):
-        """Bias points: the AWG holds the EOMs at fixed rotations, the analyzer
-        steps around each null at a sensitive V/div (rampol.bias)."""
+        """Fixed rotations (in the code and the files: bias points): the AWG
+        holds the EOMs at fixed rotations, the analyzer steps around each null
+        at a sensitive V/div (rampol.bias)."""
+        ttk.Label(f, justify="left", wraplength=330, text=(
+            "Extinction ratio and rotation with the EOMs held still: the AWG holds "
+            "each rotation in the list (a plateau, no ramp) and the analyzer measures "
+            "Imin, Imax and the light's angle there.")).pack(anchor="w", padx=6, pady=(4, 2))
         self.bv = {}
-        for items in ((("Biases (deg)", "biases", 13), ("split on X1", "split", 5)),
+        for items in ((("Rotations (deg)", "biases", 13), ("split on X1", "split", 5)),
                       (("Shots", "shots", 4), ("null +-deg", "null_half_deg", 4),
                        ("null points", "null_points", 3)),
                       (("Hold ms", "hold_ms", 5), ("settle ms", "settle_ms", 4),
@@ -654,12 +673,12 @@ class App:
         ttk.Combobox(rr, textvariable=self.bias_order, values=("up", "updown"),
                      width=8, state="readonly").pack(side="left", padx=4)
         self._btn(rr, "Dry run on scope", self.do_bias_dry, padx=(8, 0))
-        self._btn(rr, "Start bias points", self.do_start_bias, padx=(4, 0))
+        self._btn(rr, "Start", self.do_start_bias, padx=(4, 0))
         self._btn(rr, "Load...", self.do_load_bias, padx=(4, 0))
         ttk.Label(f, foreground="#666", justify="left", wraplength=330, text=(
-            "Biases: start:stop:step or a list, in target rotation degrees. The "
+            "Rotations: start:stop:step or a list, in degrees of EOM rotation. The "
             "4063B (close its GUI) plays plateaus on the bench trigger (EXT), CH1 "
-            "-> X1, CH2 -> X2, checked against the Trek limits first. Per bias: 4 "
+            "-> X1, CH2 -> X2, checked against the Trek limits first. Per rotation: 4 "
             "angles find the azimuth, then the analyzer steps +-null deg around the "
             "crossed position at the most sensitive V/div that holds it (Imin), and "
             "once to the bright angle (Imax). The window opens 'settle' ms into the "
@@ -885,11 +904,25 @@ class App:
             import ilc_bench as ib
             ib._AWGMOD = mod
             awg = mod.BK4063B(connect=False, resource_manager=hw.shared_rm(mod.pyvisa))
-            self.log(f"AWG: {awg.connect()}")
+            self.log(f"AWG: {awg.connect(c.get('awg_addr') or None).strip()} on "
+                     f"{awg.resource_name}")
             self.awg_sess = awgmod.Session(awg, ib, log=self.log)
         self.awg_sess.never_float = bool(a.get("never_float", True))
         self.awg_sess.require_dry_run = bool(a.get("require_dry_run", True))
         return self.awg_sess
+
+    def do_connect_awg(self):
+        """Connect the 4063B now rather than on first use. Only *IDN? is sent:
+        the outputs are left exactly as they are (nothing of this window's is
+        loaded, so even the never-float rule has nothing to park)."""
+        c = self.gather()
+        roles = self.roles()
+
+        def go():
+            if c["simulate"] and self.bench is None:
+                self.ensure_sim(roles)
+            self._awg_session(c)
+        self.worker(go, done=lambda _r: self._awg_status())
 
     def _awg_close(self):
         """End the AWG (park under the never-float rule, else off) and let it go."""
@@ -910,7 +943,16 @@ class App:
         if s is None:
             self.awg_lbl.configure(text="AWG: not connected (connects on first use)",
                                    foreground="#666")
+            self.awg_hw.configure(text="not connected", foreground="#666")
             return
+        dev = s.awg
+        if self.bench is not None and getattr(dev, "bench", None) is self.bench:
+            where = "simulated 4063B"
+        else:
+            where = (f"{short_idn(getattr(dev, 'idn', '') or '4063B')} on "
+                     f"{getattr(dev, 'resource_name', '') or '?'}")
+        self.awg_hw.configure(text=where + ("; outputs ON" if s.owned else ""),
+                              foreground="#060")
         on = bool(s.owned)
         if s.wave is None:
             what = "nothing of this window's loaded"
@@ -1319,7 +1361,7 @@ class App:
             "AWG volts -> Trek monitor volts -> kV at the EOM -> rotation, per crystal:\n"
             "    monitor V = gain x (AWG V - idle),   kV = monitor V / (monitor V per kV),"
             "   deg = 90 x kV / V90.\nThe pair turns the light by the sum of the two. Used "
-            "by the AWG waveforms and bias runs (rotation -> AWG volts), the scans' "
+            "by the AWG waveforms and fixed-rotation runs (rotation -> AWG volts), the scans' "
             "rotation from the monitors and the ILC-target comparison.")).grid(
             row=0, column=0, columnspan=6, sticky="w", padx=8, pady=(8, 6))
         for j, h in enumerate(("", "AWG -> monitor (V/V)", "monitor V per kV", "V90 (kV)",
@@ -1361,7 +1403,7 @@ class App:
         ttk.Button(bf, text="1 Sep 2026 values", command=lambda: self._cal_fill(
             calib.DEFAULT)).pack(side="left")
         ttk.Button(bf, text="From EOM-ILC", command=self._cal_from_eomilc).pack(side="left", padx=4)
-        ttk.Button(bf, text="Fit to the loaded bias run", command=self._cal_from_bias).pack(
+        ttk.Button(bf, text="Fit to the loaded fixed-rotation run", command=self._cal_from_bias).pack(
             side="left")
         ttk.Button(bf, text="Close", command=w.destroy).pack(side="right")
         ttk.Button(bf, text="Apply and save", command=self._cal_apply).pack(side="right", padx=4)
@@ -1414,7 +1456,7 @@ class App:
     def _cal_from_bias(self):
         r = getattr(self, "bias_result", None)
         if not r:
-            self.log("Load a bias run first (Bias points tab: Load...).")
+            self.log("Load a fixed-rotation run first (Fixed rotations tab: Load...).")
             return
         try:
             cal, rep = calib.from_bias(r, self._cal_read())
@@ -1493,7 +1535,7 @@ class App:
         name = scanmod.safe_name(plan.pop("name", "bias") or "bias")
         new = scanmod.next_free_name(c["outdir"], name)
         if new != name:
-            self.log(f"{name} exists - this bias run is {new}")
+            self.log(f"{name} exists - this fixed-rotation run is {new}")
             self.bv["name"].set(new)
             c["bias"]["name"] = new
             name = new
@@ -1502,7 +1544,7 @@ class App:
         try:
             plan["idle"] = self._awg_idle(c)
         except ValueError as exc:
-            self.log(f"Bias points: {exc}")
+            self.log(f"Fixed rotations: {exc}")
             return
         plan["end"] = "park" if c["awg"].get("never_float", True) else "off"
         if c["awg"].get("require_dry_run", True):
@@ -1513,7 +1555,7 @@ class App:
                 messagebox.showwarning(
                     "Dry run first", f"{len(missing)} of the {len(waves)} plateaus in this "
                     f"plan have not passed a dry run on the scope (e.g. "
-                    f"{', '.join(w.label for w in missing[:3])}).\n\nBias points tab: 'Dry "
+                    f"{', '.join(w.label for w in missing[:3])}).\n\nFixed rotations tab: 'Dry "
                     f"run on scope' plays every plateau into the scope first.",
                     parent=self.root)
                 return
@@ -1569,7 +1611,7 @@ class App:
             waves = self._bias_waves(plan)
             wiring = self._awg_wiring(c)
         except (ValueError, OSError) as exc:
-            self.log(f"Bias dry run: {exc}")
+            self.log(f"Fixed rotations dry run: {exc}")
             return
         if not self._dry_confirm(wiring, len(waves)):
             return
@@ -1585,7 +1627,7 @@ class App:
         self.draw_visible()
 
     def do_load_bias(self):
-        d = filedialog.askdirectory(title="A bias run folder (holds bias.json)",
+        d = filedialog.askdirectory(title="A fixed-rotation run folder (holds bias.json)",
                                     parent=self.root, initialdir=self.outdir.get())
         if d:
             self.load_bias(d)
@@ -1595,13 +1637,13 @@ class App:
         try:
             self.bias_result = biasmod.load(folder)
         except (OSError, ValueError) as exc:
-            self.log(f"Bias run not loaded: {exc}")
+            self.log(f"Fixed-rotation run not loaded: {exc}")
             return
         tf = self.bias_result.get("transfer")
         n = len(self.bias_result.get("points", []))
         self._lab_upsert(os.path.dirname(os.path.abspath(folder)),
                          lablog.bias_row(self.bias_result))
-        self.log(f"Bias run {self.bias_result['name']}: {n} points"
+        self.log(f"Fixed-rotation run {self.bias_result['name']}: {n} points"
                  + (f"; light / monitors gain {tf['gain']:.4f}, residual "
                     f"{tf['rms_resid']*1e3:.0f} mdeg rms" if tf else ""))
         self.plot_dirty.add(self.fig_bias._frame)
@@ -1624,7 +1666,7 @@ class App:
         r = getattr(self, "bias_result", None)
         if not r or not r.get("points"):
             ax = fig.add_subplot(111)
-            ax.text(0.5, 0.5, "No bias run yet - Bias points tab: Start, or Load",
+            ax.text(0.5, 0.5, "No fixed-rotation run yet - Fixed rotations tab: Start, or Load",
                     ha="center", va="center", transform=ax.transAxes, color="#888")
             ax.set_axis_off()
             return
@@ -2762,6 +2804,10 @@ class App:
         self.save_settings()
         i = c["ilc"]
         folder = self.result["d"].folder
+        seq = self.result["d"].manifest.get("plan", {}).get("sequence") or c.get("sequence") or {}
+        gap = float(seq.get("spacing_ms", 16.667))
+        self.log(f"ILC target: legs {gap:g} ms apart (from the "
+                 f"{'scan' if self.result['d'].manifest.get('plan', {}).get('sequence') else 'sequence fields'})")
 
         def go():
             from . import ilc_target
@@ -2770,7 +2816,7 @@ class App:
                 lock_tol=float(c["analysis"].get("lock_tol", 0.006)),
                 pd_delay_us=float(i["pd_delay_us"]), split=float(i["split"]),
                 line_ref=i.get("line_ref") or None,
-                leg_gap_ms=float(c.get("sequence", {}).get("spacing_ms", 16.667)),
+                leg_gap_ms=gap,
                 scope_grab_path=c["scope_grab_path"], eomilc_path=c["eomilc_path"],
                 log=self.log)
 
@@ -2825,6 +2871,7 @@ class App:
     def _load_settings(self):
         c = self.cfg
         self.scope_addr.set(c["scope_addr"])
+        self.awg_addr.set(c.get("awg_addr", ""))
         self.ell_port.set(c["ell_port"])
         self.ell_addr.set(c["ell_address"])
         self.simulate.set(bool(c["simulate"]))
@@ -2875,6 +2922,7 @@ class App:
         """The window's values into self.cfg (validated where it matters)."""
         c = self.cfg
         c["scope_addr"] = self.scope_addr.get().strip()
+        c["awg_addr"] = self.awg_addr.get().strip()
         c["ell_port"] = self.ell_port.get().strip()
         c["ell_address"] = self.ell_addr.get().strip() or "0"
         c["simulate"] = bool(self.simulate.get())
@@ -3061,7 +3109,7 @@ class App:
             scope.connect(c["scope_addr"] or None)
         self.link = hw.ScopeLink(scope, log=self.log)
         self.log(f"Scope: {scope.idn.strip()} at {scope.addr}")
-        return f"scope: {short_idn(scope.idn)}"
+        return short_idn(scope.idn)
 
     def _open_ell(self, c, roles):
         """Worker thread: connect the analyzer mount; (status text, position)."""
@@ -3076,7 +3124,7 @@ class App:
         pos = dev.position()
         self.log(f"Analyzer: ELL{info['type']} S/N {info['serial']} on {dev.port}, "
                  f"{info['pulses_per_unit']} pulses/rev, firmware {info['firmware']}")
-        return (f"analyzer: ELL{info['type']} S/N {info['serial']} on {dev.port}", pos)
+        return (f"ELL{info['type']} S/N {info['serial']}", pos)
 
     def do_connect_scope(self):
         c = self.gather()
@@ -3134,8 +3182,8 @@ class App:
             self.bench = None
 
         def done(_):
-            self.scope_status.configure(text="scope: not connected", foreground="#666")
-            self.ell_status.configure(text="analyzer: not connected", foreground="#666")
+            self.scope_status.configure(text="not connected", foreground="#666")
+            self.ell_status.configure(text="not connected", foreground="#666")
             self._awg_status()
         self.worker(go, done=done)
 
@@ -3546,6 +3594,8 @@ class App:
         steps = [{"kind": k, "target": 0.0} for k in pre] + steps
         plan = dict(s, preset=c["preset"], software=f"rampol {__version__}",
                     dark_mode=dm, bg_mode=bm)
+        if (cfgmod.PRESETS.get(c["preset"]) or {}).get("sequence"):
+            plan["sequence"] = dict(c.get("sequence") or cfgmod.DEFAULTS["sequence"])
         run.new(plan, steps, extra={"zero_deg": float(c["ell_zero_deg"]),
                                     "precheck": getattr(self, "last_check", None),
                                     "provenance": self._provenance(c)})
@@ -3644,6 +3694,140 @@ class App:
         self._fill_compare_list(names)
         if select:
             self.show_scan.set(os.path.basename(select))
+
+    # -- rename / correct a scan ------------------------------------------------
+    SEQ_FIELDS = (("legs apart", "spacing_ms"), ("motion", "motion_ms"),
+                  ("before", "before_ms"), ("after", "after_ms"))
+
+    def open_edit_scan(self):
+        """Rename the shown scan and correct what its manifest says about it
+        (the preset, the spin-echo sequence, notes). Every correction is kept
+        in the manifest's 'edits' with the old value."""
+        path = self._scan_path(self.show_scan.get())
+        name = os.path.basename(os.path.normpath(path)) if path else ""
+        mp = os.path.join(path, f"{name}_scan.json") if path else ""
+        if not path or not os.path.isfile(mp):
+            self.log("Rename / edit: pick a scan in the Scan box first.")
+            return
+        with open(mp, encoding="utf-8") as fh:
+            man = json.load(fh)
+        plan = man.get("plan", {})
+        w = tk.Toplevel(self.root)
+        w.title(f"Rename / edit - {name}")
+        w.transient(self.root)
+        self.edit_win = w
+        f = ttk.Frame(w, padding=8)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+        ttk.Label(f, text="Name").grid(row=0, column=0, sticky="w")
+        v_name = tk.StringVar(value=name)
+        ttk.Entry(f, textvariable=v_name, width=44).grid(row=0, column=1, sticky="ew", pady=2)
+        preview = ttk.Label(f, foreground="#666", text="")
+        preview.grid(row=1, column=1, sticky="w")
+
+        def show_name(*_):
+            n = scanmod.safe_name(v_name.get())
+            preview.configure(text=(f"saved as {n}" if n != v_name.get().strip() else "")
+                              + "  (spaces become _ : Scope Grab's Compare box splits at "
+                                "spaces)")
+        v_name.trace_add("write", show_name)
+        show_name()
+        ttk.Label(f, text="Preset").grid(row=2, column=0, sticky="w")
+        v_preset = tk.StringVar(value=plan.get("preset", ""))
+        ttk.Entry(f, textvariable=v_preset, width=44).grid(row=2, column=1, sticky="ew", pady=2)
+        ttk.Label(f, text="Sequence (ms)").grid(row=3, column=0, sticky="w")
+        sr = ttk.Frame(f)
+        sr.grid(row=3, column=1, sticky="w", pady=2)
+        seq = plan.get("sequence") or {}
+        v_seq = {}
+        for label, key in self.SEQ_FIELDS:
+            ttk.Label(sr, text=label).pack(side="left", padx=(0, 2))
+            v_seq[key] = tk.StringVar(value=f"{seq[key]:g}" if key in seq else "")
+            ttk.Entry(sr, textvariable=v_seq[key], width=7).pack(side="left", padx=(0, 6))
+        ttk.Label(f, foreground="#666", justify="left", wraplength=420, text=(
+            "The spin-echo sequence the scan ran: leg spacing, one motion's length, and the "
+            "record kept before the trigger and after the second motion. "
+            + ("Not recorded for this scan (before 7 Oct 2026, or not a spin-echo preset): "
+               "fill it in to correct it, or leave it blank." if not seq else
+               "Recorded when the scan started.")
+            + " The ILC-target comparison takes its leg spacing from here.")).grid(
+            row=4, column=1, sticky="w")
+        ttk.Label(f, text="Notes").grid(row=5, column=0, sticky="nw", pady=(4, 0))
+        notes = tk.Text(f, width=52, height=4, wrap="word", font="TkDefaultFont")
+        notes.grid(row=5, column=1, sticky="ew", pady=(4, 2))
+        notes.insert("1.0", man.get("notes", ""))
+        ed = man.get("edits") or []
+        hist = "\n".join(f"{e.get('when', '')}  {e.get('field')}: {e.get('from')!r} -> "
+                         f"{e.get('to')!r}" for e in ed[-6:]) or "none yet"
+        ttk.Label(f, text="Corrections").grid(row=6, column=0, sticky="nw")
+        CopyLabel(f, text=hist, foreground="#666", width=60).grid(row=6, column=1, sticky="w")
+        msg = ttk.Label(f, foreground="#c00000", text="")
+        msg.grid(row=7, column=1, sticky="w")
+
+        def save():
+            if self.busy:
+                msg.configure(text="Busy - wait for the current operation (or Stop it) first.")
+                return
+            seq_new = {}
+            for _label, key in self.SEQ_FIELDS:
+                txt = v_seq[key].get().strip()
+                if txt:
+                    if not _isnum(txt) or float(txt) < 0:
+                        msg.configure(text=f"Sequence {key}: a number of ms >= 0")
+                        return
+                    seq_new[key] = float(txt)
+            if seq_new and len(seq_new) < len(self.SEQ_FIELDS):
+                msg.configure(text="Sequence: fill in all four, or none")
+                return
+            fields = {"plan.preset": v_preset.get().strip(),
+                      "plan.sequence": seq_new or None,
+                      "notes": notes.get("1.0", "end").strip()}
+            try:
+                new = self.edit_scan(path, fields, v_name.get())
+            except (OSError, ValueError) as exc:
+                msg.configure(text=str(exc))
+                return
+            w.destroy()
+            self.refresh_scan_list(select=new)
+            self.do_load_shown()
+        b = ttk.Frame(f)
+        b.grid(row=8, column=1, sticky="e", pady=(6, 0))
+        ttk.Button(b, text="Save", command=save).pack(side="left", padx=4)
+        ttk.Button(b, text="Cancel", command=w.destroy).pack(side="left")
+
+    def edit_scan(self, path, fields, new_name):
+        """Correct the metadata, then rename (folder, files, manifest, the
+        lab log, other scans that cite it). Returns the scan's name after.
+        Tk thread: it is a few hundred renames, and nothing may be measuring."""
+        outdir = os.path.dirname(os.path.normpath(path))
+        old = os.path.basename(os.path.normpath(path))
+        if self.run is not None and os.path.normcase(self.run.folder) == os.path.normcase(path) \
+                and self.busy:
+            raise ValueError(f"{old} is being measured")
+        scanmod.edit_metadata(path, fields, log=self.log)
+        new = scanmod.safe_name(new_name)
+        if new != old:
+            new = scanmod.rename(outdir, old, new, log=self.log)
+            new_folder = os.path.join(outdir, new)
+            try:
+                n = lablog.rename(outdir, old, new, new_folder)
+                if n:
+                    self.log(f"  lab log: {n} row(s) updated")
+            except OSError as exc:
+                self.log(f"  lab log NOT updated ({exc}): its row still says {old}. Close "
+                         f"it in Excel and correct the row by hand (the next analysis of "
+                         f"{new} adds a row under the new name).")
+            # what the window holds that points at the old folder
+            self.scan_cache.pop(os.path.normcase(os.path.abspath(path)), None)
+            # the Compare picks are re-read from the list (it shows the new name)
+            self.cmp_sel, self.cmp_results = [], {}
+            lr = self.iv["line_ref"].get().strip()
+            if lr and os.path.normcase(os.path.normpath(lr)) == os.path.normcase(os.path.normpath(path)):
+                self.iv["line_ref"].set(new_folder)
+            if self.run is not None and os.path.normcase(self.run.folder) == os.path.normcase(path):
+                self.run = None
+            self.log("  Export brief again for a brief that says the new name.")
+        return new
 
     def _scan_path(self, text):
         text = text.strip()
@@ -3871,7 +4055,7 @@ class App:
         p = lablog.path(out)
         if not os.path.exists(p):
             self.log(f"No lab log yet in {out}: a row is added when a scan is loaded "
-                     f"with every Apply switch on, a bias run finishes or an angle is found.")
+                     f"with every Apply switch on, a fixed-rotation run finishes or an angle is found.")
             return
         self.log(f"Lab log: {p}")
         if hasattr(os, "startfile"):
@@ -4765,10 +4949,30 @@ class App:
         ttk.Button(w, text="Close", command=w.destroy).pack(pady=(0, 8))
 
     def draw_diagnostics(self, fig):
+        """Four checks on the scan, each with a line under it saying what it
+        shows and what it should look like."""
         res = self.result
         pol, d = res["pol"], res["d"]
+        plan = d.manifest.get("plan", {})
         t = d.t * 1e3
-        ax = fig.add_subplot(221)
+        subs = fig.subfigures(2, 2)
+
+        def panel(k):
+            return subs.flat[k].add_subplot(111)
+
+        def caption(k, text):
+            # wrap=True wraps at the panel's own edge, so it follows the window
+            subs.flat[k].supxlabel(text, x=0.01, ha="left", fontsize=7, color="#444",
+                                   wrap=True)
+        ax = panel(0)
+        dr = pol.get("drift_resid")
+        caption(0, f"The analyzer goes back to {float(plan.get('ref_angle', 45)):g} deg every "
+                   f"{plan.get('ref_every', '?')} angles; each point is that return's mean "
+                   f"photodiode level. The light there does not change, so any trend is laser "
+                   f"intensity drift: it is interpolated in time and divided out of every angle "
+                   f"('drift-correct from refs'). How well the returns predict each other "
+                   + (f"({dr * 1e3:.2f}e-3) caps the trustworthy ER_fit at ~{1 / dr:.0f}."
+                      if dr else "sets the cap on a trustworthy ER_fit."))
         if len(pol["ref_clocks"]):
             c0 = pol["ref_clocks"].min()
             lv = pol["ref_levels"]
@@ -4777,8 +4981,13 @@ class App:
         ax.set_ylabel("ref level - mean (1e-3)")
         ax.set_title("Reference-angle returns")
         ax.grid(alpha=0.3)
-        ax = fig.add_subplot(222)
+        ax = panel(1)
         if pol.get("angle_gain") is not None:
+            caption(1, "How much light reaches the photodiode at each analyzer angle "
+                       "relative to the mean, fitted along with the Malus law and divided "
+                       "out. The mount turning moves the beam on the detector, so a smooth "
+                       "once-per-turn variation of a few % is expected; a jump at one angle "
+                       "points at that capture.")
             g = pol["angle_gain"]
             order = np.argsort(wrap_angle(pol["theta"]))
             ax.plot(wrap_angle(pol["theta"])[order], (g[order] - 1) * 100, "o-", ms=3)
@@ -4799,11 +5008,21 @@ class App:
             ax.text(0.5, 0.5, "needs >= 8 angles over >= 150 deg", ha="center",
                     transform=ax.transAxes, color="#888")
         if pol.get("angle_gain") is None:
+            caption(1, "Shown with the per-angle transmission switched off: the parts of the "
+                       "signal varying once (1-theta) or four times (4-theta) per analyzer "
+                       "turn, which the Malus law a0 + B cos 2(theta - psi) cannot make, "
+                       "relative to B. 1-theta is the beam walking on the detector; both "
+                       "should sit near the noise.")
             ax.set_ylabel("relative amplitude (1e-3)")
             ax.set_xlabel("time (ms)")
             ax.set_title("Harmonics outside the Malus law")
             ax.grid(alpha=0.3)
-        ax = fig.add_subplot(223)
+        ax = panel(2)
+        caption(2, "Along the record: the rms of what the per-sample Malus fit leaves over, "
+                   "against the median statistical error of one capture block (dashed). On "
+                   "the line, the Malus law explains the data to the noise; above it, "
+                   "something the model lacks (drift, an angle-dependent transmission, a "
+                   "fast change within the averaging) - those times' ER_fit is less certain.")
         sem_med = np.nanmedian([np.nanmedian(s["sem"]["PD"]) for s in pol["steps"]])
         src = pol.get("err_source", "residual")
         ax.plot(t, pol["rms"] * 1e3, lw=0.6,
@@ -4816,7 +5035,11 @@ class App:
         ax.set_title("Residual vs measurement noise")
         ax.legend(fontsize=7)
         ax.grid(alpha=0.3)
-        ax = fig.add_subplot(224)
+        ax = panel(3)
+        caption(3, "Per step, in measuring order: where the analyzer landed against where it "
+                   "was sent (mdeg, blue; one ELL14 pulse is 2.5 mdeg), and the share of "
+                   "photodiode samples that were off the scope screen (red x). Off-screen "
+                   "samples are clipped: that step's V/div or offset did not hold the light.")
         st = [s for s in d.steps if s["kind"] in ("scan", "ref", "null") and "landed" in s]
         err = [((s["landed"] - s["target"] + 180) % 360 - 180) * 1e3 for s in st]
         offs = [100 * max(s.get("offscreen_frac", {}).values() or [0]) for s in st]

@@ -84,6 +84,11 @@ def main():
           app.scope_status.cget("text"))
     check("analyzer connected (simulated)", app.rot is not None,
           app.ell_status.cget("text"))
+    app.do_connect_awg()
+    settle(root, app)
+    check("AWG Connect in the hardware pane: session up, outputs untouched",
+          app.awg_sess is not None and not app.awg_sess.owned
+          and "4063B" in app.awg_hw.cget("text"), app.awg_hw.cget("text"))
     app.goto_var.set("123.4")
     app.do_goto()
     settle(root, app)
@@ -192,7 +197,7 @@ def main():
     from rampol import lablog
     rows = lablog.read(app.outdir.get())
     check("the scan has its row in the lab log",
-          any(r["kind"] == "ramp scan" and r["name"] == "gui-test" for r in rows),
+          any(r["kind"] == "ramp scan" and r["name"] == "gui_test" for r in rows),
           [(r["kind"], r["name"]) for r in rows])
     check("direct ER computed with the load", len(app.result["direct"]) >= 10,
           len(app.result["direct"]))
@@ -209,6 +214,10 @@ def main():
             fig.savefig(os.path.join(out, f"{name}.png"))
     nfig = sum(1 for f, _d in app.plot_tabs.values() if f is not None)
     check("every figure tab drew", len(os.listdir(out)) == nfig, sorted(os.listdir(out)))
+    caps = [sf._supxlabel.get_text() for sf in app.fig_diag.subfigs
+            if getattr(sf, "_supxlabel", None) is not None]
+    check("Diagnostics: a line under each of the 4 panels saying what it shows",
+          len(caps) == 4 and all(len(c_) > 80 for c_ in caps), [c_[:40] for c_ in caps])
     check("table has rows", len(app.tv.get_children()) > 5, len(app.tv.get_children()))
 
     print("\ncursor and compare")
@@ -253,7 +262,7 @@ def main():
     settle(root, app)
     res = app.result
     log = app.logbox.get("1.0", "end")
-    check("the stopped scan is loaded", res is not None and res["d"].name == "stopped-part-way"
+    check("the stopped scan is loaded", res is not None and res["d"].name == "stopped_part_way"
           and 0 < res["n_done"] < res["n_total"],
           res and (res["d"].name, res["n_done"], res["n_total"]))
     check("the log says where it stopped and how to resume", "Stopped after" in log
@@ -280,7 +289,7 @@ def main():
     print("\nbias points: AWG plateaus into the simulated bench")
     tabs = [app.modes.tab(f, "text") for f in app.modes.tabs()]
     check("measurement modes are tabs (find and refine share Analyzer)",
-          tabs == ["Ramp scan", "Analyzer", "AWG", "Bias points", "ILC target"], tabs)
+          tabs == ["Ramp scan", "Analyzer", "AWG", "Fixed rotations", "ILC target"], tabs)
     app.bv["biases"].set("0:90:45")
     app.bv["shots"].set("4")
     app.bv["name"].set("gui-bias")
@@ -339,18 +348,19 @@ def main():
     app.check_first.set(False)
     app.do_start_scan()
     settle(root, app, timeout=300)
-    check("a used name counts up", app.scan_name.get() == "gui-test-2", app.scan_name.get())
+    check("a used name counts up, spaces as underscores",
+          app.scan_name.get() == "gui_test_2", app.scan_name.get())
     res = app.result
     man = res["d"].manifest if res else {}
     check("background reused from the earlier scan",
-          man.get("borrowed", {}).get("background", {}).get("source") == "gui-test",
+          man.get("borrowed", {}).get("background", {}).get("source") == "gui_test",
           man.get("borrowed"))
     lv = an.offset_levels(res["d"], 1.0) if res else {}
     check("dark (PD covered) measured in this scan",
           lv.get("dark", {}).get("source") == "this scan",
           lv.get("dark", {}).get("level"))
     txt = app.corr_label.cget("text")
-    check("corrections shown up front", "subtract background" in txt and "gui-test" in txt,
+    check("corrections shown up front", "subtract background" in txt and "gui_test" in txt,
           txt[:150])
     app.sub_dark.set(False)
     app.reanalyse()
@@ -417,7 +427,7 @@ def main():
           repr(root.clipboard_get()))
 
     print("\ncompare scans")
-    i = list(app.cmp_lb.get(0, "end")).index("gui-test")
+    i = list(app.cmp_lb.get(0, "end")).index("gui_test")
     app.cmp_lb.selection_clear(0, "end")
     app.cmp_lb.selection_set(i)
     app.do_compare_load()
@@ -426,7 +436,7 @@ def main():
     ax = app.fig_cmp.axes
     names = [ln.get_label() for ln in ax[0].lines] if ax else []
     check("Compare: rotation of both scans, their difference and the ER",
-          len(ax) == 3 and "gui-test" in names and "gui-test-2 (shown)" in names, names)
+          len(ax) == 3 and "gui_test" in names and "gui_test_2 (shown)" in names, names)
     app.fig_cmp.savefig(os.path.join(out, "Compare.png"))
 
     print("\nbrief export")
@@ -440,6 +450,70 @@ def main():
     summ = _json.load(open(os.path.join(bdir, "summary.json"), encoding="utf-8"))
     check("summary has the direct ER and the provenance",
           summ.get("direct_er_min") and summ.get("provenance"), summ.get("direct_er_min"))
+
+    print("\nrename / edit a scan")
+    from rampol import lablog
+    outd = app.outdir.get()
+    old_dir = app.result["d"].folder
+    app.open_edit_scan()
+    root.update()
+    check("Rename / edit opens on the shown scan", "gui_test_2" in app.edit_win.title())
+    app.edit_win.destroy()
+    new = app.edit_scan(old_dir, {"plan.sequence": {"spacing_ms": 133.333, "motion_ms": 9.5,
+                                                    "before_ms": 60.0, "after_ms": 125.0},
+                                  "notes": "the offset was not applied"},
+                        "gui test 2 renamed")
+    nd = os.path.join(outd, new)
+    files = os.listdir(nd)
+    import json as _json2
+    man = _json2.load(open(os.path.join(nd, f"{new}_scan.json"), encoding="utf-8"))
+    check("renamed with underscores: folder, every capture, the manifest",
+          new == "gui_test_2_renamed" and not os.path.exists(old_dir)
+          and all(f.startswith(new + "_") for f in files if os.path.isfile(os.path.join(nd, f)))
+          and man["name"] == new
+          and all(f.startswith(new + "_") for st in man["steps"] for f in st.get("files", [])),
+          files[:3])
+    briefs = os.listdir(os.path.join(nd, "analysis", "brief"))
+    check("exported figures carry the new name",
+          any(b.startswith(new + "_") for b in briefs)
+          and not any("gui_test_2_" in b and not b.startswith(new) for b in briefs), briefs[:3])
+    check("corrections kept with the old values",
+          [e["field"] for e in man.get("edits", [])] == ["plan.sequence", "notes", "name"]
+          and man["edits"][-1]["from"] == "gui_test_2"
+          and man["plan"]["sequence"]["spacing_ms"] == 133.333, man.get("edits"))
+    rows = [r["name"] for r in lablog.read(outd) if r["kind"] == "ramp scan"]
+    check("the lab log row follows the rename", new in rows and "gui_test_2" not in rows, rows)
+    app.refresh_scan_list(select=new)
+    app.do_load_shown()
+    settle(root, app)
+    check("the renamed scan loads and reports its notes",
+          app.result["d"].name == new
+          and an.scan_summary(app.result)["notes"] == "the offset was not applied")
+    # a rename that cannot happen changes nothing
+    lock = open(os.path.join(nd, sorted(f for f in files if f.endswith(".npz"))[-1]), "rb")
+    try:
+        import msvcrt
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        try:
+            app.edit_scan(nd, {}, "never")
+            undone = False
+        except OSError:
+            undone = os.path.isdir(nd) and not os.path.exists(os.path.join(outd, "never"))
+        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        lock.close()
+    check("a held file: the rename is refused and everything put back", undone,
+          sorted(os.listdir(nd))[:2])
+    # the first scan lent its background to gui_test_2: renaming the lender
+    # updates the citation
+    app.edit_scan(os.path.join(outd, "gui_test"), {}, "gui test lender")
+    man = _json2.load(open(os.path.join(nd, f"{new}_scan.json"), encoding="utf-8"))
+    check("a scan citing the renamed one follows",
+          man["borrowed"]["background"]["source"] == "gui_test_lender", man["borrowed"])
+    app.edit_scan(os.path.join(outd, "gui_test_lender"), {}, "gui_test")
+    app.refresh_scan_list(select=new)
+    app.do_load_shown()
+    settle(root, app)
 
     print("\nshots: single traces and averages")
     app.nb.select(app.fig_shots._frame)

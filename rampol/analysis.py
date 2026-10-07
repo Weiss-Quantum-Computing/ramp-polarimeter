@@ -821,6 +821,11 @@ def direct_er(d, pol, box_us=4.0, correct_drift=False, gains=None):
             imin, s_min = float(Is[k, m]), float(sems[k, m])
             imax = float(np.mean([Is[j, m] for j in orth[k]]))
             s_max = float(np.sqrt(np.mean([sems[j, m] ** 2 for j in orth[k]]) / len(orth[k])))
+            if not np.isfinite(s_min) and imin <= 0:
+                # no error estimate (a step stopped after one shot) and a
+                # level at or below zero: neither a value nor a bound
+                # (7 Oct 2026: it went into the lab log as ER -2366)
+                continue
             lower = bool(imin < 2 * s_min)
             pts.append(dict(kind="crossing", seg=seg_of(t[m]), t_ms=float(t[m] * 1e3),
                             theta=float(th[k]), rotation=float(rot[m]),
@@ -853,6 +858,8 @@ def direct_er(d, pol, box_us=4.0, correct_drift=False, gains=None):
         s_max = float(np.mean([np.mean(sem[j, w]) for j in orth[k]]) / np.sqrt(n_ind * len(orth[k])))
         off = float(np.median(wrap(psi[w] - th[k] - 90)))
         imin = float(means[k])
+        if not np.isfinite(s_min) and imin <= 0:
+            continue                  # as for a crossing: no value, no bound
         lower = bool(imin < 2 * s_min)
         from_off = float(imax * np.sin(np.deg2rad(off)) ** 2)
         pts.append(dict(kind="static", seg=s["kind"], t_ms=float(t[w].mean() * 1e3),
@@ -942,7 +949,9 @@ def scan_summary(res, direct=None):
            "complete": res.get("n_done") == res.get("n_total"),
            "pd_vdiv": _pd_vdiv(d, "scan"),
            "shots_per_angle": man.get("plan", {}).get("shots"),
-           "preset": man.get("plan", {}).get("preset", "")}
+           "preset": man.get("plan", {}).get("preset", ""),
+           "sequence": man.get("plan", {}).get("sequence"),
+           "notes": man.get("notes", "")}
     cs = res.get("corr") or {}
     out["subtracted"] = cs.get("subtracted_kind")
     out["subtracted_mV"] = None if cs.get("subtracted") is None else cs["subtracted"] * 1e3

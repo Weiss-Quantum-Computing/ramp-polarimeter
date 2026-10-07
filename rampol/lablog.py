@@ -63,6 +63,36 @@ def upsert(outdir, row):
     return p
 
 
+def rename(outdir, old, new, folder=None):
+    """A renamed scan: its row takes the new name (and folder), and the old
+    name is replaced where other rows cite it (a borrowed background).
+    Returns the number of rows changed. Raises OSError if the log cannot be
+    written (open in Excel)."""
+    import re
+    rows = read(outdir)
+    pat = re.compile(r"(?<![\w.-])" + re.escape(old) + r"(?![\w-])")
+    n = 0
+    for r in rows:
+        before = dict(r)
+        if r.get("kind") == "ramp scan" and r.get("name") == old:
+            r["name"] = new
+            if folder:
+                r["folder"] = folder
+        for k in ("result", "subtracted", "direct_er_min_at", "notes"):
+            if r.get(k):
+                r[k] = pat.sub(new, r[k])
+        n += r != before
+    if n:
+        p = path(outdir)
+        tmp = p + ".part"
+        with open(tmp, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.DictWriter(fh, fieldnames=COLUMNS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        replace_retrying(tmp, p)
+    return n
+
+
 def _fmt(v):
     if v is None:
         return ""
@@ -104,6 +134,7 @@ def scan_row(summary):
         "software": short({"software": prov.get("software")}) if prov else "",
         "ilc": short({"ilc_state_files": prov.get("ilc_state_files")}) if prov else "",
         "folder": s.get("folder", ""),
+        "notes": s.get("notes", ""),
     }
 
 
@@ -154,7 +185,7 @@ def find_row(out, when=None):
         res = (f"{out['kind']} transmission at analyzer {out['angle']:.3f} +- "
                f"{out['sig']*1e3:.0f} mdeg ({where}), level {out['level']*1e3:.3f} mV "
                f"at {out['vdiv']*1e3:g} mV/div; {out.get('offset_note', 'raw')}")
-    return {"kind": kind, "name": f"{kind.replace(' ', '-')}-{when.replace(':', '')}",
+    return {"kind": kind, "name": f"{kind.replace(' ', '_')}_{when.replace(':', '')}",
             "measured": when, "status": "done", "result": res}
 
 
@@ -169,7 +200,7 @@ def dry_row(reports, label, when):
         nums.append(f"{n} gain {r.get('gain', float('nan')):.4f}, delay "
                     f"{r.get('delay_us', float('nan')):.1f} us")
     res = ("PASSED" if ok else "FAILED: " + "; ".join(last.get("problems", [])[:3]))
-    return {"kind": "AWG dry run", "name": f"dryrun-{when_s.replace(':', '')}",
+    return {"kind": "AWG dry run", "name": f"dryrun_{when_s.replace(':', '')}",
             "measured": when_s, "status": "passed" if ok else "failed",
             "result": f"{label}: {len(reports)} waveform(s) {res}" + (
                 f" ({'; '.join(nums)})" if nums else "")}

@@ -28,15 +28,18 @@ FORMAT = "rampol-scan/1"
 
 
 def safe_name(text):
-    """A scan name usable as a filename and as a Scope Grab compare key: no
-    spaces, nothing Windows refuses."""
+    """A scan name usable as a filename and as a Scope Grab compare key.
+    Spaces become underscores: Windows takes spaces in a filename, but Scope
+    Grab's Compare box separates its entries (KEY:RUNS) at whitespace, so a
+    key with a space in it would split in two. (Before 7 Oct 2026 they became
+    dashes, which turned '-2V' into '--2V'.) Nothing Windows refuses."""
     text = re.sub(r'[<>:"/\\|?*]', "", str(text).strip())
-    return re.sub(r"\s+", "-", text) or "scan"
+    return re.sub(r"\s+", "_", text) or "scan"
 
 
 def next_free_name(outdir, name):
     """`name` if no scan uses it in outdir, else the next free one: a
-    trailing number is counted up (test-4 -> test-5), otherwise -2, -3 ...
+    trailing number is counted up (test_4 -> test_5), otherwise _2, _3 ...
     is added. So a name never has to be retyped to start another scan."""
     name = safe_name(name)
 
@@ -53,9 +56,126 @@ def next_free_name(outdir, name):
             k += 1
         return f"{head}{k:0{width}d}"
     k = 2
-    while taken(f"{name}-{k}"):
+    while taken(f"{name}_{k}"):
         k += 1
-    return f"{name}-{k}"
+    return f"{name}_{k}"
+
+
+def _write_json(path, obj):
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, indent=1)
+    replace_retrying(tmp, path)
+
+
+def rename(outdir, old, new, log=print):
+    """Rename scan `old` in `outdir` to `new` (made safe). Renamed: the
+    folder; every file in it named '<old>_...' (captures, sidecars, the
+    manifest); files in its subfolders that carry the name (exported
+    figures); the manifest's name and file lists; and the name where other
+    scans' manifests cite it (a dark or background they borrowed). The change
+    is recorded in the manifest's 'edits'. Returns the new name.
+
+    All or nothing on disk: a file that cannot be renamed (held open by a
+    viewer, Excel, Explorer's preview) puts back everything renamed before it
+    and raises OSError. The lab log is renamed separately (lablog.rename)."""
+    new = safe_name(new)
+    if new == old:
+        return old
+    src, dst = os.path.join(outdir, old), os.path.join(outdir, new)
+    if not os.path.isfile(os.path.join(src, f"{old}_scan.json")):
+        raise FileNotFoundError(f"{old} is not a scan in {outdir}")
+    # a change of case only is the same folder to Windows
+    if os.path.exists(dst) and os.path.normcase(src) != os.path.normcase(dst):
+        raise FileExistsError(f"{new} already exists in {outdir}")
+    done = []
+    try:
+        os.rename(src, dst)
+        done.append((src, dst))
+        for root, _dirs, files in os.walk(dst):
+            top = os.path.normcase(root) == os.path.normcase(dst)
+            for f in files:
+                if top:
+                    g = new + f[len(old):] if f.startswith(old + "_") else f
+                else:
+                    # in a filename the name ends at _ or the extension
+                    # (target_<name>_played.csv, <name>_corrections.png)
+                    g = re.sub(r"(?<![A-Za-z0-9.-])" + re.escape(old) + r"(?=[_.]|$)",
+                               new, f)
+                if g != f:
+                    a, b = os.path.join(root, f), os.path.join(root, g)
+                    os.rename(a, b)
+                    done.append((a, b))
+        mp = os.path.join(dst, f"{new}_scan.json")
+        with open(mp, encoding="utf-8") as fh:
+            man = json.load(fh)
+        man["name"] = new
+        for s in man.get("steps", []):
+            s["files"] = [new + f[len(old):] if f.startswith(old + "_") else f
+                          for f in s.get("files", [])]
+        man.setdefault("edits", []).append(
+            {"when": now(), "field": "name", "from": old, "to": new})
+        _write_json(mp, man)
+    except OSError as exc:
+        for a, b in reversed(done):
+            try:
+                os.rename(b, a)
+            except OSError:
+                pass
+        raise OSError(f"could not rename {old}: {exc}. Nothing was changed - close "
+                      f"whatever holds its files (a viewer, Excel, Explorer's preview "
+                      f"pane, OneDrive syncing) and try again.") from exc
+    log(f"Renamed {old} -> {new} ({len(done) - 1} files)")
+    # other scans that cite it by name: a borrowed dark / background
+    for n in sorted(os.listdir(outdir)):
+        p = os.path.join(outdir, n, f"{n}_scan.json")
+        if n == new or not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8") as fh:
+                m = json.load(fh)
+            hit = [k for k, e in (m.get("borrowed") or {}).items()
+                   if isinstance(e, dict) and e.get("source") == old]
+            if hit:
+                for k in hit:
+                    m["borrowed"][k]["source"] = new
+                _write_json(p, m)
+                log(f"  {n}: borrowed {', '.join(hit)} now cites {new}")
+        except (OSError, ValueError) as exc:
+            log(f"  {n}: could not update its reference to {old} ({exc})")
+    return new
+
+
+def edit_metadata(folder, fields, log=print):
+    """Correct a scan's recorded metadata. `fields` maps a manifest key (a
+    dotted path into it: 'notes', 'plan.preset', 'plan.sequence') to its
+    corrected value; None removes it. Each change is recorded in 'edits'
+    with the old and new value, so the manifest still says what was planned
+    as well as what was corrected. Returns the fields that changed."""
+    name = os.path.basename(os.path.normpath(folder))
+    mp = os.path.join(folder, f"{name}_scan.json")
+    with open(mp, encoding="utf-8") as fh:
+        man = json.load(fh)
+    changed = []
+    for key, val in fields.items():
+        *path, last = key.split(".")
+        node = man
+        for k in path:
+            node = node.setdefault(k, {})
+        old = node.get(last)
+        if old == val or (old in (None, "") and val in (None, "")):
+            continue
+        if val is None:
+            node.pop(last, None)
+        else:
+            node[last] = val
+        man.setdefault("edits", []).append({"when": now(), "field": key, "from": old,
+                                            "to": val})
+        changed.append(key)
+    if changed:
+        _write_json(mp, man)
+        log(f"{name}: corrected {', '.join(changed)}")
+    return changed
 
 
 def angle_list(start, stop, step):

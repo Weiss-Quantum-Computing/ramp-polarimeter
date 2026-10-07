@@ -148,6 +148,8 @@ DEFAULTS = {
     "awg_path": os.path.join(PROJECTS, "BK4063B-AWG-GUI", "bk4063b.py"),
     "scope_model": "msox2014a",
     "scope_addr": "",
+    # the BK Precision 4063B's VISA resource; blank = the first 4063B found
+    "awg_addr": "",
     "ell_port": "COM3",
     "ell_address": "0",
     # Mount angle (deg) that is analyzer 0. By the campaign's convention 0 is

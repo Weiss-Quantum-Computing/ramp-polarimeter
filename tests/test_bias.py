@@ -120,7 +120,7 @@ def run_checks(sg, eomilc):
           not any(bench.awg_on.values()) and scope.get(":TIMebase:SCALe") == tb0
           and link.channel_state([1])[1] == pd0)
     check("asked before the outputs and for the dark",
-          asked[:3] == ["Bias points", "Dark", "Dark"], str(asked))
+          asked[:3] == ["Fixed rotations", "Dark", "Dark"], str(asked))
     man = bias.load(run.folder)
     check("manifest reloads", len(man["points"]) == 4 and man["transfer"] is not None)
 

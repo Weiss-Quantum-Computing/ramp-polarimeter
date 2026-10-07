@@ -84,15 +84,20 @@ sign (not built in yet).
 
 ## Using it
 
-1. **Connect** the scope (VISA address blank = first MSO-X found) and the
-   ELL14 (COM3 on this PC). With *Connect on open* ticked (the default) the
-   window connects both when it opens, each on its own: one that is off or
+1. **Connect** (the Hardware pane, one row per instrument: address, Connect,
+   what is connected) the scope (VISA address blank = first MSO-X found),
+   the ELL14 (COM3 on this PC) and the BK Precision 4063B AWG (blank = first
+   4063B found; the row shows its model and the VISA resource it is open
+   on). With *Connect on open* ticked (the default) the window connects the
+   scope and the ELL14 when it opens, each on its own: one that is off or
    held by another program is logged and the other still connects. The AWG
-   is never connected on open (CH1 is often live from the ILC panel); it
-   connects on first use. The scope and the AWG share one VISA resource
+   is never connected on open (CH1 is often live from the ILC panel, and an
+   open session keeps its own GUI out); its Connect, or the first AWG
+   operation, connects it. Connecting sends only `*IDN?` - the outputs are
+   left as they are. The scope and the AWG share one VISA resource
    manager on the default (NI) VISA that neither closes - EOM-ILC's fix for
    the 26 Aug traps (one close killing the other's session; Keysight's
-   ktvisa32 half-loading once NI's is in the process). `Simulate both` runs
+   ktvisa32 half-loading once NI's is in the process). `Simulate` runs
    the whole window against a software bench instead, which is also what
    the tests use.
 
@@ -159,9 +164,28 @@ sign (not built in yet).
    else the dark; with both, the corrections line shows the stray light
    apart. Scans before 6 Oct 2026 have one "dark", taken with the beam
    blocked - a background in this sense; the numbers are the same.
-   **Scan name**: a name already used counts up (`test-4` -> `test-5`,
-   `scan` -> `scan-2`); a stopped scan of that name is offered for resuming
-   first.
+   **Scan name**: spaces become underscores (`133 ms SE offset -2V` ->
+   `133_ms_SE_offset_-2V`). Windows would take the spaces; Scope Grab's
+   Compare box would not - it splits its `KEY:RUNS` entries at whitespace,
+   so a scan's key must not contain one. Before 7 Oct 2026 they became
+   dashes. A name already used counts up (`test_4` -> `test_5`, `scan` ->
+   `scan_2`); a stopped scan of that name is offered for resuming first.
+   A scan records the spin-echo sequence fields with its plan when its
+   preset is built from them.
+
+   **Rename / edit...** (next to the Scan box) corrects the shown scan
+   after the fact: its name, the preset and spin-echo sequence it actually
+   ran (leg spacing, motion, before / after), and notes. A rename moves the
+   folder and every file named after the scan (captures, sidecars, the
+   manifest, exported figures under `analysis/`), the manifest's file
+   lists, the lab-log row, and any other scan citing it (a borrowed dark or
+   background). It is all-or-nothing on disk: a file held open (a viewer,
+   Excel, OneDrive) refuses it and nothing changes. Every correction goes
+   into the manifest's `edits` with the old value, so the record still says
+   what was planned. The notes go to the lab log's `notes` column. The
+   ILC-target comparison takes its leg spacing from the scan's own sequence
+   when it has one. A brief exported before a rename keeps the old name in
+   its text: export it again.
    **Check scope** (and `check first`, on by default, before every scan)
    judges the settings - trigger sweep, channels displayed, DC coupling, a
    pre-trigger stretch, trigger wait longer than the repetition - then takes
@@ -176,10 +200,15 @@ sign (not built in yet).
    with the polarization at the EO zero. After a scan, this sets the zero
    (the mount angle of analyzer 0) to the scan's fitted rest azimuth. Never
    trust the engraving.
-6. **Analyzer** tab, two parts. *Refine the shown scan's static nulls*:
-   windows `auto` (rest, hold, after) or `t1-t2` in ms,
-   offsets around crossed, the PD V/div at the null. It takes a background
-   at that V/div first (block the beam when asked).
+6. **Analyzer** tab, two parts. *Null refine: precise Imin of the shown
+   scan where it is flat*. A scan reads every angle at the V/div the
+   brightest one needs, so where the rotation stands still its Imin is a
+   code or two. This steps the analyzer to `offsets` (deg) around each flat
+   stretch's crossed angle - windows `auto` (rest, holds, after) or `t1-t2`
+   in ms - at a sensitive PD V/div, and adds the captures to the same scan
+   (the Extinction tab's null-refine points). It takes a background at that
+   V/div first (block the beam when asked). *Plan (log only)* lists what it
+   would measure.
 7. *Find the min / max transmission angle*, of either
    - **static light (line trigger)**: the light as it is with nothing
      ramping - the experiment runs on, mains-synchronous, so the scope
@@ -413,14 +442,14 @@ from one run). The converter turns any of AWG V, monitor V, kV or degrees
 into the others. *Apply and save* stores it in the config with its source
 and date; every dry-run record carries the calibration it was made with.
 
-## Bias points (Bias points tab)
+## Fixed rotations (Fixed rotations tab; `bias points` in the code and files)
 
 A ramp scan reads every angle at the V/div the brightest needs, so near a
 null the scope resolves ~1 code: on test-4 the rest/hold minima (2.6-3 mV)
 were one step at 1 V/div - ER ~1800 there is the scope's floor. Mid-ramp
 (166-281 mV, ER 18-31) they were well resolved.
 
-Bias points hold the EOMs at fixed rotations with the AWG (4063B; close its
+Fixed rotations ("bias points") hold the EOMs at each rotation in a list with the AWG (4063B; close its
 GUI; CH1 -> X1, CH2 -> X2; plateaus on the bench trigger, EXT, each checked
 with EOM-ILC's limit check before upload). They use the AWG tab's session,
 idle levels and its two rules: with 'require a dry run', *Dry run on scope*
@@ -486,7 +515,7 @@ box opens any angle: key `<name>_a045.00`, runs `1-4`.
 | Angle | rotation from rest with +-1 SD, the monitor prediction, their difference in mdeg |
 | Extinction | the extinction ratio along the record by method (marker): measured at a crossing (circles), dip fit (triangles), measured static (squares; grey hollow where the angle was too far from crossed), null refine (diamonds), the per-sample Malus fit as a grey line with its drift limit; colour = leg (first / second transport, shaded on the time axis), filled = rotation moving away from rest, hollow = moving back; +-1 sigma bars (asymmetric: ER goes as 1/Imin); lower bounds as arrows. *What are these?* opens the explanation of every family. x = time or rotation (rotation lines the two legs up) |
 | Poincaré | the linear Stokes parameters in the rest frame on the sphere (coloured by time), |S3| and the ellipticity angle chi vs time assuming full polarization (handedness not measured), the ellipse at the cursor against the rest ellipse |
-| Diagnostics | ref returns vs time, 1-theta and 4-theta amplitudes, residual vs block SEM, landing error and off-screen samples per step |
+| Diagnostics | ref returns vs time, per-angle transmission (or 1-theta and 4-theta amplitudes with it off), residual vs block SEM, landing error and off-screen samples per step; a line under each panel says what it shows and what it should look like |
 | Table | per-segment medians, every refine, dip and direct ER; Save CSV |
 | Shots | the data behind every number: pick steps (several with ctrl/shift), a channel, and any of single shots straight from the files, the average the fit uses, +-1 SE, the min-max over the shots, the dropped (missed-lock) shots dashed, the analyzer 90 deg away; a shot list (`1, 3-5`) and a time window - zoom with the toolbar and the view re-reads the files at full resolution. *Crossed at cursor* picks the angle nearest crossed at the cursor time with its partner: the direct-ER view |
 | Build | how the angles become the polarization: a time slider; top every angle's averaged trace as fitted, bottom left the points at that instant (and before corrections) with the Malus fit a0 + B cos 2(theta - psi), its maximum and null, bottom right the rotation with the instant marked |
@@ -494,7 +523,7 @@ box opens any angle: key `<name>_a045.00`, runs `1-4`.
 | Compare | the shown scan against up to 6 others picked in a list: rotation, the difference from the shown scan (smoothed, with the shown scan's +-1 SD), ER_fit and the direct points; each with the window's Apply switches |
 | Find angle | the last Find angle scan and its fit |
 | AWG | the AWG tab's waveform per channel, the rotation it gives, the hold and the Find window; after a dry run, what the scope saw against what was meant and the residual |
-| Bias points | static ER vs rotation (Imax/Imin and from the null curvature), light - monitors static (and the shown scan's ramp), Imin with the V/div it was read at, the last null scan |
+| Fixed rotations | static ER vs rotation (Imax/Imin and from the null curvature), light - monitors static (and the shown scan's ramp), Imin with the V/div it was read at, the last null scan |
 | ILC target | the ILC comparison's figures for the shown scan |
 
 Click a time on Map, Angle, Extinction or the Poincaré tab's time plot to move
@@ -535,7 +564,7 @@ python tests/run_tests.py
 | `test_checks.py` | the pre-run check against the simulator: a hand-changed scope put back by a preset and confirmed, a silently refused setting reported, and each failure it should catch (AUTO sweep, channel off, wait <= repetition, AC coupling, clipping, off screen, small signal, ramp cut off, no light, no pre-trigger) |
 | `test_awg.py` | ramps (the ILC's record, ends at idle, the hold at the rotation), every check (length, trigger period, duty, idle and AWG caps), ILC drive files (header, a target refused, keepers against their targets pass and as u x gain fail), the session against the simulated AWG (names reused, a foreign ON refused, OFF for a change, park, a live FRQ change refused, CH2 refusing ON leaves nothing on); the rules (ON and live loads refused without a dry run, OFF needs force, the end is park); the dry run into the simulated scope (passes and sees the zero-code error, puts the scope back; catches swapped cables and a wrong FRQ); the calibration (conversions, applied everywhere, a bias-run fit) |
 | `test_bias.py` | the plan (AWG volts, plateaus, the Trek limit check), the null fit and ER, and a whole bias run on the simulated bench (AWG plateaus into the bench model): ER at 0-90 deg against the model, a 2 deg static rotator error recovered, outputs off and scope restored at the end |
-| `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER, a bias run from the Bias points tab, the direct points, residual map, Poincaré, Compare, Export brief, provenance and lab-log rows; config sandboxed, window off screen |
+| `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER, a fixed-rotation run from its tab, rename / edit (files, manifest, lab log, citing scans, a held file refused), the direct points, residual map, Poincaré, Compare, Export brief, provenance and lab-log rows; config sandboxed, window off screen |
 
 ## What has and has not run on hardware
 
