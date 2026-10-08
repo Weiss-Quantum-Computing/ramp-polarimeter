@@ -831,15 +831,16 @@ class BiasRun:
             traces[f"coarse_{a:.2f}"] = s["PD"].mean(axis=0)
         return malus4(th4, I4)
 
-    def _null_scan(self, b, theta0, est, coarse, null_sets, w, traces):
+    def _null_scan(self, b, theta0, est, coarse, null_sets, w, traces, half=None):
         """The analyzer stepped across the null at the most sensitive V/div
         that holds the scan; re-centred when the fit lands off centre.
         Returns (fit, scan dict, setting, converged)."""
         p = self.p
+        half = float(p["null_half_deg"] if half is None else half)
         setting = next((s_ for s_ in null_sets if est < 5.5 * s_[0]), coarse)
         fit, scan, recentred = None, None, 0
         while True:
-            offs = np.linspace(-p["null_half_deg"], p["null_half_deg"], int(p["null_points"]))
+            offs = np.linspace(-half, half, int(p["null_points"]))
             th = theta0 + offs
             I, S, clipped = [], [], False
             for a in th:
@@ -858,13 +859,25 @@ class BiasRun:
                          f"{setting[0]*1e3:g} mV/div")
                 continue
             fit = fit_null(th, I, S)
-            scan = {"theta": th.tolist(), "I": I, "sem": S, "vdiv": setting[0]}
+            scan = {"theta": th.tolist(), "I": I, "sem": S, "vdiv": setting[0], "half": half}
             ok = fit["inside"] and abs(fit["theta_n"] - theta0) < 0.6 * p["null_half_deg"]
             if ok or recentred >= 2:
                 return fit, scan, setting, ok
             theta0 = fit["theta_n"]
             recentred += 1
             self.log(f"  {b}: null at {theta0:.2f} deg, off centre - again")
+
+    def _scan_width(self, imin_est, imax_est):
+        """Half-width (deg) of the null scan: the plan's, widened so the scan
+        rises to at least twice Imin over its half-width (K sin^2(half) >=
+        2 Imin) - a 130 mV Imin (ER ~40) under a +-3 deg scan is 15 mV of
+        curvature on 130 mV and the fit cannot hold it. Capped at 30 deg."""
+        half = float(self.p["null_half_deg"])
+        k = max(float(imax_est) - float(imin_est), 1e-9)
+        need = 2.0 * max(float(imin_est), 0.0) / k
+        if need > math.sin(math.radians(half)) ** 2:
+            half = math.degrees(math.asin(math.sqrt(min(need, 0.25))))
+        return min(max(half, float(self.p["null_half_deg"])), 30.0)
 
     def _point(self, i, e, direction, coarse, null_sets, w, idle, prev, track=False,
                t_fall=None):
@@ -886,23 +899,43 @@ class BiasRun:
         if prev is not None and p.get("predict_null", True) and prev.get("theta_n") is not None:
             theta0 = (prev["theta_n"] + sense * (b - prev["bias"])) % 180
             imax4 = prev.get("imax") or prev.get("imax4")
-            imin4 = max(prev.get("imin", 0.0) or 0.0, 0.0)
             predicted = True
-        else:
-            base = 0.0 if prev is None else prev.get("psi", 0.0)
+            # one coarse reading at the predicted null: roughly what Imin is
+            # there, so the null V/div and the scan's width fit it (7 Oct
+            # 2026, X2 45 deg: Imin ~130 mV where the point before had 3 mV
+            # - the 10 mV/div scan clipped, the ladder climbed 6 steps over
+            # 9 minutes and the fit at 500 mV/div held nothing)
+            t, s = self._acquire(theta0, coarse)
+            imin4 = max(self._window(t, s["PD"], w)[0] - dark_c, 0.0)
+            traces["probe"] = s["PD"].mean(axis=0)
+            if imin4 > 0.5 * imax4:
+                # bright where the null should be: the prediction (its sense)
+                # is wrong - find the azimuth the long way
+                self.log(f"  {what}: {imin4:.2f} V at the predicted null {theta0:.2f} deg - "
+                         f"not a null; 4 angles")
+                predicted = False
+        if not predicted:
+            base = (theta0 - 90.0) if prev is not None and p.get("predict_null", True)                 else (0.0 if prev is None else prev.get("psi", 0.0))
             psi, imax4, imin4 = self._coarse_azimuth(base, coarse, w, dark_c, mons, traces)
             theta0 = (psi + 90) % 180
-        # 2. around the null at the most sensitive setting that holds it
-        est = max(imin4, 0.0) + imax4 * math.sin(math.radians(p["null_half_deg"] + 1)) ** 2
-        fit, scan, setting, ok = self._null_scan(what, theta0, est, coarse, null_sets, w, traces)
+        # 2. around the null at the most sensitive setting that holds it, the
+        # scan wide enough for the Imin found
+        half = self._scan_width(imin4, imax4)
+        if half > p["null_half_deg"] + 1e-9:
+            self.log(f"  {what}: Imin about {imin4*1e3:.0f} mV - null scan widened to "
+                     f"+-{half:.1f} deg")
+        est = max(imin4, 0.0) + imax4 * math.sin(math.radians(half + 1)) ** 2
+        fit, scan, setting, ok = self._null_scan(what, theta0, est, coarse, null_sets, w, traces,
+                                                 half)
         if not ok and predicted:
             # the prediction missed: find the azimuth the long way and scan again
             self.log(f"  {what}: predicted null {theta0:.2f} deg not found - 4 angles")
             psi, imax4, imin4 = self._coarse_azimuth(theta0 - 90, coarse, w, dark_c, mons, traces)
             theta0 = (psi + 90) % 180
-            est = max(imin4, 0.0) + imax4 * math.sin(math.radians(p["null_half_deg"] + 1)) ** 2
+            half = self._scan_width(imin4, imax4)
+            est = max(imin4, 0.0) + imax4 * math.sin(math.radians(half + 1)) ** 2
             fit, scan, setting, ok = self._null_scan(what, theta0, est, coarse, null_sets, w,
-                                                     traces)
+                                                     traces, half)
             predicted = False
         # 3. Imax at the bright angle
         t, s = self._acquire((fit["theta_n"] + 90) % 180, coarse)

@@ -59,13 +59,32 @@ class Log:
         self.fh.flush()
 
 
-def ask_factory(log, yes):
+def ask_factory(log, yes, ask_dir=None):
+    """The questions a run asks. With `ask_dir` (no terminal to type in) the
+    question is written to <ask_dir>/ASK.txt and the answer read from
+    <ask_dir>/ANSWER.txt (first word y / n) when that file appears."""
     def ask(title, text):
         log(f"? {title}: {text}")
         hands = "block" in text.lower() or "unblock" in text.lower() or "cover" in text.lower()
         if yes and not hands:
             log("  (--yes) yes")
             return True
+        if ask_dir:
+            q, a = os.path.join(ask_dir, "ASK.txt"), os.path.join(ask_dir, "ANSWER.txt")
+            if os.path.exists(a):
+                os.remove(a)
+            with open(q, "w", encoding="utf-8") as fh:
+                fh.write(f"{title}: {text}\nWrite y or n into ANSWER.txt in this folder.\n")
+            log(f"  waiting for {a} (y / n)")
+            while not os.path.exists(a):
+                time.sleep(2)
+            time.sleep(0.5)
+            with open(a, encoding="utf-8") as fh:
+                ans = (fh.read().strip().split() or [""])[0].lower()
+            os.remove(a)
+            os.remove(q)
+            log(f"  answered {ans or 'nothing'}")
+            return ans in ("y", "yes")
         try:
             ans = input(f"{title}: {text}\n  [y/N] ").strip().lower()
         except EOFError:
@@ -349,6 +368,8 @@ def main(argv=None):
     ap.add_argument("--simulate", action="store_true")
     ap.add_argument("--only", help="run only the stage(s) named (comma-separated)")
     ap.add_argument("--config", help="a config.json other than the panel's")
+    ap.add_argument("--ask-file", action="store_true",
+                    help="no terminal: questions through <outdir>/campaign/ASK.txt / ANSWER.txt")
     args = ap.parse_args(argv)
     with open(args.plan, encoding="utf-8") as fh:
         plan = json.load(fh)
@@ -360,7 +381,8 @@ def main(argv=None):
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log = Log(os.path.join(cfg["outdir"], "campaign", f"{stamp}.log"))
     log(f"Campaign {os.path.basename(args.plan)}: {len(plan['stages'])} stages; outdir {cfg['outdir']}")
-    ask = ask_factory(log, args.yes)
+    ask = ask_factory(log, args.yes,
+                      os.path.join(cfg["outdir"], "campaign") if args.ask_file else None)
     parts = connect(cfg, log, simulate=args.simulate)
     prov = provenance.collect(cfg)
     only = set(x.strip() for x in args.only.split(",")) if args.only else None
