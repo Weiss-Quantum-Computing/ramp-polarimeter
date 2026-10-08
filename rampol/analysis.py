@@ -1089,7 +1089,7 @@ def direct_er(d, pol, box_us=4.0, correct_drift=False, gains=None):
     return pts
 
 
-def malus_check(pol, factor=3.0, floor_mV=2.0):
+def malus_check(pol, factor=3.0, floor_mV=2.0, segs=None):
     """Where the light does not follow Malus: static stretches whose fit
     residual is `factor` times the rest's (and above `floor_mV`). Measured 7
     Oct 2026 (XEO1 hold series): at rest 0.9 mV, in every hold 4-6 mV, an
@@ -1101,7 +1101,8 @@ def malus_check(pol, factor=3.0, floor_mV=2.0):
     t, rms = pol["t"], pol["rms"]
     if not np.any(np.isfinite(rms)):
         return [], []
-    segs = segments(t, pol["rotation"])
+    if segs is None:
+        segs = segments(t, pol["rotation"])
     rest = [s for s in segs if s["base"] == "rest"]
     if not rest:
         return [], []
@@ -1423,7 +1424,7 @@ def scan_summary(res, direct=None):
                                     "er_fit_median": float(np.median(pol["er"][m])),
                                     "fit_rms_mV": float(np.nanmedian(pol["rms"][m]) * 1e3)
                                     if np.any(np.isfinite(pol["rms"][m])) else None})
-        out["malus_notes"] = malus_check(pol)[1]
+        out["malus_notes"] = malus_check(pol, segs=segs)[1]
     if direct:
         res_pts = [p for p in direct if not p["lower"] and not p.get("offset_limited")]
         if res_pts:
@@ -1433,6 +1434,16 @@ def scan_summary(res, direct=None):
         out["direct_er_n"] = len(direct)
         out["direct_er_lower_bounds"] = sum(p["lower"] for p in direct)
         out["direct_er_offset_limited"] = sum(bool(p.get("offset_limited")) for p in direct)
+        # since 7 Oct 2026 a static point whose angle sat far enough from
+        # crossed is a bound, not a value: say so where the lab log's
+        # direct_er_min used to come from such a point
+        sb = [p for p in direct if p["kind"] == "static" and p.get("bound_from") == "offset"]
+        out["direct_er_static_bounds"] = len(sb)
+        if sb:
+            out["direct_er_note"] = (
+                f"{len(sb)} static ER point(s) are offset bounds (nearest angle "
+                + ", ".join(f"{p['off_deg']:+.1f}" for p in sb[:4])
+                + (" ..." if len(sb) > 4 else "") + " deg from crossed), not values")
     out["provenance"] = man.get("provenance")
     return out
 
@@ -1457,9 +1468,11 @@ def _neg_split(part):
     return "-" + head, rest
 
 
-def segments(t, rotation, static_deg_per_ms=2.0, min_ms=0.3):
+def segments(t, rotation, static_deg_per_ms=2.0, min_ms=0.3, min_swing_deg=2.0):
     """Split the record into static and moving parts by |d rotation/dt|.
-    Returns [{'kind': rest|hold|after|up|down, 't0', 't1', 'rotation'}]."""
+    Returns [{'kind': rest|hold|after|up|down, 't0', 't1', 'rotation'}].
+    A moving stretch counts only when it carries the azimuth at least
+    `min_swing_deg` end to end."""
     # Smooth over ~0.1 ms BEFORE differentiating: the per-sample azimuth noise
     # divided by a sub-microsecond sample spacing is tens of deg/ms, which
     # would chop a hold into pieces. Edges are padded, not zero-filled.
@@ -1474,6 +1487,14 @@ def segments(t, rotation, static_deg_per_ms=2.0, min_ms=0.3):
 
     rate = smooth(np.abs(np.gradient(smooth(rotation), t))) * 1e-3   # deg/ms
     static = rate < static_deg_per_ms
+    # a "motion" that moves the azimuth less than min_swing_deg end to end
+    # (a lock glitch, a dropped shot's step in the mean) is not one: it stays
+    # part of the static stretch around it, so it cannot turn the rest that
+    # follows into a "hold"
+    moving = np.flatnonzero(np.diff(np.r_[0, (~static).astype(int), 0]))
+    for a, b in zip(moving[::2], moving[1::2]):
+        if abs(float(rotation[b - 1]) - float(rotation[a])) < min_swing_deg:
+            static[a:b] = True
     out = []
     edges = np.flatnonzero(np.diff(static.astype(int))) + 1
     bounds = [0, *edges, len(t)]

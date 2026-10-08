@@ -195,6 +195,14 @@ def angle_list(start, stop, step):
     return [round(start + i * step, 6) for i in range(max(n, 0))]
 
 
+def null_offsets(half, points):
+    """`points` offsets (deg) evenly across +-`half`: the angles around a
+    null that a parabola is fitted through (Fixed rotations, the sequence's
+    hold-null angles). One point sits at 0."""
+    n = max(1, int(points))
+    return [(-half + 2 * half * k / (n - 1)) if n > 1 else 0.0 for k in range(n)]
+
+
 def hold_angles(crossed_rest, rotation_deg, half=3.0, points=3, existing=(), tol=1.0,
                 bright=True, sense=-1.0):
     """Analyzer angles that put a ramp's hold near crossed: `points` angles
@@ -211,9 +219,7 @@ def hold_angles(crossed_rest, rotation_deg, half=3.0, points=3, existing=(), tol
     unmeasured. Three angles across the null also give a per-sample parabola
     (Imin(t) and the null's angle through the hold)."""
     c = crossed_rest + sense * rotation_deg
-    n = max(1, int(points))
-    offs = [(-half + 2 * half * k / (n - 1)) if n > 1 else 0.0 for k in range(n)]
-    want = [c + o for o in offs] + ([c + 90.0] if bright else [])
+    want = [c + o for o in null_offsets(half, points)] + ([c + 90.0] if bright else [])
     have = [float(x) for x in existing]
     out = []
     for a in want:
@@ -243,11 +249,16 @@ def ordered(angles, order, seed=0):
     return a
 
 
-def build_steps(angles, ref_every=0, ref_angle=45.0):
+def build_steps(angles, ref_every=0, ref_angle=45.0, extra=()):
     """The step list: a reference capture first, after every `ref_every`
-    angles, and last (when ref_every > 0); the scan angles between."""
+    angles, and last (when ref_every > 0); the scan angles between. `extra`
+    angles (a sequence member's hold-null angles, hold_angles) come after
+    the grid, marked hold_null - so interleaved members keep the analyzer
+    put through the shared grid and differ only at the end."""
     steps = []
     refs = 0
+    extra = [float(a) for a in extra]
+    angles = [float(a) for a in angles] + extra
 
     def ref():
         nonlocal refs
@@ -257,7 +268,10 @@ def build_steps(angles, ref_every=0, ref_angle=45.0):
     if ref_every > 0:
         ref()
     for i, a in enumerate(angles):
-        steps.append({"kind": "scan", "target": float(a)})
+        st = {"kind": "scan", "target": a}
+        if i >= len(angles) - len(extra):
+            st["hold_null"] = True
+        steps.append(st)
         if ref_every > 0 and ((i + 1) % ref_every == 0 or i == len(angles) - 1):
             ref()
     return steps

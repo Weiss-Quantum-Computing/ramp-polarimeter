@@ -279,6 +279,18 @@ def few_angles_checks():
     kinds = [s["kind"] for s in an.segments(t, lvl)]
     check("a static stretch after a part-way ramp down is a hold, the last one 'after'",
           kinds == ["rest", "up", "hold", "down", "hold", "down", "after"], kinds)
+    # a 1 deg glitch in the rest moves fast enough to look like motion but
+    # carries the azimuth nowhere: it must not turn the rest into a hold
+    blip = rot.copy()
+    g = (t > -8e-3) & (t < -7.5e-3)
+    blip[g] += 1.0 * np.sin(np.pi * (t[g] + 8e-3) / 0.5e-3)
+    kinds = [s["kind"] for s in an.segments(t, blip)]
+    check("a 1 deg glitch in the rest is not a motion: rest / up / hold / down / after",
+          kinds == ["rest", "up", "hold", "down", "after"], kinds)
+    st = scan.build_steps([0.0, 22.5], 0, 45.0, extra=[345.0])
+    check("build_steps puts extra angles after the grid, marked hold_null",
+          [(s["target"], bool(s.get("hold_null"))) for s in st]
+          == [(0.0, False), (22.5, False), (345.0, True)], st)
     from rampol import checks
     plan = dict(config.DEFAULTS["scan"], start=0.0, stop=45.0, step=22.5)
     sg_prof = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"]).scope_profiles.PROFILES["msox2014a"]

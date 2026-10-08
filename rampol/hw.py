@@ -103,8 +103,23 @@ class NoTrigger(RuntimeError):
 # 7 Oct 2026: one :WAVeform:DATA? in ~1000 came back empty over USB and
 # pyvisa's block-header parse raised "invalid literal for int() with base
 # 10: b''", which ended a 20-minute null refine at step 3. A failed read
-# now clears the scope's output queue and takes that shot again.
+# now clears the scope's output queue and takes that shot again - for the
+# errors a bad transfer gives (a parse of what came back, a VISA I/O error,
+# an OS-level error), not for anything else, which is a bug and is raised.
 READ_RETRIES = 2
+
+
+def _read_errors():
+    errs = (ValueError, OSError)
+    try:
+        import pyvisa
+        errs += (pyvisa.Error,)
+    except Exception:
+        pass
+    return errs
+
+
+READ_ERRORS = _read_errors()
 
 
 class Cancelled(Exception):
@@ -319,7 +334,7 @@ class ScopeLink:
                         break
                     except (Cancelled, NoTrigger):
                         raise
-                    except Exception as exc:
+                    except READ_ERRORS as exc:
                         if attempt == READ_RETRIES:
                             raise
                         self.log(f"  scope read failed ({type(exc).__name__}: {exc}) - "

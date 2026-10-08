@@ -58,14 +58,13 @@ def ramp_scan(s, dark_mode="none", bg_mode="measure", stray_vdiv=None, drive=Non
     angles added after the grid (a sequence member's hold-null angles,
     scan.hold_angles), marked hold_null."""
     angles = scanmod.ordered(scanmod.angle_list(s["start"], s["stop"], s["step"]), s["order"])
-    extra = [float(a) for a in extra]
     steps = _offsets(dark_mode, bg_mode, stray_vdiv, name, drive)
-    for st in scanmod.build_steps(angles + extra, int(s.get("ref_every", 0)),
-                                  s.get("ref_angle", 45.0)):
+    for st in scanmod.build_steps(angles, int(s.get("ref_every", 0)),
+                                  s.get("ref_angle", 45.0), extra=extra):
         steps.append({"kind": st["kind"], "angle": float(st["target"]), "scan": name,
                       "x1": drive[0] if drive else None, "x2": drive[1] if drive else None,
                       "shots": int(s["shots"])})
-        if st["kind"] == "scan" and st["target"] in extra:
+        if st.get("hold_null"):
             steps[-1]["note"] = "hold null"
     for st in steps:
         st.setdefault("shots", int(s["shots"]))
@@ -102,9 +101,10 @@ def sequence(s, ends, order, names, dark_mode="none", bg_mode="measure", stray_v
 def sampling(span_s, points, peak_rate_deg_per_ms):
     """What one scope sample means on a ramp: (dt_us, deg per sample). The
     scope decimates the record to at most `points` over the screen `span_s`.
-    7 Oct 2026: 20000 points over a 270 ms screen = 14 us, 1.3 deg per sample
-    at the 90 deg/ms peak of a 1 ms cosine edge to 90 deg - the edges and the
-    crossing ERs of that series were sampling-limited."""
+    7 Oct 2026: 20000 points over a 270 ms screen = 14 us, 2.0 deg per sample
+    at the 141 deg/ms peak (pi/2 x 90 deg / 1 ms) of a 1 ms cosine edge to
+    90 deg - the edges and the crossing ERs of that series were
+    sampling-limited."""
     if not span_s or not points or points <= 0:
         return float("nan"), float("nan")
     dt = float(span_s) / float(points)
@@ -127,8 +127,7 @@ def fixed_rotations(p, biases, name="bias", ladder=4):
               "shots": shots, "scan": name,
               "note": f"beam blocked, at ~{ladder + 1} V/div settings"}]
     order = biasmod.order_biases(biases, p.get("order", "up"))
-    half, npts = float(p["null_half_deg"]), int(p["null_points"])
-    offs = [(-half + 2 * half * k / (npts - 1)) if npts > 1 else 0.0 for k in range(npts)]
+    offs = scanmod.null_offsets(float(p["null_half_deg"]), int(p["null_points"]))
     for b in order:
         x1, x2 = b * split, b * (1 - split)
         common = {"x1": x1, "x2": x2, "shots": shots, "scan": name, "rel": True,

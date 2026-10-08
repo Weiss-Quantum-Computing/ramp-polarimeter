@@ -1852,11 +1852,8 @@ class App:
             for k, (r, w, (e1, e2), x) in enumerate(zip(runs, waves, ends, extras)):
                 # the member's own hold-null angles after the shared grid, so
                 # interleaving keeps the analyzer put through the grid
-                steps = scanmod.build_steps(angles + list(x), int(sc["ref_every"]),
-                                            sc["ref_angle"])
-                for st in steps:
-                    if st["kind"] == "scan" and st["target"] in x:
-                        st["hold_null"] = True
+                steps = scanmod.build_steps(angles, int(sc["ref_every"]), sc["ref_angle"],
+                                            extra=x)
                 pl = dict(plan, series={"base": base, "index": k, "of": len(runs),
                                         "ends_deg": {"X1": e1, "X2": e2}, "order": order,
                                         "members": names},
@@ -5499,7 +5496,9 @@ class App:
                 set_ = float(self.cfg["awg"].get("seq_crossed_deg", 0.0) or 0)
             except (TypeError, ValueError):
                 set_ = 0.0
-            if abs((crossed - set_ + 90) % 180 - 90) > 0.5:
+            plan_ = d.manifest.get("plan") or {}
+            awg_scan = bool(plan_.get("series") or d.manifest.get("drive"))
+            if awg_scan and abs((crossed - set_ + 90) % 180 - 90) > 0.5:
                 self.log(f"  crossed at rest = {crossed % 180:.2f} deg (rest azimuth + 90); "
                          f"AWG settings has {set_:g} for the sequence's hold-null angles")
             far = [p for p in res.get("direct", []) if p["kind"] == "static"

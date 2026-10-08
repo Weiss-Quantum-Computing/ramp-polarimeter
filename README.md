@@ -505,7 +505,7 @@ The order, each step its own button:
    `plan.hold_angles`. Start (and the Plan tab) also says what one scope
    sample means on the fastest ramp (`points` over the screen x the peak
    deg/ms) and warns above 0.3 deg per sample: 20000 points over a 270 ms
-   screen were 1.3 deg per sample on 7 Oct, which made the edges and the
+   screen were 2.0 deg per sample on 7 Oct (141 deg/ms at the peak of a 1 ms cosine edge to 90 deg), which made the edges and the
    crossing ERs sampling-limited. One dark / background (and
    stray-light pair) is taken in the first scan and lent to the others. Each
    scan's manifest has the ramp it ran (`drive`, with `ends_deg`) and its
