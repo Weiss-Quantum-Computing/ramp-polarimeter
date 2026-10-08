@@ -146,10 +146,14 @@ DEFAULTS = {
     # repo (bias-point measurements). Both loaded by path, like Scope Grab.
     "eomilc_path": os.path.join(PROJECTS, "EOM-ILC"),
     "awg_path": os.path.join(PROJECTS, "BK4063B-AWG-GUI", "bk4063b.py"),
+    # the SRS DS345 (light gate): its Ds345 class from the DS345 panel, by path
+    "ds345_path": os.path.join(PROJECTS, "DS345-AWG-GUI", "ds345_awg_gui.py"),
     "scope_model": "msox2014a",
     "scope_addr": "",
     # the BK Precision 4063B's VISA resource; blank = the first 4063B found
     "awg_addr": "",
+    # the DS345's GPIB resource; blank = the remembered one, else a bus scan
+    "ds345_addr": "",
     "ell_port": "COM3",
     "ell_address": "0",
     # Mount angle (deg) that is analyzer 0. By the campaign's convention 0 is
@@ -260,6 +264,15 @@ DEFAULTS = {
         "wait_s": 30.0,           # trigger stall limit (> the repetition period)
         "rep_s": 10.0,            # trigger period, for the time estimate only
     },
+    # The DS345 gating the light (rampol/ds345.py). Volts AT THE MODULATOR
+    # (Hi-Z: the DS345 is programmed half). load_min_v / load_max_v: what the
+    # modulator input may see - set them to its rating; a gate outside is
+    # refused. idle: the light's level outside the windows and between
+    # bursts; windows (ms from the trigger) take the other level.
+    "ds345": {"on_v": 1.0, "off_v": 0.0, "load_min_v": 0.0, "load_max_v": 1.0,
+              "idle": "on", "windows": "", "edge_us": 20.0, "record_ms": 0.0,
+              "dry_ch": 2, "dry_shots": 4, "margin_ms": 0.3, "recover_ms": 0.5,
+              "gate_refine": False},
     "refine": {
         "offsets": "-4,-2,-1,-0.5,0,0.5,1,2,4",
         "pd_vdiv": 0.02,          # PD V/div for the null captures

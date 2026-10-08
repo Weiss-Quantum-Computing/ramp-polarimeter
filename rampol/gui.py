@@ -34,6 +34,7 @@ from . import checks, hw, lablog, provenance, scan as scanmod, sim
 from .widgets import CopyLabel
 from . import awg as awgmod
 from . import calib
+from .gui_light import LightTab
 
 ANGLE_CMAP = "hsv"                 # cyclic: 0 and 360 deg share a colour, none near white
 AWG_HELP = (
@@ -99,7 +100,7 @@ PLOT_HINT = ("Click a time on the Map, Angle or Extinction tab to move the "
              "cursor the Malus tab shows.")
 
 
-class App:
+class App(LightTab):
     def __init__(self, root):
         self.root = root
         self.msgs = queue.Queue()
@@ -157,6 +158,7 @@ class App:
         self.build_awg(self._mode_tab("AWG"))
         self.build_bias(self._mode_tab("Fixed rotations"))
         self.build_ilc(self._mode_tab("ILC target"))
+        self.build_light(self._mode_tab("Light"))
         self.bias_result = None
         self.ilc_summary = None
         self.build_right(right)
@@ -283,6 +285,10 @@ class App:
         self.awg_addr = tk.StringVar()
         self.awg_hw = row(2, "AWG", ttk.Entry(g, textvariable=self.awg_addr, width=19),
                           self.do_connect_awg, "not connected")
+        # the SRS DS345 gating the light (Light tab): GPIB, found by a scan
+        self.ds_addr = tk.StringVar()
+        self.ds_hw = row(3, "DS345", ttk.Entry(g, textvariable=self.ds_addr, width=19),
+                         self.do_connect_ds345, "not connected")
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=(1, 3))
         self.simulate = tk.BooleanVar()
@@ -336,15 +342,21 @@ class App:
         f = ttk.LabelFrame(left, text="Scope channels")
         f.pack(fill="x", padx=8, pady=3)
         self.ch_role, self.ch_name = {}, {}
+        # two channels a line: the DS345's hardware row (8 Oct 2026) took the
+        # height back from here - the left column sets the window's height
+        g = ttk.Frame(f)
+        g.pack(fill="x", padx=6, pady=1)
         for ch in (1, 2, 3, 4):
-            r = ttk.Frame(f)
-            r.pack(fill="x", padx=6, pady=1)
-            ttk.Label(r, text=f"CH{ch}").pack(side="left")
+            row, col = (ch - 1) // 2, 3 * ((ch - 1) % 2)
+            ttk.Label(g, text=f"CH{ch}").grid(row=row, column=col, sticky="w",
+                                              padx=(0 if col == 0 else 10, 0), pady=1)
             self.ch_role[ch] = tk.StringVar()
-            ttk.Combobox(r, textvariable=self.ch_role[ch], values=cfgmod.ROLES,
-                         width=7, state="readonly").pack(side="left", padx=4)
+            ttk.Combobox(g, textvariable=self.ch_role[ch], values=cfgmod.ROLES,
+                         width=7, state="readonly").grid(row=row, column=col + 1, padx=4,
+                                                         pady=1)
             self.ch_name[ch] = tk.StringVar()
-            ttk.Entry(r, textvariable=self.ch_name[ch], width=24).pack(side="left")
+            ttk.Entry(g, textvariable=self.ch_name[ch], width=15).grid(row=row,
+                                                                       column=col + 2, pady=1)
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=(0, 4))
         ttk.Label(r, foreground="#666", justify="left", wraplength=230,
@@ -593,6 +605,11 @@ class App:
         r = self._row(left, (1, 3))
         self._btn(r, "List the angles", self.do_plan_refine)
         self._btn(r, "Measure, add to the shown scan", self.do_run_refine, padx=(4, 0))
+        r = self._row(left, (0, 3))
+        self.ds_gate_refine = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r, text="gate the light per window (DS345, Light tab): off where "
+                               "that angle is bright", variable=self.ds_gate_refine).pack(
+            side="left")
 
     # -- right side -----------------------------------------------------------
     def build_right(self, right):
@@ -2433,6 +2450,12 @@ class App:
         self.worker(go, done=lambda out: self._find_done(out, c["outdir"]))
 
     def draw_awg(self, fig):
+        lv = getattr(self, "light_view", None)
+        if lv is not None:
+            # the Light tab's gate, until the AWG tab shows something newer
+            if lv["awg"] == (id(self.awg_wave), id(self.awg_set)):
+                return self.draw_light(fig)
+            self.light_view = None
         if self.awg_set:
             return self._draw_awg_set(fig, self.awg_set)
         w = self.awg_wave
@@ -4430,6 +4453,7 @@ class App:
         self.a_never.set(bool(a.get("never_float", True)))
         self.a_require.set(bool(a.get("require_dry_run", True)))
         self._awg_safety_text()
+        self._light_load(c)
 
     def gather(self):
         """The window's values into self.cfg (validated where it matters)."""
@@ -4507,6 +4531,7 @@ class App:
                 i[k] = txt
             elif _isnum(txt):
                 i[k] = float(txt)
+        self._light_gather(c)
         return c
 
     def save_settings(self):
@@ -5226,8 +5251,11 @@ class App:
                 self.run = run
                 self.log(f"Refine resumed: {len(left)} step(s) left in {d.name}")
                 offs = sorted({s["kind"] for s in left if s["kind"] in an.OFFSET_KINDS})
-                go = lambda: self.worker(lambda: self._run_scan(run, {"null"}),
-                                         done=self.scan_done)
+                gated = any(s.get("gate") for s in left)
+                cc = self.gather()
+                go = lambda: self.worker(
+                    (lambda: self._run_gated(run, {"null"}, cc)) if gated else
+                    (lambda: self._run_scan(run, {"null"})), done=self.scan_done)
                 if offs:
                     # the beam block / PD cover prompt first, as on a first run
                     self.offsets_then(run, offs, go)
@@ -5249,10 +5277,31 @@ class App:
                               "t0": p["t0"], "t1": p["t1"], "label": p["label"],
                               "pd_scale": scale, "shots": int(rs.get("shots", 64)),
                               "blocks": int(rs.get("blocks", 4))})
+        gated = bool(self.ds_gate_refine.get())
+        if gated:
+            # per window, the light only where that analyzer angle is dark:
+            # the bright rest overdrove the scope for ~5.5 ms (8 Oct 2026)
+            cc = self.gather()
+            try:
+                gates = self.ds_refine_gates(plans, self.result["pol"], cc)
+            except ValueError as exc:
+                self.log(f"Refine not started - light gate: {exc}")
+                return
+            for st in steps:
+                if st["kind"] == "null":
+                    st["gate"] = gates[st["window"]]
+            for w_, g_ in sorted(gates.items()):
+                self.log(f"  window {w_ + 1}: light {g_['idle']}, "
+                         + ("off" if g_["idle"] == "on" else "on") + " in "
+                         + (", ".join(f"{a:.2f}-{b:.2f}" for a, b in g_["windows_ms"])
+                            or "nothing") + " ms")
         run.add_steps(steps)
         self.run = run
-        self.log(f"Refine: {len(plans)} windows, {len(steps)} steps at PD {vdiv:g} V/div")
-        go = lambda: self.worker(lambda: self._run_scan(run, {"null"}), done=self.scan_done)
+        self.log(f"Refine: {len(plans)} windows, {len(steps)} steps at PD {vdiv:g} V/div"
+                 + (" (light gated by the DS345)" if gated else ""))
+        go = lambda: self.worker(
+            (lambda: self._run_gated(run, {"null"}, cc)) if gated else
+            (lambda: self._run_scan(run, {"null"})), done=self.scan_done)
         if not n_dark:
             self.offsets_then(run, ["background"], go)
         else:
@@ -6890,6 +6939,7 @@ class App:
         if th is not None and th.is_alive():
             th.join(timeout=20.0)
         self._awg_close()
+        self._ds_close()
         try:
             if self.bench is None:
                 if self.rot is not None:

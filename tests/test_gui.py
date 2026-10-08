@@ -262,6 +262,49 @@ def main():
           and all(s["status"] == "done" for s in rr.manifest["steps"] if s["kind"] == "null"),
           (n_before, len(rr.manifest["steps"])))
 
+    print("\nthe Light tab: the DS345 gating the light")
+    app.do_connect_ds345()
+    settle(root, app)
+    check("DS345 Connect in the hardware pane (simulated)",
+          app.ds_sess is not None and "simulated" in app.ds_hw.cget("text"), app.ds_hw.cget("text"))
+    app.do_ds_from_scan("hold")
+    root.update()
+    lv = app.light_view
+    check("'hold only' from the shown scan: light off, on inside the hold",
+          lv is not None and app.ds_idle.get() == "off" and lv["gate"].windows,
+          app.dv["windows"].get())
+    app.redraw(app.fig_awg)
+    check("the gate is drawn on the AWG plot tab",
+          app.fig_awg.axes and app.fig_awg.axes[0].get_title().startswith("Light gate"),
+          app.fig_awg.axes and app.fig_awg.axes[0].get_title()[:40])
+    app.fig_awg.savefig(os.path.join(out, "Light_gate_preview.png"))
+    app.do_ds_dry()
+    settle(root, app, timeout=200)
+    check("dry run of the gate on the simulated scope passed (Hi-Z, gain 1)",
+          app.ds_dry is not None and app.ds_dry["ok"],
+          app.ds_dry and (app.ds_dry["problems"], app.ds_dry["result"]["gain"]))
+    app.rv["offsets"].set("-1.5,0,1.5")
+    app.ds_gate_refine.set(True)
+    rr.load()
+    n0 = len(rr.manifest["steps"])
+    app.do_run_refine()
+    settle(root, app, timeout=400)
+    rr.load()
+    new = [s for s in rr.manifest["steps"][n0:] if s["kind"] == "null"]
+    kinds = sorted({s.get("gate", {}).get("kind") for s in new})
+    check("a gated refine: every null step carries its window's gate, hold and rest kinds",
+          new and all(s["status"] == "done" and s.get("gate") for s in new)
+          and kinds == ["hold", "rest"], (len(new), kinds))
+    check("the DS345 parked afterwards (light on, ungated)",
+          app.ds_sess.gate is None and app.ds_sess.parked_v == float(app.dv["on_v"].get()))
+    sg_ = app.load_sg()
+    hs = [s for s in new if s["gate"]["kind"] == "hold"][0]
+    a_ = __import__("numpy").asarray(sg_.load_capture(os.path.join(rr.folder, hs["files"][0]))[1])
+    pre = a_[a_[:, 0] < 0, 1]
+    check("hold-null step: before the trigger the light is gated off (no bright rest)",
+          pre.size and float(pre.mean()) < 0.01, pre.size and float(pre.mean()))
+    app.ds_gate_refine.set(False)
+
     print("\nstopping part-way: what was measured is loaded and drawn")
     app.scan_name.set("stopped part way")
     app.bg_mode.set("none")
@@ -308,7 +351,14 @@ def main():
     print("\nbias points: AWG plateaus into the simulated bench")
     tabs = [app.modes.tab(f, "text") for f in app.modes.tabs()]
     check("measurement modes are tabs (find and refine share Analyzer)",
-          tabs == ["Ramp scan", "Analyzer", "AWG", "Fixed rotations", "ILC target"], tabs)
+          tabs == ["Ramp scan", "Analyzer", "AWG", "Fixed rotations", "ILC target",
+                   "Light"], tabs)
+    root.update_idletasks()
+    col = app.modes.master
+    check("the left column fits a 1080 px screen and keeps its width (Light tab + DS345 row "
+          "added 8 Oct 2026: channels two a line)",
+          col.winfo_reqheight() <= 962 and col.winfo_reqwidth() <= 520,
+          f"{col.winfo_reqwidth()} x {col.winfo_reqheight()} px")
     app.bv["biases"].set("0:90:45")
     app.bv["shots"].set("4")
     app.bv["name"].set("gui-bias")

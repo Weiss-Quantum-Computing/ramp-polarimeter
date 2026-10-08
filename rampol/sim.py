@@ -66,6 +66,13 @@ class Bench:
         # there with the beam blocked; only covering the PD removes it
         self.ambient = ambient
         self.covered = False
+        # the DS345 light gate, when a FakeDS345 is cabled in: 'modulator'
+        # (its output scales the light linearly between mod_off_v and
+        # mod_on_v at the load) or 'scope' (a dry run: on scope ds_scope_ch)
+        self.ds345 = None
+        self.ds_wiring = "modulator"
+        self.ds_scope_ch = None
+        self.mod_on_v, self.mod_off_v = 1.0, 0.0
 
     # -- the ramp ---------------------------------------------------------
     def monitors(self, t):
@@ -145,6 +152,9 @@ class Bench:
         d = np.deg2rad(self.mount - self.mount_of_rest_pol - light)
         inv_er = 1 / self.er(rot) + 1 / self.er_pol
         imax = self.imax * self.intensity_gain()
+        if self.ds345 is not None and self.ds_wiring == "modulator":
+            span = self.mod_on_v - self.mod_off_v
+            imax = imax * np.clip((self.ds345.out_v(t) - self.mod_off_v) / span, 0.0, 1.0)
         if shots == 1 and self.lock_miss and self.rng.random() < self.lock_miss:
             imax *= 0.975            # the lock did not catch on this shot
         pd = self.dark + imax * (np.cos(d) ** 2 + inv_er * np.sin(d) ** 2)
@@ -389,7 +399,10 @@ def make_scope_class(sg):
             to_scope = {sch: ach for ach, sch in b.awg_scope.items()} if b.wiring == "scope" else {}
             chans = {}
             for ch in self.prof.channels:
-                if ch in to_scope:
+                if b.ds345 is not None and b.ds_wiring == "scope" and ch == b.ds_scope_ch:
+                    n_ = math.sqrt(max(self._pending, 1))
+                    chans[ch] = b.ds345.out_v(t) + b.rng.normal(0, 2e-3 / n_, t.size)
+                elif ch in to_scope:
                     n_ = math.sqrt(max(self._pending, 1))
                     chans[ch] = b.awg_out(to_scope[ch], t) + b.rng.normal(0, 2e-3 / n_, t.size)
                 else:
@@ -456,3 +469,90 @@ def make(sg, prof_key="msox2014a", roles=None, bench=None, zero_offset_deg=0.0):
     scope = SimScope(prof, bench, roles or {1: "PD", 3: "MonX1", 4: "MonX2"})
     scope.connect()
     return scope, FakeELL14(bench, zero_offset_deg), bench
+
+
+class FakeDS345:
+    """The DS345 calls rampol.ds345 makes (checked_write, query,
+    upload_arb), playing into a Bench: out_v(t) is the voltage at a Hi-Z
+    load (twice the programmed 50 Ohm figure). An ARB in burst mode on the
+    external trigger plays its record once from `delay` after the trigger
+    and holds its first point otherwise (between bursts: the real one is not
+    documented; the dry run reads it); an ARB with burst off free-runs."""
+
+    def __init__(self, bench, delay=2e-6):
+        self.bench, self.delay = bench, delay
+        self.idn = "StanfordResearchSystems,DS345,SIM,1.0"
+        self.addr = "GPIB0::19::INSTR"
+        self.st = {"FUNC": 0, "FSMP": 40e6, "AMPL": 1.0, "OFFS": 0.0, "MENA": 0,
+                   "MTYP": 0, "BCNT": 1, "TSRC": 0}
+        self.codes = np.zeros(8)
+        self.writes = []
+        self.load_ohms = None          # None: Hi-Z (2x the programmed); 50: as specified
+        bench.ds345 = self
+
+    def close(self):
+        pass
+
+    def query(self, cmd):
+        cmd = cmd.strip()
+        if cmd == "*IDN?":
+            return self.idn
+        if cmd == "*ESR?":
+            return "0"
+        key = cmd.rstrip("?")
+        return str(self.st.get(key, ""))
+
+    def checked_write(self, command, log=lambda s: None):
+        self.writes.append(command)
+        head, _, arg = command.strip().partition(" ")
+        head = head.upper()
+        try:
+            if head == "AMPL":
+                a = arg.upper().rstrip("VP").strip() if arg.upper().endswith("VP") else arg
+                val = float(a)
+                if val / 2 + abs(self.st["OFFS"]) > 5.0 + 1e-9:
+                    return [f"{command} -> execution error"]
+                self.st["AMPL"] = val
+            elif head == "OFFS":
+                val = float(arg)
+                if self.st["AMPL"] / 2 + abs(val) > 5.0 + 1e-9:
+                    return [f"{command} -> execution error"]
+                self.st["OFFS"] = val
+            elif head == "FSMP":
+                n = max(1, round(40e6 / float(arg)))
+                self.st["FSMP"] = 40e6 / n
+            elif head in self.st:
+                self.st[head] = int(float(arg))
+            elif head == "*TRG":
+                pass
+            else:
+                return [f"{command} -> command error"]
+        except ValueError:
+            return [f"{command} -> command error"]
+        return []
+
+    def upload_arb(self, samples, normalize=True):
+        x = np.clip(np.asarray(samples, float), -1, 1)
+        if not 8 <= x.size <= 16300:
+            raise ValueError(f"{x.size} samples: the DS345 takes 8..16300")
+        self.codes = np.round(x * 2047) / 2047
+        return x.size
+
+    def out_v(self, t):
+        t = np.asarray(t, float)
+        s = self.st
+        if s["FUNC"] != 5:
+            prog = np.full_like(t, s["OFFS"])         # AMPL 0VP: DC (other shapes not modelled)
+        else:
+            c, fs = self.codes, s["FSMP"]
+            if s["MENA"] == 1 and s["MTYP"] == 5 and s["TSRC"] in (2, 3):
+                i = np.floor((t - self.delay) * fs).astype(int)
+                inside = (i >= 0) & (i < c.size)
+                code = np.where(inside, c[np.clip(i, 0, c.size - 1)], c[0])
+            else:
+                phase = (self.bench.clock * 7.3) % 1.0
+                i = np.floor(((t * fs) + phase * c.size) % c.size).astype(int)
+                code = c[i]
+            prog = s["OFFS"] + code * s["AMPL"] / 2
+        r = self.load_ohms
+        return prog * (2.0 if r is None else 2.0 * r / (r + 50.0))

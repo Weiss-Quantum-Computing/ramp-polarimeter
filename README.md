@@ -567,6 +567,55 @@ what the AWG holds unknown, a record-length change plays the new waveform's
 flat idle first - a flat record plays the same at any length. Outputs are switched one at a time and read back; if either fails,
 nothing is left on.
 
+## Light gate (Light tab, SRS DS345)
+
+The DS345 drives the light modulator so the light is on only where a
+measurement wants it. Why: at a sensitive V/div the bright parts of the
+record overdrive the scope, and it takes ~5.5 ms to come back (8 Oct 2026,
+20 mV/div: pinned at the screen top until 18.4 ms after a ramp that ended at
+13.0 ms; at the hold's null the rest is bright, so the first ~5.7 ms of the
+hold were lost). With the light off wherever that analyzer angle would be
+bright, nothing overdrives.
+
+**Cabling.** The bench trigger into the DS345's rear TRIGGER IN (TTL, rising
+edge); the FUNCTION output into the modulator. For the dry run, a tee at the
+output to a free scope channel (Settings..., default CH2).
+
+**Levels are volts at the modulator.** The DS345 is specified into 50 Ohm and
+the modulator is Hi-Z, so the voltage there is twice what is programmed:
+the program sends half (OFFS, AMPL) and shows both. Into Hi-Z it reaches
++-10 V. Settings... has *the modulator takes lo to hi V*: set it to the
+modulator input's rating - a gate outside it is refused (defaults 0..1 V).
+The dry run reads the output on a Hi-Z scope channel: a 50 Ohm load or
+terminator shows as gain 0.5 and is named.
+
+**The instrument's limits** (SRS manual, read 8 Oct 2026): arbitrary
+waveforms of 8 to 16,300 points - a real limit, unlike the 4063B's old
+16384 - clocked at 40 MHz / N; the gate picks N so its record fits (300 ms
+-> 18.4 us per point). An ARB in burst mode plays once per trigger from its
+first point and ignores triggers during the burst, so a gate still playing at
+the next trigger is refused. No output switch: *Park* is a DC level (the
+light on, ungated) - also what the window leaves on closing and after a
+gated refine.
+
+**The tab.** 1 Gate: the light's level outside the windows (on / off), the
+windows (ms from the trigger) at the other level, edges; *from the shown
+scan*: *hold only* (light only inside each hold) or *all but the ramp* (off
+from the first motion to the last + a recovery). 2 Preview (drawn on the AWG
+plot tab over the ramp's rotation), *Dry run on scope*, *Load (play on
+trigger)*, *Park*.
+
+**Gating the null refine** (Analyzer tab, *gate the light per window*): each
+window gets its gate - a window in a hold the light only in that hold, any
+other window the light off during the ramp - recorded in each null step
+(`gate`), loaded before that window's steps, parked at the end. A resumed
+refine loads the gates it recorded.
+
+Not yet run on hardware: the DS345 code here (its Ds345 class is the DS345
+panel's, which has connected on this bus), the levels between bursts (the
+manual does not say; the dry run reads them), the trigger latency (the
+simulator assumes 2 us).
+
 ## EOM calibration (EOM calibration... button)
 
 One chain per crystal, every number visible and editable (`rampol/calib.py`):
@@ -779,6 +828,7 @@ after another they took ~5). `run_tests.py gui awg` runs only those,
 | `test_ell14.py` | the driver against a fake serial port (the real mount's IN reply), the approach-from-below wrapper |
 | `test_analysis.py` | the harmonic fit exact on noise-free data, its uncertainties checked by pulls (unit spread), lower bounds; a 72-angle simulated scan written and read back: rotation, rest azimuth, drift correction, 142 dip ERs against the model, direct ERs against the model and their Imax against the fit, the residual map at unit noise, the Stokes identities, segments, monitor prediction; provenance (this repository's commit, an ILC state's fingerprint) and the lab log's update-in-place |
 | `test_checks.py` | the pre-run check against the simulator: a hand-changed scope put back by a preset and confirmed, a silently refused setting reported, and each failure it should catch (AUTO sweep, channel off, wait <= repetition, AC coupling, clipping, off screen, small signal, ramp cut off, no light, no pre-trigger) |
+| `test_ds345.py` | the light gate: the clock divider that fits 16,300 points, idle at both ends, Hi-Z halving, the +-10 V and modulator-range limits, a gate still playing at the next trigger refused; the session's order (burst armed before ARB: never free-running), park, the gate playing into the simulated bench's light, the dry run on a Hi-Z scope channel and a 50 Ohm load caught as gain 0.5 |
 | `test_awg.py` | ramps (the ILC's record, ends at idle, the hold at the rotation), every check (length, trigger period, duty, idle and AWG caps), ILC drive files (header, a target refused, keepers against their targets pass and as u x gain fail), the session against the simulated AWG (names reused, a foreign ON refused, OFF for a change, park, a live FRQ change refused, CH2 refusing ON leaves nothing on); the rules (ON and live loads refused without a dry run, OFF needs force, the end is park); the dry run into the simulated scope (passes and sees the zero-code error, puts the scope back; catches swapped cables and a wrong FRQ); the calibration (conversions, applied everywhere, a bias-run fit) |
 | `test_bias.py` | the plan (AWG volts, plateaus, the Trek limit check), the null fit and ER, and a whole bias run on the simulated bench (AWG plateaus into the bench model): ER at 0-90 deg against the model, a 2 deg static rotator error recovered, outputs off and scope restored at the end |
 | `test_gui.py` | the window against the simulator: connect, dark, scan, every tab drawn, cursor, null refine of rest/hold/after against the model ER, a fixed-rotation run from its tab, rename / edit (files, manifest, lab log, citing scans, a held file refused), the direct points, residual map, Poincaré, Compare, Export brief, provenance and lab-log rows; config sandboxed, window off screen |
