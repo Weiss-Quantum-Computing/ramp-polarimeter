@@ -15,9 +15,12 @@ from the angles near crossed (with those angles' traces), and the summary.
 import glob, json, os, sys, traceback
 import tkinter as tk
 from tkinter import ttk, messagebox
+import warnings
 import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
+warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+warnings.filterwarnings("ignore", message="Mean of empty slice")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
@@ -250,6 +253,11 @@ class Viewer(tk.Tk):
                 self.nb.select(self.tabs["Points"])
             elif kind != "bias" and tab not in scan_tabs:
                 self.nb.select(self.tabs["Traces"])
+        except ValueError as exc:
+            # an empty or still-running scan, or one the analysis cannot fit
+            self.status.set(f"{name}: {exc}")
+            self.cur = None
+            return
         except Exception as exc:
             self.status.set(f"{name}: {exc}")
             traceback.print_exc()
@@ -355,12 +363,18 @@ class Viewer(tk.Tk):
             return p.get(key, np.nan)
         v = np.array([val(p) for p in pts], float)
         xs, ys = sorted(set(x1)), sorted(set(x2))
+        logscale = key == "er" and np.any(np.isfinite(v) & (v > 0))
+        if not np.any(np.isfinite(v)):
+            ax.text(0.5, 0.5, f"no {key} values in this run (track-only points?)", ha="center", transform=ax.transAxes)
+            ax.set_title(f"{man['name']}: {key}")
+            self.map_plot.draw()
+            return
         if len(xs) > 1 and len(ys) > 1 and len(pts) == len(xs) * len(ys):
             g = np.full((len(ys), len(xs)), np.nan)
             for a, b, c in zip(x1, x2, v):
                 g[ys.index(b), xs.index(a)] = c
             im = ax.imshow(g, origin="lower", aspect="auto", cmap="viridis",
-                           norm=matplotlib.colors.LogNorm() if key == "er" else None,
+                           norm=matplotlib.colors.LogNorm() if logscale else None,
                            extent=(min(xs) - 7.5, max(xs) + 7.5, min(ys) - 7.5, max(ys) + 7.5))
             fig.colorbar(im, ax=ax)
             for a, b, c in zip(x1, x2, v):
@@ -370,7 +384,7 @@ class Viewer(tk.Tk):
             lab = [f"{a:g}/{b:g}" for a, b in zip(x1, x2)]
             ax.plot(range(len(v)), v, "o-")
             ax.set_xticks(range(len(v))); ax.set_xticklabels(lab, rotation=90, fontsize=7)
-            if key == "er":
+            if logscale:
                 ax.set_yscale("log")
         p = self._point()
         ax.plot([p["x1"]], [p["x2"]] if len(xs) > 1 and len(ys) > 1 and len(pts) == len(xs) * len(ys) else [val(p)], "r+", ms=16, mew=2)
