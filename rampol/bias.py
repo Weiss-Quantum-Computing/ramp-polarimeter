@@ -81,6 +81,12 @@ PLAN = {
     # trim parks the chain at 0 V (file zero parks it at -9 / -41 V)
     "idle": {"EO1": 0.0, "EO2": 0.0},
     "end": "off",               # off | park (idle waveform, outputs left ON)
+    # a multisine on one channel through the hold (the transfer-function
+    # run of 8 Oct 2026): {"chan": "EO1", "f_hz": [...], "deg": amplitude per
+    # tone (scalar or list), "start_ms": into the hold, "stop_ms": before the
+    # hold ends, "taper_ms": raised-cosine on/off}; None = a plain plateau
+    "modulation": None,
+    "save_decimate": 10,        # the tracked traces are saved every n-th sample
 }
 
 
@@ -160,6 +166,44 @@ def correction_on(t, p, name):
                   np.asarray(c["u_V"], float), left=0.0, right=0.0)
     u[[0, -1]] = 0.0
     return u
+
+
+def multisine(p):
+    """(f_hz, amp_deg, phase_rad) of the plan's modulation: Schroeder phases
+    (phi_k = -pi k^2 / N, low crest factor) and one amplitude per tone."""
+    m = p.get("modulation") or {}
+    f = np.asarray(m.get("f_hz") or [], float)
+    a = m.get("deg", 0.2)
+    a = np.full(len(f), float(a)) if np.isscalar(a) else np.asarray(a, float)
+    k = np.arange(len(f))
+    phase = -np.pi * k * k / max(len(f), 1)
+    return f, a, phase
+
+
+def modulation_on(t, p, name):
+    """The plan's multisine for channel `name` in AWG volts on `t`: the tones
+    summed from start_ms into the hold to stop_ms before its end, each end
+    raised-cosine tapered over taper_ms so the drive never steps. Zero on
+    the other channel and when there is no modulation."""
+    m = p.get("modulation") or {}
+    if not m or m.get("chan", "EO1") != name:
+        return np.zeros(len(t))
+    f, a, ph = multisine(p)
+    if not len(f):
+        return np.zeros(len(t))
+    t = np.asarray(t, float)
+    t_hold = (p["lead_ms"] + p["rise_ms"]) * 1e-3
+    t0 = t_hold + float(m.get("start_ms", 2.0)) * 1e-3
+    t1 = t_hold + (p["hold_ms"] - float(m.get("stop_ms", 0.5))) * 1e-3
+    tap = float(m.get("taper_ms", 0.5)) * 1e-3
+    per_deg = awg_volts(1.0, 1.0 if name == "EO1" else 0.0)[name]
+    u = np.zeros(len(t))
+    for fk, ak, pk in zip(f, a, ph):
+        u += ak * per_deg * np.cos(2 * np.pi * fk * (t - t0) + pk)
+    env = np.clip((t - t0) / tap, 0, 1) * np.clip((t1 - t) / tap, 0, 1)
+    env = 0.5 - 0.5 * np.cos(np.pi * env)
+    env[(t < t0) | (t > t1)] = 0.0
+    return u * env
 
 
 def plateau(amp, p, idle=0.0):
@@ -253,11 +297,13 @@ def plateau_wave(item, p):
     u, t = {}, None
     for name in CHAN:
         t, u[name] = plateau(volts[name], p, float(idle.get(name, 0.0)))
-        u[name] = u[name] + correction_on(t, p, name)
+        u[name] = u[name] + correction_on(t, p, name) + modulation_on(t, p, name)
     label = (f"bias X1 {e1:g} / X2 {e2:g} deg" if isinstance(item, (tuple, list, dict))
              else f"bias {float(item):g} deg")
     if p.get("correction"):
         label += " + correction"
+    if p.get("modulation"):
+        label += " + multisine"
     w = awgmod.Wave(t, u, p["dt_us"] * 1e-6, label,
                     hold=((p["lead_ms"] + p["rise_ms"]) * 1e-3,
                           (p["lead_ms"] + p["rise_ms"] + p["hold_ms"]) * 1e-3),
@@ -944,7 +990,7 @@ class BiasRun:
             for sign, name in ((+1, "plus"), (-1, "minus")):
                 t, s = self._acquire((centre + sign * 45.0) % 180, coarse)
                 slope[name] = s["PD"].mean(axis=0) - dark_c
-                for r in ("MonX1", "MonX2"):
+                for r in ("MonX1", "MonX2", "CmdX1", "CmdX2"):
                     if r in s:
                         mons.setdefault(r, []).append(s[r])
                 traces[f"slope_{which}_{name}"] = slope[name]
@@ -979,8 +1025,11 @@ class BiasRun:
         pt["track"] = track_summary(t, tr["lm"], w, t_fall, tr.get("lm_rest"),
                                     tr.get("valid_rest"), t_end=t_end)
         extra = {f"track_{k}": v for k, v in tr.items() if isinstance(v, np.ndarray)}
+        dec = max(int(p.get("save_decimate") or 10), 1)
+        mon_full = {f"mon_{r}": v for r, v in mon_t.items()} if dec == 1 else {}
         np.savez_compressed(os.path.join(self.folder, f"point_{i:02d}.npz"),
-                            t=t[::10], **{k: v[::10] for k, v in traces.items()}, **extra)
+                            t=t[::dec], **{k: v[::dec] for k, v in traces.items()},
+                            **{k: v[::dec] for k, v in extra.items()}, **mon_full)
         tk = pt["track"]
         self.log(f"  {what} deg, hold {p['hold_ms']:g} ms: tracked at null {theta_n:.2f} "
                  f"({pt['null_from']}); creep {tk.get('hold_slope_mdeg_ms', float('nan')):+.1f} "

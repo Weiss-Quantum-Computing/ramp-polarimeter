@@ -265,14 +265,26 @@ def stage_ramps(st, cfg, parts, log, ask, prov):
     idle = awg_idle(cfg)
     ends = [(float(x), float(y)) for x, y in
             awgmod.parse_ends(st["x1"], st.get("x2", "0"), st.get("how", "pairs"))]
-    waves = [awgmod.ramp_hold(0.0, a, idle=idle, ends={"EO1": e1, "EO2": e2}) for e1, e2 in ends]
+    # rise_ms_list: the same end points with every edge length in the list
+    # (fall = rise), named ..._r<ms> - the slew sweep of 8 Oct 2026
+    rises = [float(x) for x in (st.get("rise_ms_list") or [])]
+    waves, pairs, names = [], [], []
+    for r in rises or [None]:
+        ar = dict(a) if r is None else dict(a, rise_ms=r, fall_ms=r)
+        for e1, e2 in ends:
+            waves.append(awgmod.ramp_hold(0.0, ar, idle=idle, ends={"EO1": e1, "EO2": e2}))
+            pairs.append((e1, e2))
+            names.append(scanmod.safe_name(f"{base}_X1_{e1:g}_X2_{e2:g}"
+                                           + ("" if r is None else f"_r{r:g}".replace(".", "p"))))
     for w in waves:
         found = awgmod.check(w, eom, trig_hz=float(a.get("trig_hz") or 0) or None)
         bad = [m for lv, m in found if lv == "FAIL"]
-        if bad:
+        if bad and st.get("allow_fail"):
+            log(f"  ! {w.label}: " + "; ".join(bad) + " - PLAYED ANYWAY (allow_fail: the Trek "
+                "limits itself; the slew sweep asks for exactly this)")
+        elif bad:
             raise RuntimeError(f"{w.label}: " + "; ".join(bad))
-    names = [scanmod.safe_name(f"{base}_X1_{e1:g}_X2_{e2:g}") for e1, e2 in ends]
-    return _ramp_sequence(st, cfg, parts, log, prov, base, waves, ends, names, sc, a)
+    return _ramp_sequence(st, cfg, parts, log, prov, base, waves, pairs, names, sc, a)
 
 
 def _read_target(path):
@@ -305,6 +317,7 @@ def stage_targets(st, cfg, parts, log, ask, prov):
     a = dict(cfg["awg"], **(st.get("awg") or {}))
     sc = dict(cfg["scan"], **(st.get("scan") or {}))
     stems = st.get("stems") or "all"
+    scale = float(st.get("scale", 1.0))
     if stems == "all":
         stems = sorted({f[len("target_"):-len("X1.csv")] for f in os.listdir(d)
                         if f.startswith("target_") and f.endswith("X1.csv")})
@@ -314,21 +327,23 @@ def stage_targets(st, cfg, parts, log, ask, prov):
         for n, suf in (("EO1", "X1"), ("EO2", "X2")):
             files[n] = os.path.join(d, f"target_{stem}{suf}.csv")
             tt, v = _read_target(files[n])
-            t[n], u[n] = tt, v / 1000.0 / biasmod.CHAN[n]["gain"]
+            t[n], u[n] = tt, scale * v / 1000.0 / biasmod.CHAN[n]["gain"]
         if len(t["EO1"]) != len(t["EO2"]) or np.abs(t["EO1"] - t["EO2"]).max() > 1e-6:
             raise RuntimeError(f"{stem}: X1 and X2 targets are not on one time grid")
         dt = float(t["EO1"][1] - t["EO1"][0]) * 1e-6
         e = {n: 90.0 * float(u[n].max()) * biasmod.CHAN[n]["gain"] / biasmod.CHAN[n]["v90"]
              for n in u}
-        w = awgmod.Wave(t["EO1"] * 1e-6, u, dt, f"target {stem}", rotation=e["EO1"] + e["EO2"],
-                        source="files", files=files)
+        w = awgmod.Wave(t["EO1"] * 1e-6, u, dt,
+                        f"target {stem}" + (f" x {scale:g}" if scale != 1.0 else ""),
+                        rotation=e["EO1"] + e["EO2"], source="files", files=files)
         w.ends = e
         found = awgmod.check(w, eom, trig_hz=float(a.get("trig_hz") or 0) or None)
         bad = [m for lv, m in found if lv == "FAIL"]
         if bad:
             raise RuntimeError(f"{w.label}: " + "; ".join(bad))
         log(f"  {stem}: {w.n} points at {dt*1e6:g} us = {w.period*1e3:.3f} ms, peaks X1 "
-            f"{e['EO1']:.1f} / X2 {e['EO2']:.1f} deg, AWG {u['EO1'].max():.2f} / {u['EO2'].max():.2f} V")
+            f"{e['EO1']:.1f} / X2 {e['EO2']:.1f} deg, AWG {u['EO1'].max():.2f} / {u['EO2'].max():.2f} V"
+            + (f" (target x {scale:g})" if scale != 1.0 else ""))
         waves.append(w)
         ends.append((e["EO1"], e["EO2"]))
         names.append(scanmod.safe_name(f"{base}_{stem}"))
@@ -624,8 +639,53 @@ def stage_transients(st, cfg, parts, log, ask, prov):
     log(f"Stage {st['name']} done: holds " + ", ".join(f"{h:g}" for h in hold_list) + " ms")
 
 
+def stage_frf(st, cfg, parts, log, ask, prov):
+    """The polarization's transfer function against the monitors and the
+    command: a multisine (modulation: chan, f_hz, deg, start_ms, stop_ms)
+    on one channel through the hold at each held point (x1 / x2 as a grid
+    run), tracked only at the hold's slope pair, the traces saved at full
+    rate (save_decimate 1). The hold's null comes from `nulls_from`.
+    Offline: frf_readout.py takes light / monitors and monitors / command
+    per tone."""
+    nulls = []
+    if st.get("nulls_from"):
+        with open(os.path.join(cfg["outdir"], st["nulls_from"], "bias.json"), encoding="utf-8") as fh:
+            nulls = [[q["x1"], q["x2"], q["theta_n"]] for q in json.load(fh).get("points", [])
+                     if q.get("theta_n") is not None]
+        log(f"  nulls from {st['nulls_from']}: {len(nulls)} points")
+    plan = dict(biasmod.PLAN, **cfg["bias"])
+    plan.pop("name", None)
+    skip = ("stage", "name", "nulls_from")
+    plan.update({k: v for k, v in st.items() if k not in skip})
+    plan.update(settle_ms=0.0, track=True, track_only=True, idle=awg_idle(cfg), end="park",
+                nulls=nulls, save_decimate=1,
+                sense=float(cfg["awg"].get("seq_sense", -1.0) or -1.0))
+    plan.setdefault("track_ms", 5.0)
+    f, amp, _ph = biasmod.multisine(plan)
+    m = plan.get("modulation") or {}
+    chan = m.get("chan", "EO1")
+    t, u = biasmod.plateau(0.0, plan)
+    um = biasmod.modulation_on(t, plan, chan)
+    hv_per_v = 1000.0 * biasmod.CHAN[chan]["gain"]
+    slew = float(np.max(np.abs(np.diff(um)))) / (plan["dt_us"]) * hv_per_v      # V/us at the Trek
+    log(f"FRF {st['name']}: {len(f)} tones {f.min():.0f}-{f.max():.0f} Hz on {chan}, "
+        f"{amp.min():.2f}-{amp.max():.2f} deg each, peak {np.max(np.abs(um)):.3f} V at the AWG "
+        f"({np.max(np.abs(um)) * hv_per_v:.0f} V HV), peak slew {slew:.2f} V/us "
+        f"({slew * 0.2:.2f} mA into 200 pF)")
+    name = scanmod.safe_name(st["name"])
+    folder = os.path.join(cfg["outdir"], name)
+    if os.path.isfile(os.path.join(folder, "bias.json")):
+        with open(os.path.join(folder, "bias.json"), encoding="utf-8") as fh:
+            if json.load(fh).get("finished"):
+                log(f"Stage {name}: already finished - skipped")
+                return
+    _bias_run(cfg, parts, log, ask, prov, name, plan,
+              resume=os.path.isfile(os.path.join(folder, "bias.json")))
+    log(f"Stage {name} done")
+
+
 STAGES = {"grid": stage_grid, "ramps": stage_ramps, "targets": stage_targets,
-          "compensate": stage_compensate, "transients": stage_transients}
+          "compensate": stage_compensate, "transients": stage_transients, "frf": stage_frf}
 
 
 def main(argv=None):
