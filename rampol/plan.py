@@ -114,29 +114,42 @@ def sampling(span_s, points, peak_rate_deg_per_ms):
 SAMPLING_WARN_DEG = 0.3
 
 
-def fixed_rotations(p, biases, name="bias", ladder=4):
+def fixed_rotations(p, items=None, name="bias", ladder=4):
     """A Fixed rotations run's steps: the dark at every V/div of the null
     ladder (its length is only known once Imax is read; `ladder` is a
-    guess), then per rotation 4 angles for the azimuth, `null_points`
-    across +-`null_half_deg` around the crossed angle found, and the bright
-    angle (crossed + 90). Angles are counted from that crossed angle (rel)."""
+    guess), then per point 4 angles for the azimuth (only the first point
+    when the plan predicts the null from the point before), `null_points`
+    across +-`null_half_deg` around the crossed angle found, the bright
+    angle (crossed + 90) and, with `track`, the two slope angles (crossed
+    +- 45). Angles are counted from that crossed angle (rel). `items`:
+    rotations or (x1, x2) pairs; default the plan's own (bias.ends_list)."""
     from . import bias as biasmod
-    split = float(p["split"])
-    shots = int(p["shots"])
+    pp = dict(biasmod.PLAN, **p)
+    shots = int(pp["shots"])
     steps = [{"kind": "dark", "angle": None, "rel": True, "x1": None, "x2": None,
               "shots": shots, "scan": name,
               "note": f"beam blocked, at ~{ladder + 1} V/div settings"}]
-    order = biasmod.order_biases(biases, p.get("order", "up"))
-    offs = scanmod.null_offsets(float(p["null_half_deg"]), int(p["null_points"]))
-    for b in order:
-        x1, x2 = b * split, b * (1 - split)
+    if items is None:
+        ends = biasmod.ends_list(pp)
+    else:
+        ends = biasmod.order_biases([biasmod.as_ends(b, pp["split"]) for b in items],
+                                    pp.get("order", "up"))
+    offs = scanmod.null_offsets(float(pp["null_half_deg"]), int(pp["null_points"]))
+    predict = bool(pp.get("predict_null", True))
+    track = bool(pp.get("track")) and float(pp.get("track_ms") or 0) > 0
+    for i, (x1, x2) in enumerate(ends):
         common = {"x1": x1, "x2": x2, "shots": shots, "scan": name, "rel": True,
-                  "note": f"rotation {b:g} deg"}
-        for a in (-90.0, -45.0, 0.0, 45.0):
-            steps.append(dict(common, kind="azimuth", angle=a))
+                  "note": f"X1 {x1:g} / X2 {x2:g} deg"}
+        if i == 0 or not predict:
+            for a in (-90.0, -45.0, 0.0, 45.0):
+                steps.append(dict(common, kind="azimuth", angle=a))
         for o in offs:
             steps.append(dict(common, kind="null", angle=o))
         steps.append(dict(common, kind="bright", angle=90.0))
+        if track:
+            for a in (45.0, -45.0):
+                steps.append(dict(common, kind="track", angle=a,
+                                  note=common["note"] + ", azimuth vs time"))
     return steps
 
 

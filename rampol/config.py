@@ -169,7 +169,13 @@ DEFAULTS = {
     # bias points (rampol.bias): the AWG holds the EOMs at fixed rotations
     "bias": {"biases": "0:180:15", "order": "up", "split": 0.5, "shots": 8,
              "null_half_deg": 3.0, "null_points": 9, "hold_ms": 8.0,
-             "settle_ms": 4.0, "name": "bias"},
+             "settle_ms": 4.0, "name": "bias",
+             # X1 / X2 held separately (pairs or a grid) - these win over
+             # biases x split when x1 is given; the null predicted from the
+             # point before; the azimuth tracked at null +- 45 deg for
+             # track_ms after the fall (rampol.bias.PLAN)
+             "x1": "", "x2": "", "how": "pairs", "predict_null": True,
+             "track": True, "track_ms": 150.0},
     # AWG mode (rampol.awg): the 4063B drives the Treks, CH1 -> X1, CH2 -> X2.
     # idle1/2 blank = from the ILC state files' first sample (the learned trim)
     "awg": {"source": "ramp", "rotation": 45.0, "split": 0.5, "edge": "cosine",

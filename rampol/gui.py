@@ -996,19 +996,26 @@ class App:
             if after:
                 ttk.Label(rr, text=after).pack(side="left", padx=(0, 5))
 
-        b = self._box(f, "1  Rotations")
+        b = self._box(f, "1  Held voltages")
         r = self._row(b, (2, 1))
-        ent(r, "biases", 12, None, "deg,")
-        ent(r, "split", 4, "X1 share")
+        ent(r, "x1", 11, "X1", "deg,")
+        ent(r, "x2", 11, "X2", "deg,")
+        self.bias_how = tk.StringVar(value="pairs")
+        ttk.Combobox(r, textvariable=self.bias_how, values=("pairs", "grid"), width=6,
+                     state="readonly").pack(side="left", padx=(0, 4))
         self.bias_order = tk.StringVar()
         ttk.Combobox(r, textvariable=self.bias_order, values=("up", "updown"),
                      width=7, state="readonly").pack(side="left")
+        r = self._row(b, (1, 1))
+        ent(r, "biases", 12, "or rotations", "deg,")
+        ent(r, "split", 4, "X1 share", "(used when X1 is blank)")
         self.bias_reach = CopyLabel(b, text="", foreground="#666", width=60)
         self.bias_reach.pack(anchor="w", padx=6, pady=(0, 2))
-        for k in ("biases", "split"):
+        for k in ("biases", "split", "x1", "x2"):
             self.bv[k].trace_add("write", lambda *_: self._bias_reach_text())
+        self.bias_how.trace_add("write", lambda *_: self._bias_reach_text())
 
-        b = self._box(f, "2  At each rotation")
+        b = self._box(f, "2  At each point")
         r = self._row(b, (2, 1))
         ent(r, "null_half_deg", 4, "around the null +-", "deg in")
         ent(r, "null_points", 3, None, "points,")
@@ -1016,6 +1023,15 @@ class App:
         r = self._row(b, (1, 3))
         ent(r, "hold_ms", 5, "hold", "ms, measuring")
         ent(r, "settle_ms", 4, None, "ms into it")
+        r = self._row(b, (1, 1))
+        self.bias_predict = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text="predict the null from the point before (4 angles only "
+                                "when it misses)", variable=self.bias_predict).pack(side="left")
+        r = self._row(b, (1, 3))
+        self.bias_track = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r, text="azimuth vs time at null +- 45 deg, to",
+                        variable=self.bias_track).pack(side="left")
+        ent(r, "track_ms", 5, None, "ms after the fall")
 
         b = self._box(f, "3  Preview, check on the scope, run")
         r = self._row(b, (2, 1))
@@ -1026,10 +1042,13 @@ class App:
         self._btn(r, "Dry run on scope", self.do_bias_dry, padx=(4, 0))
         self._btn(r, "Start", self.do_start_bias, padx=(4, 0))
         ttk.Label(f, foreground="#666", justify="left", wraplength=470, text=(
-            "Rotations: start:stop:step or a list. Per rotation: 4 angles find the azimuth, "
-            "then the null points at the most sensitive V/div that holds them (Imin), then "
-            "the bright angle (Imax). The beam is blocked once, for the darks at every "
-            "V/div. Preview: the plan step by step (Plan tab) and every plateau (AWG tab)."
+            "X1 / X2: start:stop:step or a list each, taken as pairs or as a grid (every X1 "
+            "with every X2). Per point: the null found (predicted from the point before, or "
+            "4 angles), the null points at the most sensitive V/div that holds them (Imin), "
+            "the bright angle (Imax), and the azimuth against time from the two slope "
+            "angles. The beam is blocked once, for the darks at every V/div. A run stopped "
+            "part-way resumes under the same name. Preview: the plan and its time (Plan "
+            "tab) and every plateau (AWG tab)."
         )).pack(anchor="w", padx=6, pady=(2, 4))
 
     # -- the Plan tab -------------------------------------------------------------------
@@ -2692,15 +2711,35 @@ class App:
             return
         plan = dict(c["bias"])
         name = scanmod.safe_name(plan.pop("name", "bias") or "bias")
-        new = scanmod.next_free_name(c["outdir"], name)
-        if new != name:
-            self.log(f"{name} exists - this fixed-rotation run is {new}")
-            self.bv["name"].set(new)
-            c["bias"]["name"] = new
-            name = new
+        resume = False
+        existing = os.path.join(c["outdir"], name, "bias.json")
+        if os.path.isfile(existing):
+            try:
+                with open(existing, encoding="utf-8") as fh:
+                    old = json.load(fh)
+            except (OSError, ValueError):
+                old = {}
+            n_all = len(old.get("ends") or old.get("biases") or [])
+            if old.get("dark") and not old.get("finished") and len(old.get("points", [])) < n_all:
+                ans = messagebox.askyesnocancel(
+                    "Run not finished", f"{name} has {len(old.get('points', []))} of {n_all} "
+                    f"points measured and its darks on record.\n\nYes = resume it (the same "
+                    f"points, those darks)\nNo = a new run under the next free name\n"
+                    f"Cancel = do nothing", parent=self.root)
+                if ans is None:
+                    return
+                resume = bool(ans)
+        if not resume:
+            new = scanmod.next_free_name(c["outdir"], name)
+            if new != name:
+                self.log(f"{name} exists - this fixed-rotation run is {new}")
+                self.bv["name"].set(new)
+                c["bias"]["name"] = new
+                name = new
         prov = self._provenance(c)
 
         try:
+            plan = dict(self._bias_plan(c), **{k: v for k, v in plan.items() if k != "name"})
             plan["idle"] = self._awg_idle(c)
         except ValueError as exc:
             self.log(f"Fixed rotations: {exc}")
@@ -2722,13 +2761,14 @@ class App:
         def go():
             from . import bias as biasmod
             sess = self._awg_session(c)
-            self.bias_live = {"points": [], "name": name, "plan": plan}
+            self.bias_live = {"points": [], "name": name, "plan": plan,
+                              "folder": os.path.join(c["outdir"], name)}
             run = biasmod.BiasRun(c["outdir"], name, self.link, self.rot, sess.awg, roles,
                                   plan=plan, log=self.log, cancelled=self.stop_flag.is_set,
                                   ask=self.ask_main, progress=self._progress,
                                   on_point=lambda p: self.call(self._bias_point, p),
                                   eomilc=self.awg_eom, ilc_bench=sess.ib, provenance=prov,
-                                  session=sess)
+                                  session=sess, resume=resume)
             try:
                 run.run()
             finally:
@@ -2743,13 +2783,29 @@ class App:
         """Under the rotations: the most the split lets the pair reach, and
         which rotations of the list are past it."""
         from . import bias as biasmod
+        m = awgmod.max_deg(self._awg_idle_guess())
+        x1 = self.bv["x1"].get().strip() if "x1" in self.bv else ""
+        if x1:
+            try:
+                ends = biasmod.ends_list({"x1": x1, "x2": self.bv["x2"].get(),
+                                          "how": self.bias_how.get(), "order": "up"})
+            except (ValueError, KeyError) as exc:
+                self.bias_reach.configure(text=str(exc), foreground="#c00000")
+                return
+            over = [(a, b) for a, b in ends if a > m["EO1"] + 1e-9 or b > m["EO2"] + 1e-9]
+            txt = (f"{len(ends)} points (X1 <= {m['EO1']:.1f}, X2 <= {m['EO2']:.1f} deg at the "
+                   f"{awgmod.AWG_CAP:g} V cap)")
+            if over:
+                txt = ("PAST THE AWG'S REACH: " + ", ".join(f"{a:g}/{b:g}" for a, b in over[:6])
+                       + (" ..." if len(over) > 6 else "") + " - " + txt)
+            self.bias_reach.configure(text=txt, foreground="#c00000" if over else "#666")
+            return
         try:
             split = float(self.bv["split"].get())
             bs = biasmod.parse_biases(self.bv["biases"].get())
         except (ValueError, KeyError):
             self.bias_reach.configure(text="")
             return
-        m = awgmod.max_deg(self._awg_idle_guess())
         lim = min(m["EO1"] / split if split > 0 else float("inf"),
                   m["EO2"] / (1 - split) if split < 1 else float("inf"))
         over = [b for b in bs if abs(b) > lim + 1e-9]
@@ -2764,17 +2820,23 @@ class App:
         plan = dict(c["bias"])
         plan.pop("name", None)
         plan["idle"] = self._awg_idle(c)
+        # the light's sense in the analyzer frame (AWG settings) predicts
+        # where the next point's null is
+        try:
+            plan["sense"] = float(c["awg"].get("seq_sense", -1.0) or -1.0)
+        except (TypeError, ValueError):
+            plan["sense"] = -1.0
         return plan
 
     def _bias_waves(self, plan):
-        """One plateau wave per distinct bias of the plan, as the run plays them."""
+        """One plateau wave per distinct point of the plan, as the run plays them."""
         from . import bias as biasmod
         p = dict(biasmod.PLAN, **plan)
         seen, out = set(), []
-        for b in biasmod.order_biases(biasmod.parse_biases(p["biases"]), p["order"]):
-            if b not in seen:
-                seen.add(b)
-                out.append(biasmod.plateau_wave(b, p))
+        for e in biasmod.ends_list(p):
+            if e not in seen:
+                seen.add(e)
+                out.append(biasmod.plateau_wave(e if biasmod.uses_pairs(p) else e[0] + e[1], p))
         return out
 
     def _show_awg_set(self, title, waves, window=None, found=()):
@@ -2805,32 +2867,35 @@ class App:
         try:
             plan = self._bias_plan(c)
             p = dict(biasmod.PLAN, **plan)
-            biases = biasmod.parse_biases(p["biases"])
+            ends = biasmod.ends_list(p)
             waves = self._bias_waves(plan)
             window = biasmod.windows(p)[0]
         except (ValueError, OSError) as exc:
             self.log(f"Fixed rotations preview: {exc}")
             return
         if not waves:
-            self.log("Fixed rotations preview: no rotations in the plan")
+            self.log("Fixed rotations preview: no points in the plan")
             return
         found = []
         try:
-            for _b, _pk, txt in biasmod.check_plateaus(biases, p, self._eom(c)):
+            for _b, _pk, txt in biasmod.check_plateaus(ends, p, self._eom(c)):
                 found.append(("INFO", txt))
         except ValueError as exc:
             found.append(("FAIL", str(exc)))
         self.report_checks(found, "Fixed rotations plan", popup=False)
-        order = biasmod.order_biases(biases, p["order"])
-        self._show_awg_set(f"Fixed rotations plan: {', '.join(f'{b:g}' for b in order[:10])}"
-                           f"{' ...' if len(order) > 10 else ''} deg ({p['order']})",
+        self._show_awg_set(f"Fixed rotations plan: {len(ends)} points, "
+                           + ", ".join(f"{a:g}/{b:g}" for a, b in ends[:8])
+                           + (" ..." if len(ends) > 8 else "") + f" deg X1/X2 ({p['order']})",
                            waves, window, found)
         from . import plan as planmod
-        steps = planmod.fixed_rotations(p, biases, c["bias"].get("name") or "bias")
+        steps = planmod.fixed_rotations(p, None, c["bias"].get("name") or "bias")
+        # the tracked tail is on screen for every shot of the run
+        span = self._plan_span(c, waves)
+        if p.get("track") and float(p.get("track_ms") or 0) > 0:
+            span = max(span, waves[0].period + float(p["track_ms"]) * 1e-3)
         self._show_plan(f"Fixed rotations {c['bias'].get('name') or ''}", steps, c["scan"],
                         "angles marked * are counted from the null the run finds at each "
-                        "rotation; the plateaus themselves: AWG tab",
-                        span_s=self._plan_span(c, waves))
+                        "point; the plateaus themselves: AWG tab", span_s=span)
 
     def do_seq_preview(self):
         """Every ramp of the AWG tab's sequence, drawn together."""
@@ -2983,34 +3048,72 @@ class App:
                     ha="center", va="center", transform=ax.transAxes, color="#888")
             ax.set_axis_off()
             return
+        from . import bias as biasmod
         pts = r["points"]
         cols = {"up": "#1f77b4", "down": "#d62728"}
+        x1s = sorted({p.get("x1") for p in pts if p.get("x1") is not None})
+        x2s = sorted({p.get("x2") for p in pts if p.get("x2") is not None})
+        grid = len(x1s) >= 2 and len(x2s) >= 2
+        xlabel = "rotation, monitors (deg)"
+
+        def xof(ps):
+            return [p["phi_mon"] if p.get("phi_mon") is not None else p["bias"] for p in ps]
+
         ax = fig.add_subplot(221)
-        for d_ in ("up", "down"):
-            ps = [p for p in pts if p.get("dir", "up") == d_]
-            if not ps:
-                continue
-            x = [p["phi_mon"] if p.get("phi_mon") is not None else p["bias"] for p in ps]
-            ok = [i for i, p in enumerate(ps) if p.get("er")]
-            ax.errorbar([x[i] for i in ok], [ps[i]["er"] for i in ok],
-                        [ps[i].get("sig_er") or 0 for i in ok], fmt="o", ms=4,
-                        color=cols[d_], label=f"Imax / Imin ({d_})")
-            lb = [i for i, p in enumerate(ps) if not p.get("er") and p.get("er_lower")]
-            if lb:
-                xs, ys = [x[i] for i in lb], [ps[i]["er_lower"] for i in lb]
-                ax.plot(xs, ys, "o", mfc="none", color=cols[d_],
-                        label="lower bound (Imin unresolved; dotted line up)")
-                ax.vlines(xs, ys, [y * 2.5 for y in ys], color=cols[d_], lw=1.0,
-                          linestyles=(0, (1, 1.6)))
-            cv = [i for i in ok if ps[i].get("malus_ratio")]
-            ax.plot([x[i] for i in cv],
-                    [(ps[i]["imin"] + ps[i]["fit"]["k"]) / ps[i]["imin"] for i in cv],
-                    "x", color=cols[d_], alpha=0.6, label="from the null's curvature")
-        self._logy(fig, ax)
-        ax.set_xlabel("rotation, monitors (deg)")
-        ax.set_ylabel("extinction ratio")
-        ax.set_title(f"Static extinction ratio ({r['name']})")
-        ax.legend(fontsize=7)
+        if grid:
+            # the grid: ER at every (X1, X2), colour = log ER, hollow = lower bound
+            import matplotlib.colors as mcolors
+            vals = [p.get("er") or p.get("er_lower") for p in pts]
+            ok = [v for v in vals if v]
+            norm = mcolors.LogNorm(vmin=max(min(ok), 1.0), vmax=max(ok)) if ok else None
+            xs = [p["x1"] for p in pts]
+            ys = [p["x2"] for p in pts]
+            full = [bool(p.get("er")) for p in pts]
+            sc_ = ax.scatter([x for x, f in zip(xs, full) if f], [y for y, f in zip(ys, full) if f],
+                             c=[v for v, f in zip(vals, full) if f], norm=norm, cmap="viridis",
+                             s=140, marker="s", edgecolors="k", linewidths=0.4)
+            if not all(full):
+                ax.scatter([x for x, f in zip(xs, full) if not f],
+                           [y for y, f in zip(ys, full) if not f],
+                           c=[v for v, f in zip(vals, full) if not f], norm=norm,
+                           cmap="viridis", s=140, marker="s", edgecolors="k", linewidths=1.2,
+                           hatch="//", alpha=0.6)
+            for x, y, v, f in zip(xs, ys, vals, full):
+                if v:
+                    ax.annotate(("" if f else ">") + f"{v:.0f}", (x, y), ha="center",
+                                va="center", fontsize=6, color="w" if norm and norm(v) > 0.5
+                                else "k")
+            if ok:
+                fig.colorbar(sc_, ax=ax, label="extinction ratio (hatched: lower bound)")
+            ax.set_xlabel("X1 held (deg)")
+            ax.set_ylabel("X2 held (deg)")
+            ax.set_title(f"Static extinction ratio over the grid ({r['name']})", fontsize=9)
+        else:
+            for d_ in ("up", "down"):
+                ps = [p for p in pts if p.get("dir", "up") == d_]
+                if not ps:
+                    continue
+                x = xof(ps)
+                ok = [i for i, p in enumerate(ps) if p.get("er")]
+                ax.errorbar([x[i] for i in ok], [ps[i]["er"] for i in ok],
+                            [ps[i].get("sig_er") or 0 for i in ok], fmt="o", ms=4,
+                            color=cols[d_], label=f"Imax / Imin ({d_})")
+                lb = [i for i, p in enumerate(ps) if not p.get("er") and p.get("er_lower")]
+                if lb:
+                    xs, ys = [x[i] for i in lb], [ps[i]["er_lower"] for i in lb]
+                    ax.plot(xs, ys, "o", mfc="none", color=cols[d_],
+                            label="lower bound (Imin unresolved; dotted line up)")
+                    ax.vlines(xs, ys, [y * 2.5 for y in ys], color=cols[d_], lw=1.0,
+                              linestyles=(0, (1, 1.6)))
+                cv = [i for i in ok if ps[i].get("malus_ratio")]
+                ax.plot([x[i] for i in cv],
+                        [(ps[i]["imin"] + ps[i]["fit"]["k"]) / ps[i]["imin"] for i in cv],
+                        "x", color=cols[d_], alpha=0.6, label="from the null's curvature")
+            self._logy(fig, ax)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel("extinction ratio")
+            ax.set_title(f"Static extinction ratio ({r['name']})")
+            ax.legend(fontsize=7)
         ax.grid(alpha=0.3, which="both")
 
         ax = fig.add_subplot(222)
@@ -3019,17 +3122,22 @@ class App:
             phi = np.array(tf["phi_mon"])
             dev = (np.array(tf["rot_light"]) - phi) * 1e3
             dirs = tf.get("dir", ["up"] * len(phi))
-            for d_ in ("up", "down"):
-                m = np.array([x == d_ for x in dirs])
-                if m.any():
-                    ax.plot(phi[m], dev[m], "o-", ms=4, color=cols[d_],
-                            label=f"static, {d_}")
+            if grid:
+                sc_ = ax.scatter(phi, dev, c=[p["x2"] for p in pts if p.get("theta_n") is not None],
+                                 cmap="plasma", s=18, label="static (colour: X2)")
+                fig.colorbar(sc_, ax=ax, label="X2 held (deg)")
+            else:
+                for d_ in ("up", "down"):
+                    m = np.array([x == d_ for x in dirs])
+                    if m.any():
+                        ax.plot(phi[m], dev[m], "o-", ms=4, color=cols[d_],
+                                label=f"static, {d_}")
             ramp = self._ramp_lm()
             if ramp is not None:
                 act = ramp[0] > 0.5
                 ax.plot(ramp[0][act], ramp[1][act] * 1e3, ",", color="0.5", alpha=0.5,
                         label=f"ramp {self.result['d'].name}, leg 1")
-            ax.set_xlabel("rotation, monitors (deg)")
+            ax.set_xlabel(xlabel)
             ax.set_ylabel("light - monitors (mdeg)")
             ax.set_title(f"Light - monitors, static: gain {tf['gain']:.4f}, "
                          f"{tf['rms_resid']*1e3:.0f} mdeg rms left", fontsize=8)
@@ -3037,7 +3145,7 @@ class App:
             ax.grid(alpha=0.3)
 
         ax = fig.add_subplot(223)
-        x = [p["phi_mon"] if p.get("phi_mon") is not None else p["bias"] for p in pts]
+        x = xof(pts)
         ax.errorbar(x, [p["imin"] * 1e3 for p in pts], [p["sig_imin"] * 1e3 for p in pts],
                     fmt="o", ms=4, label="Imin (dark-subtracted)")
         for xi, p in zip(x, pts):
@@ -3045,26 +3153,51 @@ class App:
                 ax.annotate(f"{p['scan']['vdiv']*1e3:g}", (xi, p["imin"] * 1e3), fontsize=6,
                             xytext=(3, 3), textcoords="offset points", color="#666")
         self._logy(fig, ax)
-        ax.set_xlabel("rotation, monitors (deg)")
+        ax.set_xlabel(xlabel)
         ax.set_ylabel("Imin (mV); labels: mV/div")
         ax.grid(alpha=0.3, which="both")
 
         ax = fig.add_subplot(224)
-        p = pts[-1]
-        sc = p.get("scan")
-        if sc:
-            th = np.array(sc["theta"])
-            ax.errorbar(th - p["theta_n"], np.array(sc["I"]) * 1e3,
-                        np.array(sc["sem"]) * 1e3, fmt="o", ms=4)
-            xx = np.linspace(th.min(), th.max(), 200)
-            f_ = p["fit"]
-            ax.plot(xx - p["theta_n"], (f_["imin"] + f_["k"] * np.sin(np.deg2rad(
-                xx - f_["theta_n"])) ** 2) * 1e3, color="k", lw=0.8)
-            ax.set_xlabel("analyzer - null (deg)")
-            ax.set_ylabel("PD (mV)")
-            ax.set_title(f"Null scan at {p['bias']:g} deg: null {p['theta_n']:.3f} "
-                         f"+- {p['sig_theta_n']*1e3:.0f} mdeg", fontsize=8)
+        tracks = {}
+        folder = r.get("folder")
+        if folder and any(p.get("track") for p in pts):
+            try:
+                tracks = biasmod.load_tracks(folder)
+            except OSError:
+                tracks = {}
+        if tracks:
+            import matplotlib.cm as cm
+            rots = {p["i"]: p["bias"] for p in pts}
+            lo_, hi_ = min(rots.values()), max(rots.values())
+            fall = (r.get("t_fall_s") or 0.0) * 1e3
+            for i, tr in sorted(tracks.items()):
+                b = rots.get(i, 0.0)
+                c_ = cm.viridis((b - lo_) / (hi_ - lo_)) if hi_ > lo_ else "C0"
+                k = max(1, len(tr["t"]) // 4000)
+                ax.plot(tr["t"][::k] * 1e3, tr["lm"][::k] * 1e3, lw=0.7, color=c_)
+            if fall:
+                ax.axvline(fall, color="0.6", lw=0.6, ls=":")
+            ax.set_xlabel("t (ms)")
+            ax.set_ylabel("light - monitors (mdeg)")
+            ax.set_title(f"Azimuth vs time from the slope angles, {len(tracks)} points "
+                         f"(colour: rotation {lo_:g}..{hi_:g} deg)", fontsize=8)
             ax.grid(alpha=0.3)
+        else:
+            p = pts[-1]
+            sc = p.get("scan")
+            if sc:
+                th = np.array(sc["theta"])
+                ax.errorbar(th - p["theta_n"], np.array(sc["I"]) * 1e3,
+                            np.array(sc["sem"]) * 1e3, fmt="o", ms=4)
+                xx = np.linspace(th.min(), th.max(), 200)
+                f_ = p["fit"]
+                ax.plot(xx - p["theta_n"], (f_["imin"] + f_["k"] * np.sin(np.deg2rad(
+                    xx - f_["theta_n"])) ** 2) * 1e3, color="k", lw=0.8)
+                ax.set_xlabel("analyzer - null (deg)")
+                ax.set_ylabel("PD (mV)")
+                ax.set_title(f"Null scan at {p['bias']:g} deg: null {p['theta_n']:.3f} "
+                             f"+- {p['sig_theta_n']*1e3:.0f} mdeg", fontsize=8)
+                ax.grid(alpha=0.3)
 
     # -- dark and background ---------------------------------------------------------
     OFFSET_PROMPTS = {
@@ -4275,6 +4408,9 @@ class App:
         for k, v in self.bv.items():
             v.set(str(c["bias"].get(k, "")))
         self.bias_order.set(c["bias"].get("order", "up"))
+        self.bias_how.set(c["bias"].get("how", "pairs") or "pairs")
+        self.bias_predict.set(bool(c["bias"].get("predict_null", True)))
+        self.bias_track.set(bool(c["bias"].get("track", True)))
         for k, v in self.iv.items():
             v.set(str(c["ilc"].get(k, "")))
         a = c["awg"]
@@ -4336,11 +4472,14 @@ class App:
         b = c["bias"]
         for k, v in self.bv.items():
             txt = v.get().strip()
-            if k in ("biases", "name"):
+            if k in ("biases", "name", "x1", "x2"):
                 b[k] = txt
             elif _isnum(txt):
                 b[k] = int(float(txt)) if k in ("shots", "null_points") else float(txt)
         b["order"] = self.bias_order.get() or "up"
+        b["how"] = self.bias_how.get() or "pairs"
+        b["predict_null"] = bool(self.bias_predict.get())
+        b["track"] = bool(self.bias_track.get())
         seq = c.setdefault("sequence", dict(cfgmod.DEFAULTS["sequence"]))
         for k, v in self.seq.items():
             if _isnum(v.get()) and float(v.get()) >= 0:

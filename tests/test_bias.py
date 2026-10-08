@@ -125,6 +125,129 @@ def run_checks(sg, eomilc):
     check("manifest reloads", len(man["points"]) == 4 and man["transfer"] is not None)
 
 
+def pairs_checks(sg, eomilc):
+    print("\nX1 / X2 pairs on the simulated bench: a 2 x 2 grid, the null predicted, the "
+          "azimuth tracked, a stop and a resume")
+    from rampol import plan as planmod, lablog
+    # the simulated bench turns the light WITH the monitors (sense +1); the
+    # plan says -1 (the real bench) and the run must learn it from its points
+    p = {"x1": "0, 45", "x2": "0, 45", "how": "grid", "shots": 4, "points": 4000,
+         "upload_settle_s": 0.0, "track": True, "track_ms": 30.0, "predict_null": True,
+         "sense": -1.0}
+    check("the sense is learned from two measured nulls (+1 here), else the plan's",
+          bias.sense_from([{"theta_n": 10.0, "bias": 0.0}, {"theta_n": 55.0, "bias": 45.0}]) == 1.0
+          and bias.sense_from([{"theta_n": 10.0, "bias": 0.0}, {"theta_n": 145.0, "bias": 45.0}]) == -1.0
+          and bias.sense_from([{"theta_n": 10.0, "bias": 0.0}], -1.0) == -1.0)
+    ends = bias.ends_list(p)
+    check("a grid is every X1 with every X2", ends == [(0.0, 0.0), (0.0, 45.0), (45.0, 0.0),
+                                                      (45.0, 45.0)], ends)
+    check("pairs take the lists together",
+          bias.ends_list({"x1": "0, 30", "x2": "10", "how": "pairs"}) == [(0.0, 10.0), (30.0, 10.0)])
+    check("a rotation list still splits between the crystals",
+          bias.ends_list({"biases": "0, 60", "split": 0.25}) == [(0.0, 0.0), (15.0, 45.0)])
+    v = bias.ends_volts(90.0, 0.0)
+    check("volts for X1 90 / X2 0", abs(v["EO1"] - 9.1675) < 0.01 and v["EO2"] == 0.0, v)
+    w = bias.plateau_wave((30.0, 60.0), dict(bias.PLAN))
+    check("a pair's plateau carries its ends and the summed rotation",
+          w.ends == {"EO1": 30.0, "EO2": 60.0} and w.rotation == 90.0 and "X1 30" in w.label)
+    steps = planmod.fixed_rotations(p, None, "g")
+    kinds = [s["kind"] for s in steps]
+    check("the plan: 4 azimuth angles once, then null points, bright and 2 track angles "
+          "per point", kinds.count("azimuth") == 4 and kinds.count("track") == 8
+          and kinds.count("null") == 4 * bias.PLAN["null_points"] and kinds.count("bright") == 4,
+          {k: kinds.count(k) for k in set(kinds)})
+    steps = planmod.fixed_rotations(dict(p, predict_null=False), None, "g")
+    check("without prediction every point has its 4 angles",
+          [s["kind"] for s in steps].count("azimuth") == 16)
+    roles = {1: "PD", 2: "CmdX1", 3: "MonX1", 4: "MonX2"}
+    bench = sim.Bench(pd_noise=0.2e-3, drift=0.0, rotator_err_deg=2.0,
+                      er_rest=5000.0, er_mid=300.0, legs_ms=(0.0,))
+    scope, ell, bench = sim.make(sg, roles=roles, bench=bench)
+    scope.noise_per_div = 0.01
+    link = hw.ScopeLink(scope, log=lambda s: None)
+    rot = hw.Rotator(ell, log=lambda s: None)
+    awg = sim.FakeAWG(bench)
+    asked = []
+
+    def ask(title, text):
+        asked.append(title)
+        if "Block the beam" in text:
+            bench._imax_saved, bench.imax = bench.imax, 0.0
+        elif "Unblock" in text:
+            bench.imax = bench._imax_saved
+        return True
+    folder = tempfile.mkdtemp(prefix="rampol-pairs-")
+    n_pts = []
+    logs = []
+    run = bias.BiasRun(folder, "grid", link, rot, awg, {r: ch for ch, r in roles.items()},
+                       plan=p, log=logs.append, ask=ask, eomilc=eomilc,
+                       cancelled=lambda: len(n_pts) >= 2,
+                       on_point=lambda pt: n_pts.append(pt))
+    try:
+        run.run()
+    except hw.Cancelled:
+        pass
+    man = bias.load(os.path.join(folder, "grid"))
+    check("stopped after 2 points: on record with the darks and null settings, not finished",
+          len(man["points"]) == 2 and man.get("dark") and man.get("null_settings")
+          and not man.get("finished"), (len(man["points"]), bool(man.get("dark"))))
+    asked2 = []
+
+    def ask2(title, text):
+        asked2.append(title)
+        return True
+    run2 = bias.BiasRun(folder, "grid", link, rot, awg, {r: ch for ch, r in roles.items()},
+                        plan=p, log=logs.append, ask=ask2, eomilc=eomilc, resume=True)
+    pts = run2.run()
+    check("resumed: the other 2 points measured, no dark asked for again, finished",
+          len(pts) == 4 and asked2 == ["Fixed rotations"] and [p_["i"] for p_ in pts] == [0, 1, 2, 3],
+          (len(pts), asked2))
+    man = bias.load(os.path.join(folder, "grid"))
+    check("points carry X1 / X2 and the summed rotation",
+          [(p_["x1"], p_["x2"], p_["bias"]) for p_ in man["points"]]
+          == [(0.0, 0.0, 0.0), (0.0, 45.0, 45.0), (45.0, 0.0, 45.0), (45.0, 45.0, 90.0)])
+    er_true = lambda r_: 1 / (1 / bench.er(r_) + 1 / bench.er_pol)
+    for p_ in man["points"]:
+        tr = er_true(p_["phi_mon"])
+        ok = p_["er"] is not None and abs(p_["er"] / tr - 1) < 0.15
+        check(f"ER at X1 {p_['x1']:g} / X2 {p_['x2']:g} near the bench's {tr:.0f}", ok,
+              f"measured {p_['er'] or 0:.0f}, Imin {p_['imin']*1e3:.3f} mV at "
+              f"{p_['scan']['vdiv']*1e3:g} mV/div"
+              + (", null predicted" if p_.get("null_predicted") else ""))
+    check("point 2 predicted with the plan's wrong sense misses and falls back to 4 angles; "
+          "from then on the learned sense predicts the null",
+          not man["points"][0]["null_predicted"] and not man["points"][1]["null_predicted"]
+          and all(p_["null_predicted"] and p_["null_converged"] for p_ in man["points"][2:])
+          and all(p_["null_converged"] for p_ in man["points"])
+          and [p_["sense"] for p_ in man["points"]] == [-1.0, -1.0, 1.0, 1.0],
+          [(p_["null_predicted"], p_["null_converged"], p_["sense"]) for p_ in man["points"]])
+    tracks = bias.load_tracks(os.path.join(folder, "grid"))
+    tk = [p_["track"] for p_ in man["points"]]
+    check("the azimuth was tracked at every point: traces on disk, a creep slope in the "
+          "manifest, no relaxation time claimed on a bench without drift",
+          len(tracks) == 4 and all("hold_slope_mdeg_ms" in x and "tau_ms" not in x for x in tk)
+          and all(len(t_["lm"]) > 100 for t_ in tracks.values()),
+          [(round(x.get("hold_slope_mdeg_ms", 0), 2), x.get("after_from")) for x in tk])
+    check("holds past 25 deg carry the rest pair for the tail after the fall",
+          [("lm_rest" in t_) for _i, t_ in sorted(tracks.items())] == [False, True, True, True]
+          and tk[0]["after_from"] == "hold pair" and tk[3]["after_from"] == "rest pair")
+    # the bench has no slow drift and its monitors read the drive: light -
+    # monitors stays within the shot noise through the hold, and after the
+    # fall where the pair in use can see it
+    w0, w1 = man["window_s"]
+    worst_hold = max(float(np.max(np.abs(t_["lm"][(t_["t"] > w0) & (t_["t"] < w1)])))
+                     for t_ in tracks.values())
+    t_f = man["t_fall_s"]
+    worst_after = max(float(np.max(np.abs((t_.get("lm_rest", t_["lm"]))[t_["t"] > t_f + 2e-3])))
+                      for t_ in tracks.values())
+    check("tracked light - monitors stays near zero on a drift-free bench (hold and tail < 0.3 deg)",
+          worst_hold < 0.3 and worst_after < 0.3, f"{worst_hold*1e3:.0f} / {worst_after*1e3:.0f} mdeg worst")
+    row = lablog.bias_row(man)
+    check("the lab-log row names the point of the lowest ER and the tracking",
+          row["direct_er_min_at"].startswith("bias X1") and "tracked at 4" in row["result"],
+          (row["direct_er_min_at"], row["result"]))
+
+
 def main():
     sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
     try:
@@ -135,6 +258,7 @@ def main():
     plan_checks(eomilc)
     null_fit_checks()
     run_checks(sg, eomilc)
+    pairs_checks(sg, eomilc)
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED: {', '.join(FAILS)}")

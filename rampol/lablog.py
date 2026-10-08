@@ -145,20 +145,34 @@ def bias_row(man):
     """A bias run's row from its manifest (rampol.bias.load)."""
     from .provenance import short
     pts = man.get("points", [])
-    ers = [(p["er"], p["bias"]) for p in pts if p.get("er")]
-    lo = min(ers) if ers else None
+    ers = [(p["er"], p) for p in pts if p.get("er")]
+    lo = min(ers, key=lambda x: x[0]) if ers else None
     tf = man.get("transfer") or {}
     prov = man.get("provenance") or {}
+    n_all = len(man.get("ends") or man.get("biases", []))
+    where = ""
+    if lo:
+        q = lo[1]
+        where = (f"bias X1 {q['x1']:g} / X2 {q['x2']:g} deg" if "x1" in q
+                 else f"bias {q['bias']:g} deg")
+    bounds = sum(1 for p in pts if not p.get("er") and p.get("er_lower"))
+    tracked = [p["track"] for p in pts if p.get("track")]
+    taus = [t["tau_ms"] for t in tracked if "tau_ms" in t]
+    res = [f"light/monitors gain {tf['gain']:.4f}, {tf['rms_resid']*1e3:.0f} mdeg rms left"
+           if tf.get("gain") is not None else "",
+           f"{bounds} point(s) lower bounds (Imin unresolved)" if bounds else "",
+           (f"azimuth tracked at {len(tracked)} points"
+            + (f", tau {min(taus):.0f}-{max(taus):.0f} ms" if taus else ", no relaxation resolved"))
+           if tracked else ""]
     return {
         "kind": "bias points", "name": man.get("name", ""),
         "measured": man.get("created", ""),
-        "status": "complete" if man.get("finished") and len(pts) == len(man.get("biases", []))
-        else f"{len(pts)}/{len(man.get('biases', []))} points",
+        "status": "complete" if man.get("finished") and len(pts) == n_all
+        else f"{len(pts)}/{n_all} points",
         "shots": (man.get("plan") or {}).get("shots"),
         "direct_er_min": lo[0] if lo else None,
-        "direct_er_min_at": f"bias {lo[1]:g} deg" if lo else "",
-        "result": (f"light/monitors gain {tf['gain']:.4f}, {tf['rms_resid']*1e3:.0f} mdeg "
-                   f"rms left" if tf.get("gain") is not None else ""),
+        "direct_er_min_at": where,
+        "result": "; ".join(x for x in res if x),
         "software": short({"software": prov.get("software")}) if prov else "",
         "ilc": "",
         "folder": man.get("folder", ""),

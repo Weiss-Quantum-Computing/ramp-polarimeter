@@ -603,20 +603,47 @@ in this tab first plays every distinct plateau of the plan into the scope
 (wiring checked on the first one that moves), and Start refuses a plan with
 any plateau that has not passed; under never-float the bias changes are
 made live and the run ends parked. The plateaus are the ILC's record length
-(5501 points), so the ILC's FRQ check passes afterwards. Per bias:
+(5501 points), so the ILC's FRQ check passes afterwards.
 
-1. 4 analyzer angles at the normal V/div: the azimuth and Imax;
+**The points.** X1 and X2 held separately (`x1` / `x2`, each
+start:stop:step or a list, taken as *pairs* or as a *grid* of every X1 with
+every X2 - the 7 Oct 2026 asking: 0:90:5 on both is 361 points, 0:90:15 is
+49), or a rotation list split between the crystals by `split` when X1 is
+blank. A point is X1 e1 / X2 e2 deg, its rotation e1 + e2. Per point:
+
+1. where the null is: predicted from the point before (the null moves by
+   sense x the rotation change; the sense comes from AWG settings and is
+   re-learned from the run's own measured nulls once two are 10 deg
+   apart), with 4 analyzer angles at the normal V/div only for the first
+   point and whenever the prediction misses (`predict_null`);
 2. the analyzer stepped +-`null` deg around the crossed position at the most
    sensitive V/div that keeps the scan on screen (the ladder goes up a step
    when a reading clips): I = Imin + K sin^2(theta - theta_n) -> theta_n,
    Imin;
-3. the bright angle at the normal V/div: Imax.
+3. the bright angle at the normal V/div: Imax;
+4. with `track`, the azimuth against time: the two slope angles theta_n
+   +- 45 deg, where (I+ - I-) / (I+ + I- - 2 Imin) = -sin 2d gives the
+   null's displacement d sample by sample with the intensity cancelled,
+   read through the hold and `track_ms` after the fall (the scope's screen
+   covers the record plus that tail for the whole run). A pair at the
+   hold's null reads only within 45 deg of it, so holds past 25 deg take a
+   second pair at the rest null for the lead and the tail after the fall.
+   The manifest keeps the creep slope through the hold (mdeg/ms), the
+   value 1 ms after the fall, the extreme after it and a relaxation time
+   constant when its amplitude stands above the trace's scatter; the
+   traces are in the point's npz (`track_*`), drawn on the tab.
 
 ER = Imax / Imin, both measured and dark-subtracted at the V/div each was
 taken at (the beam is blocked once, at the start, for every V/div the run
 can use). An unresolved Imin gives a lower bound. K / (Imax - Imin) checks
 the Malus shape. The window starts `settle` ms into the hold: the plateau's
 edges overdrive the scope at mV/div and the MSO-X needs ~3 ms to recover.
+A run stopped part-way (Stop, an error) resumes under the same name with
+the same points and its darks (Start asks); the darks and the null V/div
+settings go on record right after they are taken. The Plan tab (Preview)
+gives the step list and the time: about 14 angles per point at 8 shots,
+~2 min at the 0.27 s trigger, so a 49-point grid is ~1.5 h and 361 points
+~12 h.
 
 theta_n - 90 is the static polarization azimuth, so the run is also the
 rotator's **static transfer curve**: light against the monitors' prediction,

@@ -321,16 +321,21 @@ def main():
     root.update()
     ax_ = app.fig_awg.axes
     check("Fixed rotations Preview: every plateau on the AWG tab, the window shaded",
-          len(ax_) >= 2 and ax_[0].get_title().startswith("Fixed rotations plan: 0, 45, 90")
+          len(ax_) >= 2 and ax_[0].get_title().startswith("Fixed rotations plan: 3 points, 0/0, 22.5/22.5, 45/45")
           and len(ax_[0].lines) == 6 and len(ax_[1].patches) == 1,
           (ax_[0].get_title() if ax_ else "", len(ax_[0].lines) if ax_ else 0))
     app.fig_awg.savefig(os.path.join(out, "AWG_fixed_rotations_preview.png"))
     pv = app.plan_view
     npts = int(app.bv["null_points"].get())
-    check("... and the plan step by step on the Plan tab: the dark, then per rotation 4 "
-          "azimuth angles, the null points and the bright angle",
-          len(pv["steps"]) == 1 + 3 * (4 + npts + 1)
+    # the null is predicted from the point before (4 angles for the first point
+    # only) and the azimuth tracked at 2 slope angles per point (defaults)
+    per_pt = npts + 1 + (2 if app.bias_track.get() else 0)
+    n_az = 4 if app.bias_predict.get() else 12
+    check("... and the plan step by step on the Plan tab: the dark, 4 azimuth angles for the "
+          "first point, then per point the null points, the bright angle and the track pair",
+          len(pv["steps"]) == 1 + n_az + 3 * per_pt
           and [st["kind"] for st in pv["steps"][1:6]] == ["azimuth"] * 4 + ["null"]
+          and [st["kind"] for st in pv["steps"]].count("track") == (6 if app.bias_track.get() else 0)
           and [st["x1"] for st in pv["steps"] if st["kind"] == "bright"]
           == [0.0, 45.0 * float(app.bv["split"].get()), 90.0 * float(app.bv["split"].get())],
           (len(pv["steps"]), pv["title"]))
