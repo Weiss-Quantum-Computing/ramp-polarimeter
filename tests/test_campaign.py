@@ -34,6 +34,20 @@ def main():
     cfg["awg"].update(scope_before_ms=0.5, scope_after_ms=0.5, hold_ms=4.0, seq_settle_s=0.0)
     with open(cfg_path, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh)
+    # two synthetic ILC target pairs in the suite's format (HV volts, 2 us grid)
+    tdir = os.path.join(tmp, "targets")
+    os.makedirs(tdir)
+    import numpy as _np
+    tt = _np.arange(0, 6000, 2.0)
+    prof = _np.clip((tt - 500) / 1000, 0, 1)
+    prof = 0.5 - 0.5 * _np.cos(_np.pi * prof)
+    prof[tt > 3500] = _np.clip(0.5 + 0.5 * _np.cos(_np.pi * _np.clip((tt[tt > 3500] - 3500) / 1000, 0, 1)), 0, 1)
+    for stem, (p1, p2) in (("T1", (5128.3, 0.0)), ("T2", (2564.15, 5137.4))):
+        for suf, pk in (("X1", p1), ("X2", p2)):
+            with open(os.path.join(tdir, f"target_{stem}{suf}.csv"), "w", encoding="utf-8") as fh:
+                fh.write(f"# {stem} {suf}: test target\ntime_us,voltage_V\n")
+                for x, y in zip(tt, prof * pk):
+                    fh.write(f"{x:.6f},{y:.6f}\n")
     plan = {"stages": [
         {"stage": "grid", "name": "g", "x1": "0, 40", "x2": "0", "how": "pairs", "shots": 2,
          "points": 4000, "upload_settle_s": 0.0, "track": True, "track_ms": 20.0},
@@ -49,7 +63,9 @@ def main():
          "points": 4000, "upload_settle_s": 0.0, "period_ms": 100.0},
         {"stage": "grid", "name": "neg", "x1": "-30", "x2": "0", "how": "pairs", "shots": 2,
          "points": 4000, "upload_settle_s": 0.0, "darks_from": "g", "track": False,
-         "allow_negative": True}]}
+         "allow_negative": True},
+        {"stage": "targets", "name": "suite", "dir": tdir, "stems": "all", "darks_from": "g",
+         "awg": {"scope_before_ms": 0.5, "scope_after_ms": 2.0}}]}
     plan_path = os.path.join(tmp, "plan.json")
     with open(plan_path, "w", encoding="utf-8") as fh:
         json.dump(plan, fh)
@@ -119,11 +135,27 @@ def main():
           len(neg["points"]) == 1 and neg["points"][0]["x1"] == -30.0 and neg["points"][0].get("er")
           and abs(neg["points"][0]["phi_mon"] + 30) < 1.0,
           (neg["points"][0].get("phi_mon"), neg["points"][0].get("er")))
+    mans = {}
+    for n in ("suite_T1", "suite_T2"):
+        p = os.path.join(cfg["outdir"], n, f"{n}_scan.json")
+        mans[n] = json.load(open(p, encoding="utf-8")) if os.path.isfile(p) else {}
+    check("targets stage: a ramp scan per suite pair, every step done, the drive on record "
+          "with its files and peak rotations (T1: X1 90, T2: 45 + 90)",
+          all(m and all(x["status"] == "done" for x in m["steps"]) for m in mans.values())
+          and abs(mans["suite_T1"]["drive"]["ends_deg"]["X1"] - 90) < 0.1
+          and abs(mans["suite_T2"]["drive"]["ends_deg"]["X1"] - 45) < 0.1
+          and abs(mans["suite_T2"]["drive"]["ends_deg"]["X2"] - 90) < 0.1
+          and "files" in mans["suite_T1"]["drive"],
+          {n: (m.get("drive") or {}).get("ends_deg") for n, m in mans.items()})
+    d2 = an.load_scan(os.path.join(cfg["outdir"], "suite_T2"), sg.load_capture)
+    p2 = an.polarization(d2, angle_gain=False)
+    check("the T2 target turned the simulated light by its 135 deg",
+          abs(float(np.max(np.abs(p2["rotation"]))) - 135) < 3, float(np.max(np.abs(p2["rotation"]))))
     # a second run of the same plan: everything finished, nothing measured again
     r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     out2 = r2.stdout + r2.stderr
     check("run again: finished stages skipped, ramp scans resumed with 0 steps to measure",
-          r2.returncode == 0 and out2.count("already finished") == 6 and "0 steps to measure" in out2,
+          r2.returncode == 0 and out2.count("already finished") == 6 and out2.count("0 steps to measure") == 2,
           out2[-800:] if not (r2.returncode == 0 and "0 steps to measure" in out2) else "")
     print()
     if FAILS:

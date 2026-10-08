@@ -209,6 +209,9 @@ def _drive_info(w, a):
            "ends_deg": {"X1": w.ends["EO1"], "X2": w.ends["EO2"]},
            "ramp": {k: a.get(k) for k in ("rotation", "split", "edge", "lead_ms", "rise_ms",
                                           "hold_ms", "fall_ms", "tail_ms")}}
+    if getattr(w, "files", None):
+        out["files"] = dict(w.files)
+        out.pop("ramp", None)
     return out
 
 
@@ -269,6 +272,73 @@ def stage_ramps(st, cfg, parts, log, ask, prov):
         if bad:
             raise RuntimeError(f"{w.label}: " + "; ".join(bad))
     names = [scanmod.safe_name(f"{base}_X1_{e1:g}_X2_{e2:g}") for e1, e2 in ends]
+    return _ramp_sequence(st, cfg, parts, log, prov, base, waves, ends, names, sc, a)
+
+
+def _read_target(path):
+    """(time_us, volts) of an ILC target / drive CSV: '#' comments, a
+    'time_us,voltage_V' header, then the samples."""
+    rows = []
+    with open(path, encoding="utf-8-sig") as fh:
+        for line in fh:
+            f = line.strip().split(",")
+            if line.startswith("#") or len(f) < 2:
+                continue
+            try:
+                rows.append((float(f[0]), float(f[1])))
+            except ValueError:
+                continue
+    a = np.array(rows, float)
+    return a[:, 0], a[:, 1]
+
+
+def stage_targets(st, cfg, parts, log, ask, prov):
+    """The suite's ILC target pairs (target_<stem>X1.csv / X2.csv in `dir`:
+    HV volts on a 2 us grid, each channel scaled to its V90, EO zero not
+    applied) played as drives - HV V / 1000 = monitor V, / the chain's gain
+    = AWG V, no learned correction - one ramp scan each, interleaved, the
+    hold-null angles from each pair's peak rotation. `stems`: a list, or
+    "all" for every pair in the folder."""
+    sg, link, rot, sess, eom, bench = parts
+    base = scanmod.safe_name(st["name"])
+    d = st["dir"]
+    a = dict(cfg["awg"], **(st.get("awg") or {}))
+    sc = dict(cfg["scan"], **(st.get("scan") or {}))
+    stems = st.get("stems") or "all"
+    if stems == "all":
+        stems = sorted({f[len("target_"):-len("X1.csv")] for f in os.listdir(d)
+                        if f.startswith("target_") and f.endswith("X1.csv")})
+    waves, ends, names = [], [], []
+    for stem in stems:
+        t, u, files = {}, {}, {}
+        for n, suf in (("EO1", "X1"), ("EO2", "X2")):
+            files[n] = os.path.join(d, f"target_{stem}{suf}.csv")
+            tt, v = _read_target(files[n])
+            t[n], u[n] = tt, v / 1000.0 / biasmod.CHAN[n]["gain"]
+        if len(t["EO1"]) != len(t["EO2"]) or np.abs(t["EO1"] - t["EO2"]).max() > 1e-6:
+            raise RuntimeError(f"{stem}: X1 and X2 targets are not on one time grid")
+        dt = float(t["EO1"][1] - t["EO1"][0]) * 1e-6
+        e = {n: 90.0 * float(u[n].max()) * biasmod.CHAN[n]["gain"] / biasmod.CHAN[n]["v90"]
+             for n in u}
+        w = awgmod.Wave(t["EO1"] * 1e-6, u, dt, f"target {stem}", rotation=e["EO1"] + e["EO2"],
+                        source="files", files=files)
+        w.ends = e
+        found = awgmod.check(w, eom, trig_hz=float(a.get("trig_hz") or 0) or None)
+        bad = [m for lv, m in found if lv == "FAIL"]
+        if bad:
+            raise RuntimeError(f"{w.label}: " + "; ".join(bad))
+        log(f"  {stem}: {w.n} points at {dt*1e6:g} us = {w.period*1e3:.3f} ms, peaks X1 "
+            f"{e['EO1']:.1f} / X2 {e['EO2']:.1f} deg, AWG {u['EO1'].max():.2f} / {u['EO2'].max():.2f} V")
+        waves.append(w)
+        ends.append((e["EO1"], e["EO2"]))
+        names.append(scanmod.safe_name(f"{base}_{stem}"))
+    return _ramp_sequence(st, cfg, parts, log, prov, base, waves, ends, names, sc, a)
+
+
+def _ramp_sequence(st, cfg, parts, log, prov, base, waves, ends, names, sc, a):
+    """One ramp scan per wave, interleaved per analyzer angle, the AWG loaded
+    live between them (stage_ramps and stage_targets)."""
+    sg, link, rot, sess, eom, bench = parts
     channels = cfgmod.channel_roles(cfg)
     roles = {r: ch for ch, (r, _n) in channels.items()}
     chroles = {ch: r for ch, (r, _n) in channels.items()}
@@ -554,8 +624,8 @@ def stage_transients(st, cfg, parts, log, ask, prov):
     log(f"Stage {st['name']} done: holds " + ", ".join(f"{h:g}" for h in hold_list) + " ms")
 
 
-STAGES = {"grid": stage_grid, "ramps": stage_ramps, "compensate": stage_compensate,
-          "transients": stage_transients}
+STAGES = {"grid": stage_grid, "ramps": stage_ramps, "targets": stage_targets,
+          "compensate": stage_compensate, "transients": stage_transients}
 
 
 def main(argv=None):
