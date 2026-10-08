@@ -320,7 +320,13 @@ Yes.
 background subtraction, the per-angle transmission and dropping missed-lock
 shots (with the existing drift correction), and one line saying what each
 correction did to the shown scan - what was subtracted and where it came
-from, the drift, the per-angle gains, the shots dropped. The Corrections tab
+from, the drift, the per-angle gains, the shots dropped. The per-angle gains are
+fitted only from a record whose polarization sweeps >= 20 deg and come out
+within 0.8..1.25: with the polarization standing still they trade off
+against the Malus terms (7 Oct, an X1 0 deg ramp: -0.83..1.57, Imax 3.8 V
+for a measured 5.9 V). A sequence member that does not sweep takes them from
+the sibling that sweeps furthest at the same angles (same mount), and the
+line says which. The Corrections tab
 draws them, and *Borrow dark / background from another scan...* applies an
 earlier measurement to the shown scan after the fact (written to its
 manifest; *Remove borrowed* takes it out).
@@ -699,6 +705,10 @@ Map draws block means over ~4000 columns (a 19 x 100k mesh took 2.4 s).
 ```
 python tests/run_tests.py
 ```
+
+The suites run side by side (~3.5 min, as long as `test_gui` alone; one
+after another they took ~5). `run_tests.py gui awg` runs only those,
+`-q` prints only the failures and the times, `--serial` runs them in turn.
 
 | suite | covers |
 |---|---|

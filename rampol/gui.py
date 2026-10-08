@@ -5176,6 +5176,43 @@ class App:
             self.show_scan.set(os.path.dirname(p))
             self.do_load_shown()
 
+    def _sibling_gains(self, d, theta, correct_drift, opts):
+        """Worker: (gains, name) from the sequence sibling that sweeps the
+        furthest and identifies its per-angle factors at the same analyzer
+        angles, or None."""
+        ser = (d.manifest.get("plan") or {}).get("series") or {}
+        out = os.path.dirname(os.path.normpath(d.folder))
+        cands = []
+        for n in ser.get("members") or []:
+            if n == d.name:
+                continue
+            mp = os.path.join(out, n, f"{n}_scan.json")
+            try:
+                with open(mp, encoding="utf-8") as fh:
+                    e = (json.load(fh).get("drive") or {}).get("ends_deg") or {}
+            except (OSError, ValueError):
+                continue
+            cands.append((abs(float(e.get("X1", 0))) + abs(float(e.get("X2", 0))), n))
+        sg = self.load_sg()
+        a = self.cfg["analysis"]
+        for _reach, n in sorted(cands, reverse=True):
+            p = os.path.join(out, n)
+            try:
+                cache = self.scan_cache.setdefault(os.path.normcase(os.path.abspath(p)), {})
+                ds = an.load_scan(p, sg.load_capture, trim=int(a["trim"]),
+                                  lock_tol=float(a.get("lock_tol", 0.0)) if opts["lock"]
+                                  else 0.0, cache=cache)
+                ds.subtract_dark = opts["sub_dark"]
+                th, I, _sem, _st = an.scan_matrix(ds, "scan", correct_drift)
+            except (OSError, ValueError):
+                continue
+            if len(th) != len(theta) or np.max(np.abs(np.asarray(th) - np.asarray(theta))) > 0.05:
+                continue
+            g, _why = an.gains_usable(th, I)
+            if g is not None:
+                return g, n
+        return None
+
     def analyse(self, path, correct_drift=True, opts=None):
         """Worker thread: everything it needs from the window is passed in
         (opts: the plot bar's Apply switches, read on the Tk thread)."""
@@ -5203,6 +5240,15 @@ class App:
         except ValueError:
             res["corr"] = an.corrections_summary(d, None)
             return res                    # fewer than 3 angles so far: traces only
+        if opts["gains"] and pol.get("angle_gain") is None and pol.get("gain_note"):
+            # a ramp that does not sweep (X1 0 in a sequence): the same mount
+            # and angles as its siblings, so their factors
+            got = self._sibling_gains(d, pol["theta"], correct_drift, opts)
+            if got is not None:
+                g, src = got
+                note = pol["gain_note"]
+                pol = an.polarization(d, correct_drift=correct_drift, angle_gain=g)
+                pol["gain_from"], pol["gain_note"] = src, note
         res["corr"] = an.corrections_summary(d, pol)
         res.update(pol=pol, dips=an.dip_er(pol, polarizer_er=a["polarizer_er"]),
                    refine=an.refine_result(d, pol, polarizer_er=a["polarizer_er"]),

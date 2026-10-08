@@ -285,6 +285,14 @@ def angle_gain_checks():
     err = lambda f: np.max(np.abs((f["psi"] - psi + 90) % 180 - 90))
     check("and the azimuth error drops", err(fixed) < 0.2 * err(plain),
           f"{err(plain) * 1e3:.0f} -> {err(fixed) * 1e3:.0f} mdeg peak")
+    g2, why = an.gains_usable(th, I)
+    check("a sweeping record identifies them (gains_usable)", g2 is not None and not why, why)
+    # 7 Oct: an X1 0 deg ramp - the polarization stands still and the
+    # factors trade off against a0/c2/s2 (they came out -0.83 .. 1.57)
+    still = g_true[:, None] * malus(th, np.full(len(t), -90.0), 5.2, np.full(len(t), 1000.0)) \
+        + rng.normal(0, 1.1e-3, (len(th), len(t)))
+    g3, why = an.gains_usable(th, still)
+    check("a record that does not sweep: none, and says why", g3 is None and "sweeps" in why, why)
 
 
 def time_map_checks():

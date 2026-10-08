@@ -438,7 +438,11 @@ def corrections_summary(d, pol=None):
     g = pol.get("angle_gain") if pol else None
     if g is not None:
         out["gains"] = {"min": float(g.min()), "max": float(g.max())}
-        parts.append(f"angle gains {(g.min()-1)*100:+.1f}..{(g.max()-1)*100:+.1f} %")
+        src = pol.get("gain_from")
+        parts.append(f"angle gains {(g.min()-1)*100:+.1f}..{(g.max()-1)*100:+.1f} %"
+                     + (f" (from {src})" if src else ""))
+    elif pol and pol.get("gain_note"):
+        parts.append("no angle gains: " + pol["gain_note"])
     drop = sum(s.get("rejected", 0) for s in d.steps)
     tot = sum(s.get("nb", 0) + s.get("rejected", 0) for s in d.steps
               if s["kind"] not in OFFSET_KINDS)
@@ -787,23 +791,65 @@ def angle_gains(theta_deg, I, iters=30):
     return g
 
 
+# The per-angle factors are identifiable only while the polarization sweeps:
+# with it standing still they trade off against a0 / c2 / s2 (7 Oct 2026, an
+# X1 0 deg ramp: g = -0.83 .. 1.57, Imax 3.8 V where 5.9 V was measured; the
+# 22.5 .. 90 deg ramps of the same sequence agreed on the 5 Oct pattern).
+GAIN_SWEEP_DEG = 20.0
+GAIN_RANGE = (0.8, 1.25)
+
+
+def azimuth_sweep(th, I, every=50):
+    """How far (deg) the polarization azimuth moves over the record, from a
+    fit on every `every`-th sample (cheap)."""
+    f = harmonic_fit(th, I[:, ::max(1, int(every))], None)
+    ok = f["B"] > 0.05 * np.maximum(f["a0"], 1e-12)
+    if ok.sum() < 3:
+        return 0.0
+    return float(np.ptp(unwrap_psi(f["psi"][ok])))
+
+
+def gains_usable(th, I):
+    """(g or None, why): the per-angle factors when the record identifies
+    them - the azimuth sweeps >= GAIN_SWEEP_DEG and every factor lands in
+    GAIN_RANGE - else None and the reason."""
+    sweep = azimuth_sweep(th, I)
+    if sweep < GAIN_SWEEP_DEG:
+        return None, (f"azimuth sweeps {sweep:.1f} deg (< {GAIN_SWEEP_DEG:g}): the per-angle "
+                      f"factors are not identifiable")
+    g = angle_gains(th, I)
+    if g.min() < GAIN_RANGE[0] or g.max() > GAIN_RANGE[1]:
+        return None, (f"fitted per-angle factors {g.min():.2f}..{g.max():.2f} are outside "
+                      f"{GAIN_RANGE[0]:g}..{GAIN_RANGE[1]:g}: not used")
+    return g, ""
+
+
 def polarization(d, correct_drift=True, diagnostics=None, angle_gain=None):
     """The full per-sample result for a scan: harmonic_fit plus psi_u
     (unwrapped azimuth), rotation (psi_u minus its rest value), t, and the
     drift record.
 
     angle_gain: fit a transmission factor per analyzer angle (angle_gains) and
-    divide it out first. Default: on when there are >= 8 angles covering
-    >= 150 deg - with fewer the factors trade off against the polarization."""
+    divide it out first. Default (None): when there are >= 8 angles covering
+    >= 150 deg (with fewer the factors trade off against the polarization)
+    and gains_usable says the record identifies them; pol['gain_note'] says
+    why not. An array: those factors (one per angle, e.g. a sequence
+    sibling's), used as given. False: none."""
     th, I, sem, steps = scan_matrix(d, "scan", correct_drift)
     if len(th) < 3:
         raise ValueError(f"{len(th)} analyzer angles measured - need at least 3")
-    if angle_gain is None:
+    gains, note = None, ""
+    if isinstance(angle_gain, np.ndarray):
+        if len(angle_gain) != len(th):
+            raise ValueError(f"{len(angle_gain)} angle gains for {len(th)} angles")
+        gains = np.asarray(angle_gain, float)
+    elif angle_gain is None:
         span = harmonic_fit(th, I[:, :2], None)["theta_span"] if len(th) >= 3 else 0
-        angle_gain = len(th) >= 8 and span >= 150
-    gains = None
-    if angle_gain:
+        if len(th) >= 8 and span >= 150:
+            gains, note = gains_usable(th, I)
+    elif angle_gain:
         gains = angle_gains(th, I)
+    if gains is not None:
         I = I / gains[:, None]
         sem = sem / gains
     fit = harmonic_fit(th, I, sem, diagnostics)
@@ -819,7 +865,8 @@ def polarization(d, correct_drift=True, diagnostics=None, angle_gain=None):
     fit.update(t=d.t, theta=th, I=I, steps=steps, psi_u=psi_u,
                psi_rest=psi_rest, rotation=psi_u - psi_rest,
                dark=dark, ref_clocks=clocks, ref_levels=levels,
-               drift_resid=drift_residual(clocks, levels), angle_gain=gains)
+               drift_resid=drift_residual(clocks, levels), angle_gain=gains,
+               gain_note=note)
     return fit
 
 
