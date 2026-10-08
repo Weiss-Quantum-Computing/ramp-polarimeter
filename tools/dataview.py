@@ -195,10 +195,24 @@ class Viewer(tk.Tk):
             else:
                 d = an.load_scan(folder, self.sg.load_capture, cache=self.cache.setdefault(folder, {}))
                 d.subtract_dark = not self.raw.get()
-                pol = an.polarization(d)
+                note = ""
+                try:
+                    pol = an.polarization(d)
+                except ValueError as exc:
+                    # one or two analyzer angles (the slew sweeps): traces only
+                    th, I, sem, steps = an.scan_matrix(d, "scan")
+                    pol = {"theta": th, "I": I, "steps": steps, "rotation": None, "no_fit": str(exc)}
+                    note = f" - {exc}: traces only, no fit"
                 self.cur = ("scan", folder, {"d": d, "pol": pol, "er": None, "direct": None})
                 self._fill_angles(d)
-            self.status.set(f"{name} ({kind})")
+            self.status.set(f"{name} ({kind}){note}")
+            # land on a tab that applies to this kind of run
+            tab = self.nb.tab(self.nb.select(), "text")
+            bias_tabs, scan_tabs = ("Points", "Null scan", "Tracking", "Summary"), ("Traces", "Fit", "ER(t)", "Summary")
+            if kind == "bias" and tab not in bias_tabs:
+                self.nb.select(self.tabs["Points"])
+            elif kind != "bias" and tab not in scan_tabs:
+                self.nb.select(self.tabs["Traces"])
         except Exception as exc:
             self.status.set(f"{name}: {exc}")
             traceback.print_exc()
@@ -431,6 +445,8 @@ class Viewer(tk.Tk):
     def _select_near(self):
         data = self.cur[2]
         pol = data["pol"]
+        if pol.get("no_fit"):
+            return
         crossed = (pol["psi_rest"] + 90) % 180
         self.angle_list.select_clear(0, "end")
         for k, s in enumerate(self._angles):
@@ -468,14 +484,18 @@ class Viewer(tk.Tk):
             if r in d.roles:
                 m = np.mean([s_["v"][r] for s_ in pol["steps"]], axis=0)
                 mon_sum += K_MON[r] * (m - m[d.t < -0.1e-3].mean())
-        sign = -1.0 if np.ptp(mon_sum) > 1 and np.corrcoef(pol["rotation"], mon_sum)[0, 1] < 0 else 1.0
-        ax2.plot(t, sign * pol["rotation"], "k", lw=0.7, label="light rotation (fit, monitors' sense, deg)")
+        sign = -1.0 if pol.get("rotation") is not None and np.ptp(mon_sum) > 1 and np.corrcoef(pol["rotation"], mon_sum)[0, 1] < 0 else 1.0
+        if pol.get("rotation") is not None:
+            ax2.plot(t, sign * pol["rotation"], "k", lw=0.7, label="light rotation (fit, monitors' sense, deg)")
         ax2.set(xlabel="t (ms)", ylabel="deg / V"); ax2.legend(fontsize=6); ax2.grid(alpha=0.3)
         self.trace_plot.draw()
 
     def _draw_fit(self):
         data = self.cur[2]
         d, pol = data["d"], data["pol"]
+        if pol.get("no_fit"):
+            self.status.set(f"{d.name}: {pol['no_fit']} - only the Traces tab applies")
+            fig = self.fit_plot.clear(); fig.text(0.5, 0.5, pol['no_fit'] + ' - only the Traces tab applies', ha='center'); self.fit_plot.draw(); return
         fig = self.fit_plot.clear()
         t = d.t * 1e3
         ax1 = fig.add_subplot(411); ax2 = fig.add_subplot(412, sharex=ax1); ax3 = fig.add_subplot(413, sharex=ax1); ax4 = fig.add_subplot(414, sharex=ax1)
@@ -499,6 +519,9 @@ class Viewer(tk.Tk):
     def _draw_er(self):
         data = self.cur[2]
         d, pol = data["d"], data["pol"]
+        if pol.get("no_fit"):
+            self.status.set(f"{d.name}: {pol['no_fit']} - only the Traces tab applies")
+            fig = self.er_plot.clear(); fig.text(0.5, 0.5, pol['no_fit'] + ' - only the Traces tab applies', ha='center'); self.er_plot.draw(); return
         half, box = float(self.er_half.get()), float(self.er_box.get())
         er = an.er_vs_time(d, pol, half_deg=half, box_us=box, stride=1, gains=pol.get("angle_gain"))
         data["er"] = er
@@ -545,6 +568,9 @@ class Viewer(tk.Tk):
     def _scan_summary(self):
         data = self.cur[2]
         d, pol = data["d"], data["pol"]
+        if pol.get("no_fit"):
+            self.status.set(f"{d.name}: {pol['no_fit']} - only the Traces tab applies")
+            self.summary.delete('1.0', 'end'); self.summary.insert('1.0', f'{d.name}: ' + pol['no_fit'] + ' - no fit, no ER; see the Traces tab'); return
         self.summary.delete("1.0", "end")
         if data.get("direct") is None:
             data["direct"] = an.direct_er(d, pol, gains=pol.get("angle_gain"))
