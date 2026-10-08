@@ -122,6 +122,22 @@ class FlakyAWG(sim.FakeAWG):
         super().set_output(ch, on)
 
 
+def record_checks():
+    print("\ndry-run passes on record (a restart keeps the day's passes)")
+    import json
+    tmp = tempfile.mkdtemp(prefix="rampol-dryrec-")
+    os.makedirs(os.path.join(tmp, "awg_dryrun"))
+    rec = lambda stem, reps: json.dump({"reports": reps}, open(
+        os.path.join(tmp, "awg_dryrun", stem + ".json"), "w", encoding="utf-8"))
+    rec("20261007-170000_a", [{"names": ["RP1aaaaaaaa", "RP2bbbbbbbb"], "ok": True},
+                              {"names": ["RP1cccccccc", "RP2bbbbbbb"], "ok": True}])
+    rec("20261007-180000_b", [{"names": ["RP1cccccccc", "RP2bbbbbbb"], "ok": False}])
+    rec("20261006-180000_c", [{"names": ["RP1dddddddd", "RP2bbbbbbbb"], "ok": True}])
+    got = awg.passes_on_record(tmp, "20261007")
+    check("today's pass counts; a later failure undoes one; another day's does not count",
+          set(got) == {("RP1aaaaaaaa", "RP2bbbbbbbb")}, sorted(got))
+
+
 def session_checks():
     print("\nthe session: outputs, names, park")
     bench = sim.Bench(seed=1)
@@ -322,6 +338,15 @@ def calib_checks():
           and abs(fit["EO1"]["v90_kv"] - 5.1283 / 1.01) < 1e-9, rep[0])
 
 
+def rate_checks():
+    print("\nthe fastest point of a ramp")
+    w = awg.ramp_hold(90.0, {"rise_ms": 1.0, "fall_ms": 1.0, "edge": "cosine"},
+                      idle={"EO1": 0.0, "EO2": 0.0})
+    r = awg.peak_rate(w)
+    check("a 1 ms cosine edge to 90 deg peaks at pi/2 x 90 deg/ms",
+          abs(r / (np.pi / 2 * 90.0) - 1) < 0.03, f"{r:.1f} deg/ms")
+
+
 def bias_checks():
     print("\nbias plateaus with an idle trim")
     p = dict(bias.PLAN, idle={"EO1": 0.026, "EO2": 0.078})
@@ -340,9 +365,11 @@ def main():
         print(f"(EOM-ILC not loaded: {exc} - limit checks skipped)")
     wave_checks(eom)
     file_checks(eom)
+    record_checks()
     session_checks()
     rule_checks()
     calib_checks()
+    rate_checks()
     bias_checks()
     print()
     if FAILS:

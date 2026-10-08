@@ -51,37 +51,67 @@ def _offsets(dark_mode, bg_mode, stray_vdiv, scan_name, drive):
 
 
 def ramp_scan(s, dark_mode="none", bg_mode="measure", stray_vdiv=None, drive=None,
-              name="scan"):
+              name="scan", extra=()):
     """A ramp scan's steps (the Ramp scan tab's settings `s`): the dark /
     background first, then the angles with the reference returns. drive:
-    (x1, x2) deg when this window's AWG plays a ramp, else None."""
+    (x1, x2) deg when this window's AWG plays a ramp, else None. extra:
+    angles added after the grid (a sequence member's hold-null angles,
+    scan.hold_angles), marked hold_null."""
     angles = scanmod.ordered(scanmod.angle_list(s["start"], s["stop"], s["step"]), s["order"])
+    extra = [float(a) for a in extra]
     steps = _offsets(dark_mode, bg_mode, stray_vdiv, name, drive)
-    for st in scanmod.build_steps(angles, int(s.get("ref_every", 0)), s.get("ref_angle", 45.0)):
+    for st in scanmod.build_steps(angles + extra, int(s.get("ref_every", 0)),
+                                  s.get("ref_angle", 45.0)):
         steps.append({"kind": st["kind"], "angle": float(st["target"]), "scan": name,
                       "x1": drive[0] if drive else None, "x2": drive[1] if drive else None,
                       "shots": int(s["shots"])})
+        if st["kind"] == "scan" and st["target"] in extra:
+            steps[-1]["note"] = "hold null"
     for st in steps:
         st.setdefault("shots", int(s["shots"]))
         st.setdefault("rel", False)
     return steps
 
 
-def sequence(s, ends, order, names, dark_mode="none", bg_mode="measure", stray_vdiv=None):
-    """The AWG sequence's steps: one ramp scan per (X1, X2) end point at the
-    Ramp scan tab's angles, interleaved (every ramp at one angle before the
-    analyzer moves) or one setting at a time - as _run_seq takes them. The
-    dark / background is taken once, in the first scan."""
-    per = [ramp_scan(s, "none", "none", None, e, n) for e, n in zip(ends, names)]
-    n = len(per[0])
+def interleave(per, order):
+    """(k, i) pairs: which member's step comes next. Interleaved: step i of
+    every member before step i + 1 (the analyzer stays put while the ramps
+    change); members may differ in length (their own hold-null angles come
+    after the shared grid), so the shorter ones just drop out at the end."""
+    n = max((len(x) for x in per), default=0)
     if str(order).startswith("one"):
-        idx = [(k, i) for k in range(len(per)) for i in range(n)]
-    else:
-        idx = [(k, i) for i in range(n) for k in range(len(per))]
+        return [(k, i) for k in range(len(per)) for i in range(len(per[k]))]
+    return [(k, i) for i in range(n) for k in range(len(per)) if i < len(per[k])]
+
+
+def sequence(s, ends, order, names, dark_mode="none", bg_mode="measure", stray_vdiv=None,
+             extras=None):
+    """The AWG sequence's steps: one ramp scan per (X1, X2) end point at the
+    Ramp scan tab's angles (plus each member's own `extras` angles),
+    interleaved (every ramp at one angle before the analyzer moves) or one
+    setting at a time - as _run_seq takes them. The dark / background is
+    taken once, in the first scan."""
+    extras = extras or [()] * len(ends)
+    per = [ramp_scan(s, "none", "none", None, e, n, x) for e, n, x in zip(ends, names, extras)]
     steps = _offsets(dark_mode, bg_mode, stray_vdiv, names[0], None)
     for st in steps:
         st.update(shots=int(s["shots"]), rel=False)
-    return steps + [per[k][i] for k, i in idx]
+    return steps + [per[k][i] for k, i in interleave(per, order)]
+
+
+def sampling(span_s, points, peak_rate_deg_per_ms):
+    """What one scope sample means on a ramp: (dt_us, deg per sample). The
+    scope decimates the record to at most `points` over the screen `span_s`.
+    7 Oct 2026: 20000 points over a 270 ms screen = 14 us, 1.3 deg per sample
+    at the 90 deg/ms peak of a 1 ms cosine edge to 90 deg - the edges and the
+    crossing ERs of that series were sampling-limited."""
+    if not span_s or not points or points <= 0:
+        return float("nan"), float("nan")
+    dt = float(span_s) / float(points)
+    return dt * 1e6, dt * 1e3 * float(peak_rate_deg_per_ms)
+
+
+SAMPLING_WARN_DEG = 0.3
 
 
 def fixed_rotations(p, biases, name="bias", ladder=4):

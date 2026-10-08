@@ -1197,11 +1197,13 @@ class App:
 
         # what is set once: variables here, widgets in Settings...
         for k in ("dt_us", "idle1", "idle2", "trig_hz", "scope_before_ms", "scope_after_ms",
-                  "dry_shots", "seq_settle_s"):
+                  "dry_shots", "seq_settle_s", "seq_null_half_deg", "seq_null_points",
+                  "seq_crossed_deg", "seq_sense"):
             var(k)
         for k, d in (("dry_ch1", "3"), ("dry_ch2", "4")):
             self.a_choice[k] = tk.StringVar(value=d)
         self.a_fit_tb = tk.BooleanVar(value=True)
+        self.a_null = tk.BooleanVar(value=True)
         self.a_never = tk.BooleanVar(value=True)
         self.a_require = tk.BooleanVar(value=True)
 
@@ -1402,6 +1404,21 @@ class App:
         ttk.Label(s, text="On Load and for Find in the hold; the dry run always shows the "
                           "whole record.", foreground="#666").pack(anchor="w", padx=6, pady=(0, 3))
         line(s, ["sequence: wait", ("e", "seq_settle_s", 5), "s after each waveform change"])
+        s = sect("Sequence: each ramp's hold near crossed")
+        rr = ttk.Frame(s)
+        rr.pack(fill="x", padx=6, pady=2)
+        ttk.Checkbutton(rr, text="add", variable=self.a_null).pack(side="left")
+        ttk.Entry(rr, textvariable=self.av["seq_null_points"], width=3).pack(side="left", padx=2)
+        ttk.Label(rr, text="angles across +-").pack(side="left")
+        ttk.Entry(rr, textvariable=self.av["seq_null_half_deg"], width=4).pack(side="left", padx=2)
+        ttk.Label(rr, text="deg of the hold's crossed angle, and the bright angle").pack(
+            side="left")
+        line(s, ["crossed at rest", ("e", "seq_crossed_deg", 6), "deg (analyzer), hold crossed "
+                 "at that +", ("e", "seq_sense", 4), "x (X1 + X2)"],
+             "Measured 7 Oct 2026: the light turns -(X1 + X2) in the analyzer frame (sense -1); "
+             "a loaded scan's rest azimuth + 90 is the crossed-at-rest angle (the log says it). "
+             "With a 22.5 deg grid the 15 / 30 / 60 / 75 deg holds sat 6-9 deg from crossed and "
+             "their hold ER was a useless bound. Angles within 1 deg of the grid are not added.")
         s = sect("Dry run wiring")
         line(s, ["AWG CH1 -> scope CH", ("c", "dry_ch1", 2), "CH2 -> scope CH",
                  ("c", "dry_ch2", 2), ("e", "dry_shots", 3), "shots per waveform"])
@@ -1580,6 +1597,15 @@ class App:
             self.awg_sess = awgmod.Session(awg, ib, log=self.log)
         self.awg_sess.never_float = bool(a.get("never_float", True))
         self.awg_sess.require_dry_run = bool(a.get("require_dry_run", True))
+        if not getattr(self.awg_sess, "_records_read", False):
+            # today's passes on disk: a restart does not undo a dry run
+            self.awg_sess._records_read = True
+            got = awgmod.passes_on_record(c["outdir"])
+            new = {k: v for k, v in got.items() if k not in self.awg_sess.verified}
+            self.awg_sess.verified.update(new)
+            if new:
+                self.log(f"AWG: {len(new)} waveform(s) passed a dry run earlier today "
+                         f"(awg_dryrun records) - counted as dry-run")
         return self.awg_sess
 
     def _awg_drive_info(self):
@@ -1634,6 +1660,38 @@ class App:
 
     def _seq_names(self, base, ends):
         return [scanmod.safe_name(f"{base}_X1_{e1:g}_X2_{e2:g}") for e1, e2 in ends]
+
+    def _seq_extras(self, c, ends):
+        """Per member: the analyzer angles added for its hold's null (AWG
+        settings), [] each when off. The grid is the Ramp scan tab's."""
+        a, sc = c["awg"], c["scan"]
+        if not a.get("seq_null_angles", True):
+            return [[] for _ in ends]
+        grid = scanmod.angle_list(sc["start"], sc["stop"], sc["step"])
+        half = float(a.get("seq_null_half_deg", 3.0) or 0)
+        pts = int(a.get("seq_null_points", 3) or 1)
+        crossed = float(a.get("seq_crossed_deg", 0.0) or 0)
+        sense = float(a.get("seq_sense", -1.0) or -1)
+        return [scanmod.hold_angles(crossed, e1 + e2, half, pts, grid, sense=sense)
+                for e1, e2 in ends]
+
+    def _seq_sampling(self, c, waves):
+        """A WARN when the scope's samples are too coarse for the ramps'
+        edges: deg per sample at the fastest point of the fastest ramp."""
+        from . import plan as planmod
+        span = self._plan_span(c, waves)
+        pts = int(c["scan"].get("points") or 0)
+        rate = max((awgmod.peak_rate(w) for w in waves), default=0.0)
+        dt_us, per = planmod.sampling(span, pts, rate)
+        if not np.isfinite(per):
+            return []
+        msg = (f"scope sampling: {pts} points over the {span*1e3:.0f} ms screen = {dt_us:.1f} us, "
+               f"{per:.2f} deg per sample at the ramps' peak {rate:.0f} deg/ms")
+        if per > planmod.SAMPLING_WARN_DEG:
+            return [("WARN", msg + f" (> {planmod.SAMPLING_WARN_DEG:g}): the edges and the "
+                                   f"crossing ERs will be sampling-limited - more points "
+                                   f"(Ramp scan settings) or a shorter screen (AWG settings)")]
+        return [("INFO", msg)]
 
     def _seq_text(self):
         try:
@@ -1694,6 +1752,8 @@ class App:
             return
         try:
             ends, waves, found = self._seq_waves(c)
+            extras = self._seq_extras(c, ends)
+            found += self._seq_sampling(c, waves)
         except (ValueError, OSError) as exc:
             self.log(f"Sequence: {exc}")
             return
@@ -1769,7 +1829,6 @@ class App:
         else:
             angles = scanmod.ordered(scanmod.angle_list(sc["start"], sc["stop"], sc["step"]),
                                      sc["order"])
-            steps = scanmod.build_steps(angles, int(sc["ref_every"]), sc["ref_angle"])
             offs = [{"kind": k, "target": 0.0} for k in pre]
             stray = self._stray_scale(c) if len(pre) == 2 else None
             if stray:
@@ -1783,11 +1842,26 @@ class App:
                 plan["sequence"] = dict(c.get("sequence") or cfgmod.DEFAULTS["sequence"])
             prov = self._provenance(c)
             order = c["awg"].get("seq_order", SEQ_ORDERS[0])
-            for k, (r, w, (e1, e2)) in enumerate(zip(runs, waves, ends)):
+            if any(extras):
+                self.log(f"  hold-null angles (AWG settings: crossed at rest "
+                         f"{float(c['awg'].get('seq_crossed_deg', 0) or 0):g} deg, sense "
+                         f"{float(c['awg'].get('seq_sense', -1) or -1):g}): "
+                         + "; ".join(f"X1 {e1:g}/X2 {e2:g}: "
+                                     + (", ".join(f"{a:g}" for a in x) if x else "none needed")
+                                     for (e1, e2), x in zip(ends, extras)))
+            for k, (r, w, (e1, e2), x) in enumerate(zip(runs, waves, ends, extras)):
+                # the member's own hold-null angles after the shared grid, so
+                # interleaving keeps the analyzer put through the grid
+                steps = scanmod.build_steps(angles + list(x), int(sc["ref_every"]),
+                                            sc["ref_angle"])
+                for st in steps:
+                    if st["kind"] == "scan" and st["target"] in x:
+                        st["hold_null"] = True
                 pl = dict(plan, series={"base": base, "index": k, "of": len(runs),
                                         "ends_deg": {"X1": e1, "X2": e2}, "order": order,
-                                        "members": names})
-                r.new(pl, (offs if k == 0 else []) + [dict(x) for x in steps],
+                                        "members": names},
+                          hold_angles=list(x))
+                r.new(pl, (offs if k == 0 else []) + [dict(st) for st in steps],
                       extra={"zero_deg": float(c["ell_zero_deg"]), "provenance": prov,
                              "drive": self._drive_info(w, s is not None and s.is_verified(w))})
             reuse = [k for k, m in (("dark", dm), ("background", bm)) if m == "reuse latest"]
@@ -1931,11 +2005,8 @@ class App:
                          f"is off screen (tick 'set the scope from' in AWG Settings...)")
         self._seq_share_offsets(runs)
         steps = [[x for x in r.manifest["steps"] if x["kind"] in ("scan", "ref")] for r in runs]
-        n = min(len(x) for x in steps)
-        if str(a.get("seq_order", "")).startswith("one"):
-            order = [(k, i) for k in range(len(runs)) for i in range(n)]
-        else:
-            order = [(k, i) for i in range(n) for k in range(len(runs))]
+        from . import plan as planmod
+        order = planmod.interleave(steps, a.get("seq_order", ""))
         todo = [(k, i) for k, i in order if steps[k][i].get("status") != "done"]
         settle = float(a.get("seq_settle_s", 1.0) or 0)
         from .bias import eta
@@ -2785,12 +2856,17 @@ class App:
         from . import plan as planmod
         base = scanmod.safe_name(c.get("scan_name") or "sequence")
         stray = self._stray_scale(c)
+        extras = self._seq_extras(c, ends)
         steps = planmod.sequence(c["scan"], ends, c["awg"].get("seq_order", SEQ_ORDERS[0]),
                                  self._seq_names(base, ends), self.dark_mode.get(),
-                                 self.bg_mode.get(), stray and stray["vdiv"])
+                                 self.bg_mode.get(), stray and stray["vdiv"], extras)
+        for lv, msg in self._seq_sampling(c, waves):
+            self.log(f"  {lv}: {msg}")
         self._show_plan(f"AWG sequence {base}", steps, c["scan"],
-                        "the analyzer angles are the Ramp scan tab's, the same for every ramp "
-                        "(the null moves with the rotation); the ramps themselves: AWG tab",
+                        "the analyzer angles are the Ramp scan tab's, the same for every ramp"
+                        + (", plus each ramp's own hold-null angles (AWG settings)"
+                           if any(extras) else " (the null moves with the rotation)")
+                        + "; the ramps themselves: AWG tab",
                         settle_s=float(c["awg"].get("seq_settle_s", 1.0) or 0),
                         span_s=self._plan_span(c, waves))
 
@@ -4214,6 +4290,7 @@ class App:
         for k in self.a_choice:
             self.a_choice[k].set(str(a.get(k, awgmod.DEFAULTS.get(k, ""))))
         self.a_fit_tb.set(bool(a.get("fit_timebase", True)))
+        self.a_null.set(bool(a.get("seq_null_angles", True)))
         self.a_never.set(bool(a.get("never_float", True)))
         self.a_require.set(bool(a.get("require_dry_run", True)))
         self._awg_safety_text()
@@ -4281,6 +4358,7 @@ class App:
         for k in self.a_choice:
             a[k] = self.a_choice[k].get()
         a["fit_timebase"] = bool(self.a_fit_tb.get())
+        a["seq_null_angles"] = bool(self.a_null.get())
         a["never_float"] = bool(self.a_never.get())
         a["require_dry_run"] = bool(self.a_require.get())
         i = c["ilc"]
@@ -4990,6 +5068,36 @@ class App:
         scale = {"ch": pd_ch, "vdiv": vdiv, "offset": 3.0 * vdiv}
         run = self._new_run(d.name)
         run.load()
+        # a refine that stopped (an error, Stop): finish its steps rather than
+        # add a second set (the Ramp scan tab will not resume a sequence's
+        # member, and a new set would measure the same angles again)
+        left = [s for s in run.manifest["steps"]
+                if s["kind"] in ("null",) + tuple(an.OFFSET_KINDS) and s.get("pd_scale")
+                and s.get("status") != "done"]
+        if left:
+            ans = messagebox.askyesnocancel(
+                "Refine not finished",
+                f"{d.name} has {len(left)} refine step(s) not measured (the last refine "
+                f"stopped).\n\nYes = measure those (the windows and angles it planned)\n"
+                f"No = add a new set from the settings now\nCancel = do nothing",
+                parent=self.root)
+            if ans is None:
+                return
+            if ans:
+                self.run = run
+                self.log(f"Refine resumed: {len(left)} step(s) left in {d.name}")
+                offs = sorted({s["kind"] for s in left if s["kind"] in an.OFFSET_KINDS})
+                go = lambda: self.worker(lambda: self._run_scan(run, {"null"}),
+                                         done=self.scan_done)
+                if offs:
+                    # the beam block / PD cover prompt first, as on a first run
+                    self.offsets_then(run, offs, go)
+                else:
+                    go()
+                return
+            for s in left:
+                s["status"] = "skipped"
+            run.save()
         n_dark = sum(1 for s in run.manifest["steps"] if s["kind"] in an.OFFSET_KINDS
                      and s.get("pd_scale", {}).get("vdiv") == vdiv)
         steps = []
@@ -5379,6 +5487,29 @@ class App:
             if off:
                 self.log(f"  ! {len(off)} steps have samples off screen at their V/div "
                          f"- possibly clipped; see Diagnostics")
+            for note in an.malus_check(pol)[1]:
+                self.log(f"  ! {note}")
+            age = (res.get("corr") or {}).get("offset_age_h")
+            if age is not None:
+                self.log(f"  ! the subtracted dark / background is {age:.1f} h older than this "
+                         f"scan (it moves ~2 mV over a day at 1 V/div): measure a fresh one "
+                         f"- the rest ER floor is set by it")
+            crossed = pol["psi_rest"] + 90.0
+            try:
+                set_ = float(self.cfg["awg"].get("seq_crossed_deg", 0.0) or 0)
+            except (TypeError, ValueError):
+                set_ = 0.0
+            if abs((crossed - set_ + 90) % 180 - 90) > 0.5:
+                self.log(f"  crossed at rest = {crossed % 180:.2f} deg (rest azimuth + 90); "
+                         f"AWG settings has {set_:g} for the sequence's hold-null angles")
+            far = [p for p in res.get("direct", []) if p["kind"] == "static"
+                   and p.get("offset_limited") and p.get("seg", "").startswith("hold")]
+            if far:
+                self.log("  ! no analyzer angle near crossed in: "
+                         + "; ".join(f"{p['seg']} (nearest {p['off_deg']:+.1f} deg off: measure "
+                                     f"{p['crossed_deg']:.1f})" for p in far)
+                         + " - its static ER is a useless bound (the sequence's hold-null "
+                           "angles, AWG settings, add them)")
             prov = d.manifest.get("provenance")
             if prov:
                 self.log(f"  recorded with: {provenance.short(prov) or 'versions unknown'}")

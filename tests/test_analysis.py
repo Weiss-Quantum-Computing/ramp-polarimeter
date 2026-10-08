@@ -122,6 +122,16 @@ def scan_checks(sg):
           np.median([abs(x["imax_V"] / f - 1) for x, f in zip(cr, imax_fit)]) < 0.03)
     st = [x for x in dr if x["kind"] == "static"]
     check("static stretches measured (rest, hold, after)", len(st) >= 3, [x["seg"] for x in st])
+    # a 5 deg grid leaves the nearest angle up to 2.5 deg from crossed: Imax
+    # sin^2 of that is 10 mV against a model Imin of ~6 mV, so the static
+    # points are bounds, and they say which angle would have been crossed
+    check("static points whose offset outweighs the noise are lower bounds and name the "
+          "crossed angle",
+          all(x["lower"] for x in st if x["imin_from_offset_mV"] > x["sig_mV"])
+          and all(0 <= x["crossed_deg"] < 180 for x in st)
+          and all(abs((x["crossed_deg"] - x["theta"] - x["off_deg"] + 90) % 180 - 90) < 1e-6
+                  for x in st),
+          [(x["seg"], round(x["off_deg"], 2), x["bound_from"]) for x in st])
     print("\nMalus residual map and the polarization state")
     th_r, resid, z = an.malus_residual(pol)
     zr = float(np.sqrt(np.nanmean(z ** 2)))
@@ -256,6 +266,19 @@ def few_angles_checks():
     kinds = [s["kind"] for s in an.segments(t, rot)]
     check("a ramp to -180 is still rest / up / hold / down / after",
           kinds == ["rest", "up", "hold", "down", "after"], kinds)
+    # a 15 deg ramp: its hold is a hold too (until 7 Oct 2026 only |rotation|
+    # > 45 deg counted, and the XEO1 15 / 30 deg holds were labelled "after")
+    kinds = [s["kind"] for s in an.segments(t, rot / 12.0)]
+    check("a ramp to 15 deg: rest / up / hold / down / after",
+          kinds == ["rest", "up", "hold", "down", "after"], kinds)
+    # two levels: up to -180 and held, part of the way back to -120 and
+    # held, then home
+    lvl = np.where(t < 6e-3, np.where(t < 4.5e-3, rot, -180.0),
+                   np.where(t < 9.5e-3, -180 + 60 * np.minimum((t - 6e-3) / 1e-3, 1.0),
+                            -120 + 120 * np.minimum((t - 9.5e-3) / 1e-3, 1.0)))
+    kinds = [s["kind"] for s in an.segments(t, lvl)]
+    check("a static stretch after a part-way ramp down is a hold, the last one 'after'",
+          kinds == ["rest", "up", "hold", "down", "hold", "down", "after"], kinds)
     from rampol import checks
     plan = dict(config.DEFAULTS["scan"], start=0.0, stop=45.0, step=22.5)
     sg_prof = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"]).scope_profiles.PROFILES["msox2014a"]
@@ -356,9 +379,69 @@ def records_checks():
                                                     for r in rows])
 
 
+def hold_checks():
+    print("\nthe hold: departures from Malus, offset-limited static ER, stale offsets, "
+          "the hold-null angles")
+    th = np.arange(0, 360, 22.5)
+    t = np.linspace(-5e-3, 25e-3, 3001)
+    edge = lambda x: 0.5 * (1 - np.cos(np.pi * np.clip(x, 0, 1)))
+    rot = -45.0 * (edge((t - 1e-3) / 1e-3) - edge((t - 12e-3) / 1e-3))
+    psi = -90.0 + rot
+    rng = np.random.default_rng(5)
+    I = malus(th, psi, 5.4, 2000.0) + rng.normal(0, 1e-3, (len(th), len(t)))
+    # 7 Oct 2026 (XEO1 series): in the hold each analyzer angle reads up to
+    # +-15 mV off Malus, the same for every held voltage - add such a pattern
+    hold = (t > 2e-3) & (t < 12e-3)
+    I[:, hold] += 8e-3 * np.sin(np.deg2rad(3 * th))[:, None]
+    fit = an.harmonic_fit(th, I)
+    pol = dict(fit, t=t, rotation=rot, psi_u=an.unwrap_psi(fit["psi"]))
+    found, notes = an.malus_check(pol)
+    check("the hold's residual is flagged, the rest and after are not",
+          [f[0] for f in found] == ["hold"] and found[0][1] > 3 * found[0][2]
+          and len(notes) == 1, found)
+    check("the azimuth error scale is the residual over 2B, in degrees",
+          found and abs(found[0][3] - np.rad2deg(found[0][1] * 1e-3 / (2 * 5.4 / 2))) < 0.01,
+          found and found[0][3])
+    I2 = malus(th, psi, 5.4, 2000.0) + rng.normal(0, 1e-3, (len(th), len(t)))
+    f2 = an.harmonic_fit(th, I2)
+    check("a clean scan gives no note", an.malus_check(dict(f2, t=t, rotation=rot))[1] == [])
+
+    class D:
+        manifest = {"created": "2026-10-07T19:44:22"}
+    check("a borrowed background from the morning is 8.3 h old; the scan's own has no age",
+          abs(an.offset_age_h(D(), {"source": "test-7", "measured": "2026-10-07T11:24:03"})
+              - 8.34) < 0.01
+          and an.offset_age_h(D(), {"source": "this scan", "measured": "2026-10-07T11:24:03"})
+          is None)
+    grid = scan.angle_list(0, 337.5, 22.5)
+    got = scan.hold_angles(0.0, 15.0, 3.0, 3, grid)
+    check("a 15 deg ramp on the 22.5 deg grid: three angles across its null (345) and the "
+          "bright angle (75)", got == [342.0, 345.0, 348.0, 75.0], got)
+    got = scan.hold_angles(0.0, 90.0, 3.0, 3, grid)
+    check("a 90 deg ramp: 270 and 0 are on the grid already, so only +-3",
+          got == [267.0, 273.0], got)
+    got = scan.hold_angles(1.2, 90.0, 3.0, 3, grid, sense=-1.0)
+    check("crossed at rest 1.2 deg (the fit's psi_rest + 90): the null at 271.2",
+          got == [268.2, 271.2, 274.2, 1.2], got)
+    from rampol import plan as planmod
+    s = dict(config.DEFAULTS["scan"], start=0.0, stop=45.0, step=22.5, shots=2, ref_every=0)
+    steps = planmod.sequence(s, [(15.0, 0.0), (90.0, 0.0)], "interleaved", ["a", "b"],
+                             bg_mode="none", extras=[[342.0, 345.0], [267.0]])
+    order = [(x["scan"], x["angle"]) for x in steps]
+    check("interleaved members of unequal length: the grid in step, then each one's own "
+          "null angles",
+          order == [("a", 0.0), ("b", 0.0), ("a", 22.5), ("b", 22.5), ("a", 45.0), ("b", 45.0),
+                    ("a", 342.0), ("b", 267.0), ("a", 345.0)]
+          and [x.get("note") for x in steps[-3:]] == ["hold null"] * 3, order)
+    dt_us, per = planmod.sampling(0.27, 20000, 141.0)
+    check("20000 points over 270 ms at 141 deg/ms: 13.5 us, 1.9 deg per sample",
+          abs(dt_us - 13.5) < 0.01 and abs(per - 1.9) < 0.01, (dt_us, per))
+
+
 def main():
     sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
     records_checks()
+    hold_checks()
     angle_gain_checks()
     time_map_checks()
     few_angles_checks()

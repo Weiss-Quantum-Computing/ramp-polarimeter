@@ -291,6 +291,14 @@ def predict(wave, chan=None):
     return mon, rot
 
 
+def peak_rate(wave, chan=None):
+    """The fastest the rotation moves anywhere in the record, deg/ms."""
+    _, rot = predict(wave, chan)
+    if len(rot) < 2:
+        return 0.0
+    return float(np.max(np.abs(np.diff(rot))) / (wave.dt * 1e3))
+
+
 def max_deg(idle=None, chan=None, cap=AWG_CAP):
     """{EO1, EO2}: the most rotation each crystal can be driven to (deg)
     with its AWG channel at most `cap` volts - its idle level allowed for
@@ -424,6 +432,34 @@ def ilc_grid(idle):
 
 
 # ------------------------------------------------------------------- session
+def passes_on_record(outdir, day=None):
+    """{(CH1 name, CH2 name): summary} for the waveforms whose most recent
+    dry run on `day` (default today; 'YYYYMMDD') passed, read from
+    outdir/awg_dryrun/*.json. A pass is kept for the day it was taken: the
+    names are a hash of the samples, so the same name is the same waveform,
+    and a restart of the window does not change what the AWG plays."""
+    import datetime
+    import glob
+    import json
+    day = day or datetime.date.today().strftime("%Y%m%d")
+    out = {}
+    for f in sorted(glob.glob(os.path.join(outdir, "awg_dryrun", f"{day}-*.json"))):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                j = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for r in j.get("reports") or []:
+            key = tuple(r.get("names") or ())
+            if len(key) != 2:
+                continue
+            if r.get("ok"):
+                out[key] = {"label": r.get("label", ""), "record": os.path.basename(f)}
+            else:
+                out.pop(key, None)          # a later failure undoes an earlier pass
+    return out
+
+
 def names(wave):
     """(CH1 name, CH2 name) of a wave: its identity for the dry-run record."""
     return (wave_name(wave.u["EO1"], 1), wave_name(wave.u["EO2"], 2))

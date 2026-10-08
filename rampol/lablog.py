@@ -130,7 +130,8 @@ def scan_row(summary):
         "er_fit_holds": "; ".join(f"{x:.0f}" for x in holds),
         "drift_resid": s.get("drift_resid"),
         "fit_resid_mV": s.get("fit_residual_mV_median"),
-        "result": s.get("corrections", ""),
+        "result": "; ".join([x for x in [s.get("corrections", "")] + list(s.get("malus_notes") or [])
+                             if x]),
         "software": short({"software": prov.get("software")}) if prov else "",
         # what played into the Treks: this window's AWG when the scan says so
         "ilc": (f"AWG (this window): {s['drive'].get('label', '')}" if s.get("drive")

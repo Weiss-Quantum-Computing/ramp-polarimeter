@@ -116,6 +116,32 @@ def main():
     check("switches by state", hw.same_setting("ON", "1") and not hw.same_setting("ON", "0"))
     check("different settings differ", not hw.same_setting("NORMal", "AUTO")
           and not hw.same_setting("LEFT", "CENT"))
+    print("\na waveform read that comes back empty (7 Oct: int() with base 10: b'')")
+    scope, link, bench = bench_scope(sg)
+    logs = []
+    link.log = logs.append
+    rec0, fails = scope.record, {"n": 0}
+
+    def glitchy(*a, **k):
+        if fails["n"] < 1:
+            fails["n"] += 1
+            raise ValueError("invalid literal for int() with base 10: b''")
+        return rec0(*a, **k)
+    scope.record = glitchy
+    got = []
+    link.acquire_blocks([1, 2], "single", 3, 3, points=2000,
+                        on_block=lambda k, recs, hits: got.append(k))
+    check("one failed read: that shot is taken again and the block goes on",
+          got == [0, 1, 2] and any("taken again" in m for m in logs), (got, logs[:1]))
+    fails["n"] = -10
+    err = None
+    try:
+        link.acquire_blocks([1], "single", 1, 1, points=2000)
+    except ValueError as exc:
+        err = str(exc)
+    check("reads that keep failing still stop it (after the retries)", err is not None, err)
+    scope.record = rec0
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED: {', '.join(FAILS)}")

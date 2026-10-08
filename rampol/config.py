@@ -186,6 +186,15 @@ DEFAULTS = {
             # Ramp scan tab's); settle after each live change of waveform
             "seq_x1": "45", "seq_x2": "0:90:45", "seq_how": "pairs",
             "seq_order": "interleaved (per angle)", "seq_settle_s": 1.0,
+            # each member also measures its hold's null: seq_null_points
+            # angles across +-seq_null_half_deg around the hold's crossed
+            # angle (and the bright angle), skipped where the grid has one
+            # within 1 deg. Crossed at rest = seq_crossed_deg (0: the Find
+            # zero; the fit's psi_rest + 90 says what it really is);
+            # the hold is crossed at seq_crossed_deg + seq_sense x (X1 + X2)
+            # (sense -1 measured 7 Oct 2026). See scan.hold_angles.
+            "seq_null_angles": True, "seq_null_half_deg": 3.0, "seq_null_points": 3,
+            "seq_crossed_deg": 0.0, "seq_sense": -1.0,
             "file1": "", "file2": "", "trig_hz": 3.7,
             "settle_ms": 4.0, "fit_timebase": True, "shots": 8,
             # BOTH outputs: never switched off by the program (the X2 path's

@@ -490,7 +490,23 @@ The order, each step its own button:
    one analyzer angle before moving on (the analyzer stays put - each step
    says `stayed` - and slow drift is shared alike), *one setting at a time*
    does each ramp's scan whole (fewer AWG changes). A waveform change waits
-   `seq_settle_s` (1 s) before the next shot. One dark / background (and
+   `seq_settle_s` (1 s) before the next shot. Each member also measures its
+   own hold near crossed (AWG settings, on by default): `seq_null_points` (3)
+   angles across +-`seq_null_half_deg` (3) around the hold's crossed angle
+   and the bright angle 90 deg from it, after the shared grid, leaving out
+   any within 1 deg of the grid. The hold is crossed at `seq_crossed_deg`
+   (crossed at rest; 0 is the Find zero, a loaded scan's rest azimuth + 90
+   is the measured value and the log says it) + `seq_sense` x (X1 + X2),
+   sense -1 as measured on 7 Oct 2026. Why: with a 22.5 deg grid the 15 /
+   30 / 60 / 75 deg holds had no angle within 6-9 deg of crossed, so their
+   static ER was a useless bound and their hold Imin unmeasured; three
+   angles across the null also give Imin(t) and the null's angle through the
+   hold. The steps are marked `hold_null` and the angles kept in
+   `plan.hold_angles`. Start (and the Plan tab) also says what one scope
+   sample means on the fastest ramp (`points` over the screen x the peak
+   deg/ms) and warns above 0.3 deg per sample: 20000 points over a 270 ms
+   screen were 1.3 deg per sample on 7 Oct, which made the edges and the
+   crossing ERs sampling-limited. One dark / background (and
    stray-light pair) is taken in the first scan and lent to the others. Each
    scan's manifest has the ramp it ran (`drive`, with `ends_deg`) and its
    place in the sequence (`plan.series`). Every ramp must have passed a dry
@@ -696,6 +712,27 @@ Map draws block means over ~4000 columns (a 19 x 100k mesh took 2.4 s).
   ramp cannot. Compare the two.
 - **Intensity drift reads as polarization** in any fit across angles. The ref
   returns measure it; a pick-off reference PD would remove it per sample.
+- **In a hold the light does not quite follow Malus** (7 Oct 2026, XEO1
+  series: fit residual 4-6 mV against 0.9 mV at rest). It is an additive
+  per-analyzer-angle pattern of up to 0.3 % of Imax, the same for every held
+  voltage at a given angle and not symmetric under analyzer + 180 deg, so
+  not a polarization state - the beam on the detector changes while the
+  field is on. It biases each scan's hold azimuth by up to ~0.1 deg and
+  raises the hold Imin by its size. The load log flags it
+  (`analysis.malus_check`, also in the lab-log summary).
+- **A static stretch is named by the motion before it** (`segments`): after
+  an up it is the hold, after a down the after-ramp rest unless the ramp came
+  only part of the way back. Until 7 Oct 2026 a hold had to be past 45 deg,
+  so the 15 and 30 deg holds were called "after".
+- **A static ER needs an angle at crossed.** The nearest angle sits `off`
+  deg from it, and Imax sin^2(off) of what it reads is that offset: once it
+  is above the noise the point is a lower bound (`bound_from` offset), and
+  over half the reading it is useless (`offset_limited`). Each such point
+  names the angle that would have been crossed (`crossed_deg`); the sequence
+  measures them by itself (hold-null angles above).
+- **A borrowed dark / background goes stale**: ~2 mV over a day at 1 V/div,
+  which is the whole rest ER floor. The corrections line and the load log say
+  its age past 2 h (`analysis.offset_age_h`).
 - **Inter-channel skew** of ~97 ns between the CH1/CH2 and CH3/CH4 pairs:
   0.015 deg at the fastest ramp rate - negligible here, noted for anything
   finer.

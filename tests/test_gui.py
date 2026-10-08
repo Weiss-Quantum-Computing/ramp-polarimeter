@@ -242,6 +242,25 @@ def main():
     app.nb.select(app.fig_ext._frame)
     root.update()
     app.fig_ext.savefig(os.path.join(out, "Extinction_refined.png"))
+    # a refine that stopped part-way (7 Oct: a scope read error at step 3):
+    # pressing Measure again finishes it instead of adding a second set
+    rr = app._new_run(app.result["d"].name)
+    rr.load()
+    nulls = [s for s in rr.manifest["steps"] if s["kind"] == "null"]
+    for s in nulls[-2:]:
+        s["status"] = "todo"
+    rr.save()
+    n_before = len(rr.manifest["steps"])
+    gui.messagebox.askyesnocancel = lambda *a_, **k_: True
+    app.do_load_shown()
+    settle(root, app, timeout=120)
+    app.do_run_refine()
+    settle(root, app, timeout=300)
+    rr.load()
+    check("a stopped refine: Measure finishes its steps, no second set added",
+          len(rr.manifest["steps"]) == n_before
+          and all(s["status"] == "done" for s in rr.manifest["steps"] if s["kind"] == "null"),
+          (n_before, len(rr.manifest["steps"])))
 
     print("\nstopping part-way: what was measured is loaded and drawn")
     app.scan_name.set("stopped part way")
@@ -983,8 +1002,17 @@ def main():
                                                                      {"X1": 30.0, "X2": 30.0}],
           {k: (m.get("drive") or {}).get("ends_deg") for k, m in mans.items()})
     second = mans["seq_test_X1_30_X2_30"]
-    check("interleaved: the analyzer stayed put for the second ramp at each angle",
-          all(x.get("stayed") for x in second["steps"] if x["kind"] == "scan"))
+    check("interleaved: the analyzer stayed put for the second ramp at each grid angle",
+          all(x.get("stayed") for x in second["steps"]
+              if x["kind"] == "scan" and not x.get("hold_null")))
+    nulls = {n_: [x for x in m["steps"] if x.get("hold_null")] for n_, m in mans.items()}
+    check("each member measured its own hold-null angles after the grid (3 across the "
+          "null + the bright angle, those not on the grid)",
+          all(0 < len(v) <= 4 and all(x["status"] == "done" for x in v) for v in nulls.values())
+          and all(m["plan"]["hold_angles"] == [x["target"] for x in nulls[n_]]
+                  for n_, m in mans.items())
+          and nulls["seq_test_X1_30_X2_30"] != nulls["seq_test_X1_30_X2_0"],
+          {k: [x["target"] for x in v] for k, v in nulls.items()})
     check("the AWG is parked at the end, on the ILC's 11 ms record",
           s_.parked and abs(s_.wave.period - 11.002e-3) < 1e-9 and all(app.bench.awg_on.values()))
     rots = {r["d"].name: float(np.max(np.abs(r["pol"]["rotation"]))) for r, _c2 in app._compared()}

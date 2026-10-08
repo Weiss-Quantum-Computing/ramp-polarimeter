@@ -390,6 +390,23 @@ def dark_level(d, vdiv=None):
     return 0.0, None
 
 
+OFFSET_AGE_WARN_H = 2.0
+
+
+def offset_age_h(d, info):
+    """Hours between a borrowed dark / background's measurement and this
+    scan's first capture (None for the scan's own, or without times)."""
+    if not info or info.get("source") in (None, "this scan"):
+        return None
+    import datetime
+    try:
+        when = datetime.datetime.fromisoformat(str(info.get("measured", "")))
+        start = datetime.datetime.fromisoformat(str(d.manifest.get("created", "")))
+    except ValueError:
+        return None
+    return (start - when).total_seconds() / 3600.0
+
+
 def corrections_summary(d, pol=None):
     """Every correction the analysis applies to this scan, with its size:
     dict(dark, background, light, subtracted, drift, gains, dropped,
@@ -407,6 +424,12 @@ def corrections_summary(d, pol=None):
         parts.append("no dark or background: 0 V subtracted")
     else:
         src = "" if info["source"] == "this scan" else f" from {info['source']}"
+        age = offset_age_h(d, info)
+        if age is not None and age > OFFSET_AGE_WARN_H:
+            # 7 Oct 2026: a background from 11:24 under scans at 19:45; the
+            # dark had moved 2 mV by 18:30 - the whole rest ER floor
+            out["offset_age_h"] = age
+            src += f" ({age:.1f} h before this scan: measure a fresh one)"
         old = " (beam blocked: a scan before 6 Oct 2026)" if "before 6 Oct" in info["what"] else ""
         if info["kind"] == "dark + stray light":
             st = info["stray"]
@@ -1044,16 +1067,62 @@ def direct_er(d, pol, box_us=4.0, correct_drift=False, gains=None):
         imin = float(means[k])
         if not np.isfinite(s_min) and imin <= 0:
             continue                  # as for a crossing: no value, no bound
-        lower = bool(imin < 2 * s_min)
         from_off = float(imax * np.sin(np.deg2rad(off)) ** 2)
+        # The angle sat `off` deg from crossed, and Imax sin^2(off) of what it
+        # read is that offset, not the light: the light's Imin is at most the
+        # reading, so once the offset's share is above the noise the point is a
+        # LOWER bound on the ER (7 Oct 2026: the 22.5 deg grid left the holds
+        # of the 15 / 30 / 60 / 75 deg ramps 6-9 deg from crossed, and
+        # "ER 42" was read as the light's). offset_limited marks the bounds
+        # the offset makes useless (over half of the reading).
+        noise_bound = bool(imin < 2 * s_min)
+        lower = noise_bound or from_off > s_min
+        er = imax / (2 * s_min) if noise_bound else imax / imin
         pts.append(dict(kind="static", seg=s["kind"], t_ms=float(t[w].mean() * 1e3),
                         theta=float(th[k]), rotation=float(np.median(rot[w])), rate=0.0,
                         imin_mV=imin * 1e3, sig_mV=s_min * 1e3, imax_V=imax,
-                        sig_imax_V=s_max,
-                        er=imax / (2 * s_min) if lower else imax / imin, lower=lower,
+                        sig_imax_V=s_max, er=er, lower=bool(lower),
+                        bound_from="noise" if noise_bound else ("offset" if lower else ""),
                         off_deg=off, imin_from_offset_mV=from_off * 1e3,
+                        crossed_deg=float(np.mod(th[k] + off, 180.0)),
                         offset_limited=bool(from_off > 0.5 * max(imin, 0.0))))
     return pts
+
+
+def malus_check(pol, factor=3.0, floor_mV=2.0):
+    """Where the light does not follow Malus: static stretches whose fit
+    residual is `factor` times the rest's (and above `floor_mV`). Measured 7
+    Oct 2026 (XEO1 hold series): at rest 0.9 mV, in every hold 4-6 mV, an
+    additive per-analyzer-angle pattern of up to 0.3 % of Imax that is the
+    same for every held voltage at a given angle, so not the polarization
+    state - the fitted azimuth there is biased by up to ~0.1 deg and Imin by
+    its size. Returns [(segment kind, rms_mV, rest_rms_mV, psi_scale_deg)]
+    and a list of note strings."""
+    t, rms = pol["t"], pol["rms"]
+    if not np.any(np.isfinite(rms)):
+        return [], []
+    segs = segments(t, pol["rotation"])
+    rest = [s for s in segs if s["base"] == "rest"]
+    if not rest:
+        return [], []
+    m0 = (t >= rest[0]["t0"]) & (t <= rest[0]["t1"])
+    r0 = float(np.nanmedian(rms[m0]) * 1e3)
+    found, notes = [], []
+    for s in segs:
+        if s["base"] not in ("hold", "after"):
+            continue
+        m = (t >= s["t0"] + 0.2e-3) & (t <= s["t1"] - 0.2e-3)
+        if m.sum() < 10:
+            continue
+        r = float(np.nanmedian(rms[m]) * 1e3)
+        if r > factor * r0 and r > floor_mV:
+            B = float(np.nanmedian(pol["B"][m]))
+            scale = float(np.rad2deg(r * 1e-3 / (2 * B))) if B > 0 else float("nan")
+            found.append((s["kind"], r, r0, scale))
+            notes.append(f"{s['kind']}: the light departs from Malus (fit residual {r:.1f} mV "
+                         f"vs {r0:.1f} at rest): its azimuth there is uncertain by ~{scale * 1e3:.0f} "
+                         f"mdeg and Imin by ~{r:.0f} mV beyond the statistical errors")
+    return found, notes
 
 
 def er_sigma(er, imin, sig_imin, imax=None, sig_imax=0.0):
@@ -1124,9 +1193,13 @@ def er_table(res, fit_bin_deg=2.0):
         note = ""
         if p.get("offset_limited"):
             note = (f"offset-limited: the angle sat {p['off_deg']:+.2f} deg from crossed, "
-                    f"which alone gives {p['imin_from_offset_mV']:.2f} mV - not the light's ER")
+                    f"which alone gives {p['imin_from_offset_mV']:.2f} mV - a useless lower "
+                    f"bound, not the light's ER; measure analyzer {p['crossed_deg']:.1f} deg")
         elif p["kind"] == "static":
             note = f"angle {p['off_deg']:+.2f} deg from crossed"
+            if p.get("bound_from") == "offset":
+                note += (f" (its {p['imin_from_offset_mV']:.2f} mV is above the noise: "
+                         f"lower bound)")
         add(p["kind"], p["t_ms"] * 1e-3, p["rotation"], float(wrap_deg(p["theta"])),
             p["rate"], p["er"], sig, p["lower"], p["imin_mV"], p["sig_mV"], p["imax_V"],
             note=note, moving=p["kind"] == "crossing", seg=p.get("seg"))
@@ -1347,7 +1420,10 @@ def scan_summary(res, direct=None):
             out["segments"].append({"kind": s["kind"], "t0_ms": s["t0"] * 1e3,
                                     "t1_ms": s["t1"] * 1e3,
                                     "rotation_deg": float(np.median(rot[m])),
-                                    "er_fit_median": float(np.median(pol["er"][m]))})
+                                    "er_fit_median": float(np.median(pol["er"][m])),
+                                    "fit_rms_mV": float(np.nanmedian(pol["rms"][m]) * 1e3)
+                                    if np.any(np.isfinite(pol["rms"][m])) else None})
+        out["malus_notes"] = malus_check(pol)[1]
     if direct:
         res_pts = [p for p in direct if not p["lower"] and not p.get("offset_limited")]
         if res_pts:
@@ -1402,12 +1478,24 @@ def segments(t, rotation, static_deg_per_ms=2.0, min_ms=0.3):
     edges = np.flatnonzero(np.diff(static.astype(int))) + 1
     bounds = [0, *edges, len(t)]
     leg = 0
+    peak = float(np.max(np.abs(rotation))) if len(rotation) else 0.0
     for a, b in zip(bounds[:-1], bounds[1:]):
         if (t[b - 1] - t[a]) < min_ms * 1e-3:
             continue
         rmean = float(np.mean(rotation[a:b]))
         if static[a]:
-            base = "hold" if abs(rmean) > 45 else ("rest" if leg == 0 else "after")
+            # A static stretch is named by the motion before it: after an
+            # "up" it is the hold, after a "down" the after-ramp rest - unless
+            # the ramp came down only part of the way (a hold at another
+            # level). Until 7 Oct 2026 "hold" meant |rotation| > 45 deg, so
+            # the 10 ms holds of the 15 and 30 deg ramps were called "after".
+            last = out[-1]["base"] if out else None
+            if last is None:
+                base = "rest"
+            elif last == "up" or abs(rmean) > 0.5 * peak:
+                base = "hold"
+            else:
+                base = "after"
         else:
             # away from rest is "up" whichever way the crystals turn it: in
             # test-2's analyzer frame the ramp ran 0 -> -180 deg

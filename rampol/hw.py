@@ -96,6 +96,17 @@ def load_module(path, name):
     return mod
 
 
+class NoTrigger(RuntimeError):
+    """No trigger within the wait: not a read glitch, never retried."""
+
+
+# 7 Oct 2026: one :WAVeform:DATA? in ~1000 came back empty over USB and
+# pyvisa's block-header parse raised "invalid literal for int() with base
+# 10: b''", which ended a 20-minute null refine at step 3. A failed read
+# now clears the scope's output queue and takes that shot again.
+READ_RETRIES = 2
+
+
 class Cancelled(Exception):
     pass
 
@@ -243,6 +254,37 @@ class ScopeLink:
         first = next(iter(got.values()))
         return first.t(), {ch: r.v() for ch, r in got.items()}, settings
 
+    def _block(self, chans, mode, per, points, wait_s, cancelled):
+        """One block: the acquisition, then every channel read. ({ch: Record}, hits)."""
+        if mode == "average":
+            hits = self.scope.accumulate(per, wait_s=wait_s, cancelled=cancelled,
+                                         channels=tuple(chans))
+            if hits is None:
+                raise Cancelled()
+            if hits == 0:
+                raise NoTrigger(f"no trigger within {wait_s:g} s")
+            pmode, pts = self.scope.transfer_plan(True, None)
+        else:
+            got = self.scope.single(wait_s=wait_s, cancelled=cancelled)
+            if got is None:
+                raise Cancelled()
+            if got is False:
+                raise NoTrigger(f"no trigger within {wait_s:g} s")
+            hits = 1
+            pmode, pts = self.scope.transfer_plan(False, points)
+        return {ch: self.scope.record(ch, points_mode=pmode, points=pts) for ch in chans}, hits
+
+    def _clear(self):
+        """After a failed read: drop whatever is left in the output queue
+        (VISA device clear), so the next query does not read stale bytes."""
+        inst = getattr(self.scope, "inst", None)
+        try:
+            if inst is not None and hasattr(inst, "clear"):
+                inst.clear()
+        except Exception as exc:
+            self.log(f"  device clear failed ({exc})")
+        time.sleep(0.2)
+
     def acquire_blocks(self, chans, mode, blocks, shots, dither_codes=0,
                        points=None, wait_s=10.0, cancelled=None, on_block=None):
         """Acquire `blocks` captures of `chans`. For mode 'average' each block
@@ -271,25 +313,18 @@ class ScopeLink:
                 if plan:
                     for ch, exc in self.scope.dither_step(plan, k, blocks).items():
                         self.log(f"  dither: CH{ch} offset refused ({exc})")
-                if mode == "average":
-                    hits = self.scope.accumulate(per, wait_s=wait_s,
-                                                 cancelled=cancelled,
-                                                 channels=tuple(chans))
-                    if hits is None:
-                        raise Cancelled()
-                    if hits == 0:
-                        raise RuntimeError(f"no trigger within {wait_s:g} s")
-                    pmode, pts = self.scope.transfer_plan(True, None)
-                else:
-                    got = self.scope.single(wait_s=wait_s, cancelled=cancelled)
-                    if got is None:
-                        raise Cancelled()
-                    if got is False:
-                        raise RuntimeError(f"no trigger within {wait_s:g} s")
-                    hits = 1
-                    pmode, pts = self.scope.transfer_plan(False, points)
-                recs = {ch: self.scope.record(ch, points_mode=pmode, points=pts)
-                        for ch in chans}
+                for attempt in range(READ_RETRIES + 1):
+                    try:
+                        recs, hits = self._block(chans, mode, per, points, wait_s, cancelled)
+                        break
+                    except (Cancelled, NoTrigger):
+                        raise
+                    except Exception as exc:
+                        if attempt == READ_RETRIES:
+                            raise
+                        self.log(f"  scope read failed ({type(exc).__name__}: {exc}) - "
+                                 f"output queue cleared, block {k + 1} taken again")
+                        self._clear()
                 if on_block:
                     on_block(k, recs, hits)
         finally:

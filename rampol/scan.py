@@ -195,6 +195,36 @@ def angle_list(start, stop, step):
     return [round(start + i * step, 6) for i in range(max(n, 0))]
 
 
+def hold_angles(crossed_rest, rotation_deg, half=3.0, points=3, existing=(), tol=1.0,
+                bright=True, sense=-1.0):
+    """Analyzer angles that put a ramp's hold near crossed: `points` angles
+    across +-`half` deg around the hold's crossed angle, plus the bright angle
+    90 deg away (for the direct ER's Imax), leaving out any within `tol` deg
+    of an angle already in `existing` (mod 180). The hold's crossed angle is
+    crossed_rest + sense x rotation_deg: measured 7 Oct 2026 (XEO1 series),
+    the light's azimuth in the analyzer frame runs -(X1 + X2), so sense = -1
+    and a 90 deg X1 ramp is crossed at crossed_rest - 90 = crossed_rest + 90.
+
+    Why: with a 22.5 deg grid the holds of the 15 / 30 / 60 / 75 deg ramps
+    had no angle within 6-9 deg of crossed, which left their hold ER as a
+    useless bound (Imax sin^2 of 8.6 deg = 120 mV) and their hold Imin
+    unmeasured. Three angles across the null also give a per-sample parabola
+    (Imin(t) and the null's angle through the hold)."""
+    c = crossed_rest + sense * rotation_deg
+    n = max(1, int(points))
+    offs = [(-half + 2 * half * k / (n - 1)) if n > 1 else 0.0 for k in range(n)]
+    want = [c + o for o in offs] + ([c + 90.0] if bright else [])
+    have = [float(x) for x in existing]
+    out = []
+    for a in want:
+        a = round(float(a) % 360.0, 6)
+        near = [x for x in have + out
+                if min(abs((a - x) % 180.0), 180.0 - abs((a - x) % 180.0)) < tol]
+        if not near:
+            out.append(a)
+    return out
+
+
 def ordered(angles, order, seed=0):
     """Angles in measuring order. 'bidirectional' interleaves the list from
     both ends; 'shuffled' is a seeded random order. Either keeps a slow drift
