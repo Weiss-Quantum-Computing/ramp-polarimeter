@@ -441,19 +441,29 @@ def stage_compensate(st, cfg, parts, log, ask, prov):
         if tr is None:
             raise RuntimeError(f"{name}: no tracked azimuth on record")
         t = tr["t"]
-        # the error: hold creep from the hold pair, referenced to the hold's
-        # first ms after the rise; the tail from the rest pair (when there is
-        # one) referenced to the lead
+        # The error is the LIGHT against the commanded rotation - not against
+        # the monitors: a corrected drive moves the monitors with the light,
+        # so light minus monitors cannot change (iteration 1 of 8 Oct 2026:
+        # creep -17.6 -> -16.2 mdeg/ms). The light's rotation in the
+        # monitors' sense is sense x the null's displacement (dpsi). Hold:
+        # the creep from the hold pair, referenced to the hold's first ms
+        # after the rise (the command is flat there); tail: the rest pair
+        # (when there is one) referenced to the lead, where the command is 0.
+        sense = float(pts[-1].get("sense", plan.get("sense", -1.0)))
         err = np.zeros(len(t))
         hold = (t >= t_hold0 + 0.5e-3) & (t <= t_hold1 - 0.1e-3)
         ref = (t >= t_hold0 + 0.5e-3) & (t <= t_hold0 + 1.5e-3)
-        err[hold] = tr["lm"][hold] - tr["lm"][ref].mean()
+        err[hold] = sense * (tr["dpsi"][hold] - tr["dpsi"][ref].mean())
         tail = t >= t_fall + 1.0e-3
-        if "lm_rest" in tr:
+        if "dpsi_rest" in tr:
             v = tr.get("valid_rest", np.ones(len(t), bool))
-            err[tail & v] = tr["lm_rest"][tail & v]
+            err[tail & v] = sense * tr["dpsi_rest"][tail & v]
         elif abs(e1 + e2) <= 25.0:
-            err[tail] = tr["lm"][tail] - tr["lm"][t < t_hold0 - 0.2e-3].mean()
+            err[tail] = sense * (tr["dpsi"][tail] - tr["dpsi"][t < t_hold0 - 0.2e-3].mean())
+        # the light's own creep and tail, for the record
+        pf = np.polyfit(t[hold] * 1e3, err[hold] * 1e3, 1) if hold.sum() > 5 else (np.nan, np.nan)
+        light_creep = float(pf[0])
+        light_after = float(np.interp(t_fall + 1.0e-3, t, err) * 1e3)
         # smooth over smooth_ms (the per-sample azimuth is ~10 mdeg of noise)
         dt = float(np.median(np.diff(t)))
         n = max(1, int(round(smooth_ms * 1e-3 / dt)))
@@ -466,15 +476,17 @@ def stage_compensate(st, cfg, parts, log, ask, prov):
         pt = pts[-1]
         tk = pt.get("track") or {}
         rec = {"iteration": k, "run": name, "err_rms_mdeg": rms,
+               "light_creep_mdeg_ms": light_creep, "light_after_1ms_mdeg": light_after,
                "creep_mdeg_ms": tk.get("hold_slope_mdeg_ms"),
                "after_1ms_mdeg": tk.get("after_1ms_mdeg"),
                "after_extreme_mdeg": tk.get("after_extreme_mdeg"), "tau_ms": tk.get("tau_ms"),
                "er": pt.get("er") or pt.get("er_lower"), "imin_mV": pt["imin"] * 1e3,
                "null_deg": pt["theta_n"], "phi_mon_deg": pt.get("phi_mon")}
         hist["iterations"].append(rec)
-        log(f"  iteration {k}: error rms {rms:.1f} mdeg over hold + tail; creep "
-            f"{tk.get('hold_slope_mdeg_ms', float('nan')):+.1f} mdeg/ms, after-fall "
-            f"{tk.get('after_1ms_mdeg', float('nan')):+.0f} mdeg, ER {rec['er']:.0f}")
+        log(f"  iteration {k}: light - command rms {rms:.1f} mdeg over hold + tail; the "
+            f"light's creep {light_creep:+.1f} mdeg/ms, 1 ms after the fall {light_after:+.0f} "
+            f"mdeg (light - monitors: creep {tk.get('hold_slope_mdeg_ms', float('nan')):+.1f}, "
+            f"after-fall {tk.get('after_1ms_mdeg', float('nan')):+.0f}), ER {rec['er']:.0f}")
         # the update: the error in deg -> volts on the driven channel, on the
         # scope's time grid (the plateau interpolates it onto its own)
         u_prev = np.zeros(len(t)) if corr is None else np.interp(
