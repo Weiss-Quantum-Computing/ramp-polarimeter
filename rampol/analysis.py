@@ -1089,6 +1089,81 @@ def direct_er(d, pol, box_us=4.0, correct_drift=False, gains=None):
     return pts
 
 
+def er_vs_time(d, pol, half_deg=4.0, box_us=20.0, stride=1, gains=None):
+    """The extinction ratio against time from the analyzer angles near
+    crossed: at every sample the scan angles within `half_deg` of the fit's
+    crossed position (psi + 90) are taken; with three or more, a parabola in
+    (theta - crossed) through their (boxcar-smoothed) intensities gives the
+    light's Imin and the crossed angle directly ('parabola'); with one or two,
+    the nearest angle's reading less Imax sin^2 of its offset from crossed
+    ('offset', the static-point correction applied per sample). Imax is the
+    harmonic fit's at that sample. Returns dict of arrays over the samples
+    where any angle is near enough: t, imin, sig_imin, imax, er, er_lower
+    (imin < 2 sigma: er is Imax / 2 sigma), crossed (fit), theta_min (the
+    parabola's, else nan), n_near, method (1 parabola, 0 offset), and the
+    angle sets used (`sets`: list of (first index, angles)). Shows what a
+    hold or the tail after a fall does to the ER with the data that measured
+    it (8 Oct 2026)."""
+    t = d.t
+    dt = float(np.median(np.diff(t)))
+    th = np.asarray(pol["theta"], float)
+    I = np.asarray(pol["I"], float)
+    steps = pol["steps"]
+    sem = np.array([np.asarray(s["sem"]["PD"], float) for s in steps])
+    if gains is not None and len(gains) == len(th):
+        I = I / np.asarray(gains)[:, None]
+        sem = sem / np.asarray(gains)[:, None]
+    nb = max(1, int(round(box_us * 1e-6 / dt)))
+    box = np.ones(nb) / nb
+    Is = np.array([np.convolve(x, box, mode="same") for x in I])
+    sems = sem / np.sqrt(nb)
+    psi = np.asarray(pol["psi_u"], float)
+    imax = np.asarray(pol["imax"], float)
+
+    def wrap(x):
+        return (x + 90.0) % 180.0 - 90.0
+    idx = np.arange(0, len(t), max(int(stride), 1))
+    out = {k: [] for k in ("t", "imin", "sig_imin", "imax", "er", "er_lower", "crossed",
+                           "theta_min", "n_near", "method")}
+    sets, last = [], None
+    for n in idx:
+        crossed = psi[n] + 90.0
+        off = wrap(th - crossed)                     # each angle's offset from crossed
+        near = np.flatnonzero(np.abs(off) <= half_deg)
+        if not len(near):
+            continue
+        key = tuple(near)
+        if key != last:
+            sets.append((int(n), [float(th[k]) for k in near]))
+            last = key
+        y, s2 = Is[near, n], sems[near, n] ** 2
+        if len(near) >= 3:
+            c = np.polyfit(off[near], y, 2)
+            if c[0] > 0:
+                x0 = -c[1] / (2 * c[0])
+                imin = float(np.polyval(c, x0))
+                theta_min = float(np.mod(crossed + x0, 180.0))
+            else:                                   # concave: take the lowest point
+                k = int(np.argmin(y)); imin = float(y[k]); theta_min = float(np.mod(th[near[k]], 180.0))
+            sig = float(np.sqrt(np.mean(s2) / len(near)))
+            method = 1
+        else:
+            k = int(np.argmin(np.abs(off[near])))
+            imin = float(y[k] - imax[n] * np.sin(np.deg2rad(off[near][k])) ** 2)
+            sig = float(np.sqrt(s2[k]))
+            theta_min, method = np.nan, 0
+        lower = bool(imin < 2 * sig)
+        er = float(imax[n] / (2 * sig)) if lower and sig > 0 else float(imax[n] / imin) if imin > 0 else np.nan
+        out["t"].append(float(t[n])); out["imin"].append(imin); out["sig_imin"].append(sig)
+        out["imax"].append(float(imax[n])); out["er"].append(er); out["er_lower"].append(lower)
+        out["crossed"].append(float(np.mod(crossed, 180.0))); out["theta_min"].append(theta_min)
+        out["n_near"].append(int(len(near))); out["method"].append(method)
+    res = {k: np.asarray(v) for k, v in out.items()}
+    res["sets"] = sets
+    res["half_deg"], res["box_us"] = float(half_deg), float(box_us)
+    return res
+
+
 def malus_check(pol, factor=3.0, floor_mV=2.0, segs=None):
     """Where the light does not follow Malus: static stretches whose fit
     residual is `factor` times the rest's (and above `floor_mV`). Measured 7
