@@ -689,6 +689,25 @@ class BiasRun:
                              "limit_checks": [c[2] for c in checks], "points": [],
                              "provenance": self.provenance}
             null_sets, coarse = None, None
+            lender = p.get("darks_from")
+            if lender:
+                # another run's darks (the same bench, the same evening: one
+                # beam block serves the night), with its V/div settings
+                lp = os.path.join(os.path.dirname(self.folder), str(lender), "bias.json")
+                with open(lp, encoding="utf-8") as fh:
+                    lm = json.load(fh)
+                if not (lm.get("dark") and lm.get("null_settings") and lm.get("coarse")):
+                    raise ValueError(f"{lender}: no darks and null settings on record to lend")
+                self.dark = {k: tuple(v) for k, v in lm["dark"].items()}
+                null_sets = [tuple(x) for x in lm["null_settings"]]
+                coarse = tuple(lm["coarse"])
+                self.manifest["dark"] = dict(lm["dark"])
+                self.manifest["null_settings"] = list(lm["null_settings"])
+                self.manifest["coarse"] = list(lm["coarse"])
+                self.manifest["darks_from"] = {"run": str(lender),
+                                               "measured": lm.get("created", "")}
+                self.log(f"  darks from {lender} ({lm.get('created', '')}): "
+                         + ", ".join(f"{k}: {v[0]*1e3:+.3f} mV" for k, v in self.dark.items()))
         self._save()
         self.log(f"Bias run {self.name}: {len(ends)} points, record "
                  f"{period*1e3:.2f} ms, window {w[0]*1e3:.2f}-{w[1]*1e3:.2f} ms"
