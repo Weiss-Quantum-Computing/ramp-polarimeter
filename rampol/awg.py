@@ -16,7 +16,8 @@ against EOM-ILC and bk4063b.py):
 * Record length. In DDS mode the whole record is resampled into one FRQ
   period, FRQ = 1/(N dt). A ramp's record is lead + rise + hold + fall +
   after; the defaults make it EOM-ILC's: 11 ms at 2 us, 5501 points, 90.893
-  Hz. N <= 16384 (datasheet; 5501 is the most proven). A different length
+  Hz. N <= 8 Mpts (4060B series arb length; 7001 played on 7 Oct 2026 is
+  the most proven - the dry run is what proves a longer one). A different length
   needs the channels set up again for the new FRQ, and setting up stops
   the burst for a moment (BSWV switches burst off; the mode block puts it
   back), so the channel free-runs whatever it holds. With the outputs live
@@ -65,8 +66,12 @@ from . import bias as biasmod
 FULL_SCALE = 10.0          # V: AMP 20 Vpp, OFST 0, samples u / FULL_SCALE uploaded as-is
 AWG_CAP = 9.6              # V: this program's cap per channel (the 4063B gives +-10 V;
                            # a margin under that rail)
-MAX_PTS = 16384            # 4063B arb memory (datasheet; unprobed above 5501)
-PROVEN_PTS = 5501
+# The 4060B series (this bench's 4063B) takes arbitrary waveforms of 8 pts to
+# 8 Mpts. 16384 stood here until 8 Oct 2026 - a figure for the older 4063
+# (no B) carried over from EOM-ILC's AWG_MAX_PTS - and refused a 34 ms ramp
+# at 2 us (17001 points). Longer records are proven by their dry run.
+MAX_PTS = 8_000_000
+PROVEN_PTS = 7001          # played and dry-run 7 Oct 2026 (14 ms at 2 us)
 IDLE_CAP = 0.100           # V: EOM-ILC Limits.idle_awg
 CHANNELS = {"EO1": 1, "EO2": 2}
 
@@ -119,6 +124,24 @@ def record_ms(p):
     return sum(float(p[k]) for k in ("lead_ms", "rise_ms", "hold_ms", "fall_ms", "tail_ms"))
 
 
+# dt steps (us) a record is coarsened to when it would not fit MAX_PTS
+DT_STEPS_US = (2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.5, 15.0, 20.0, 25.0, 40.0, 50.0)
+
+
+def fit_dt(record_s, dt_s, max_pts=None):
+    """dt_s, or the next DT_STEPS_US step that puts the record in max_pts
+    (default MAX_PTS) points: the count itself does not matter (DDS plays
+    the record in 1/FRQ, FRQ = 1/record), so the grid gives way, not the
+    record."""
+    max_pts = MAX_PTS if max_pts is None else max_pts
+    if record_s / dt_s + 1 <= max_pts:
+        return dt_s
+    for d in DT_STEPS_US:
+        if d * 1e-6 >= dt_s and record_s / (d * 1e-6) + 1 <= max_pts:
+            return d * 1e-6
+    return record_s / (max_pts - 1)
+
+
 def ramp_hold(rotation_deg, p, idle=None, chan=None, ends=None):
     """Idle -> the commanded rotation -> idle: `lead` at idle, `rise` edge,
     hold, `fall` edge, `after` (tail_ms) at idle - the record is their sum,
@@ -140,6 +163,8 @@ def ramp_hold(rotation_deg, p, idle=None, chan=None, ends=None):
         raise ValueError("lead, rise, hold, fall and after must be >= 0")
     if seg[0] <= 0 or seg[4] <= 0:
         raise ValueError("lead and after must be > 0: the record starts and ends at idle")
+    asked = dt
+    dt = fit_dt(sum(seg), dt)
     nl, nr, nh, nf, na = (int(round(x / dt)) for x in seg)
     n = nl + nr + nh + nf + na + 1
     prof = np.zeros(n)
@@ -166,6 +191,7 @@ def ramp_hold(rotation_deg, p, idle=None, chan=None, ends=None):
              f"{p['rise_ms']:g}/{p['fall_ms']:g} ms, hold {p['hold_ms']:g} ms)",
              hold=hold, rotation=float(rotation_deg), source="ramp")
     w.ends = None if ends is None else {"EO1": e1, "EO2": e2}
+    w.dt_asked = asked
     return w
 
 
@@ -337,7 +363,11 @@ def check(wave, eomilc=None, trig_hz=None, chan=None):
     out = []
     if wave.n > MAX_PTS:
         out.append(("FAIL", f"{wave.n} points: past the 4063B's {MAX_PTS}"))
-    elif wave.n > PROVEN_PTS:
+    elif getattr(wave, "dt_asked", None) and wave.dt > wave.dt_asked * (1 + 1e-9):
+        out.append(("INFO", f"{wave.period*1e3:.3f} ms does not fit {MAX_PTS} points at "
+                            f"{wave.dt_asked*1e6:g} us: grid {wave.dt*1e6:g} us instead "
+                            f"({wave.n} points; FRQ {1/wave.period:.4f} Hz on load)"))
+    if wave.n > PROVEN_PTS:
         # the count itself does not matter: in DDS mode the channel plays the
         # whole record in 1/FRQ, and FRQ is set to 1/record on load (checked
         # against the generator there, and the dry run times it on the scope)

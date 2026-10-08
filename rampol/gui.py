@@ -1404,7 +1404,7 @@ class App:
 
         s = sect("Waveform")
         line(s, ["grid", ("e", "dt_us", 5), "us per point"],
-             "The ILC's record is 11 ms at 2 us (5501 points); the 4063B takes up to 16384.")
+             "The ILC's record is 11 ms at 2 us (5501 points); the 4063B takes up to 8 Mpts.")
         rr = line(s, ["idle X1", ("e", "idle1", 8), "X2", ("e", "idle2", 8), "V"],
                   "Blank = the ILC state files' first sample (the learned trim): the AWG holds "
                   "the first sample between bursts, and file zero parks the EOMs at -9 / -41 V.")
@@ -1515,6 +1515,9 @@ class App:
             self.a_record.configure(text="")
             return
         rec = awgmod.record_ms(p)
+        if p["dt_us"] > 0:
+            # a record past the 4063B's memory goes on a coarser grid (fit_dt)
+            p["dt_us"] = awgmod.fit_dt(rec * 1e-3, p["dt_us"] * 1e-6) * 1e6
         n = int(round(rec / (p["dt_us"] * 1e-3))) + 1 if p["dt_us"] > 0 else 0
         note = (" (the ILC's)" if abs(rec - awgmod.ILC_RECORD_MS) < 1e-9
                 and abs(p["dt_us"] - awgmod.ILC_DT_US) < 1e-9 else

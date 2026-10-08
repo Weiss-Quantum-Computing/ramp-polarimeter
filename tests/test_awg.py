@@ -48,6 +48,22 @@ def wave_checks(eom):
     check("linear edges differ from cosine a quarter into the rise",
           abs(lin.u["EO1"][k] - w.u["EO1"][k]) > 0.01)
     check("split outside 0..1 refused", raises(awg.ramp_hold, 45.0, {"split": 1.5}) is not None)
+    # 8 Oct: a 34 ms record at 2 us was 17001 points and refused under the
+    # old 16384 cap; it now plays at 2 us, and past a cap the grid gives way
+    plain = awg.ramp_hold(45.0, {"hold_ms": 30.0, "tail_ms": 1.0})
+    check("a 34 ms record stays on the 2 us grid (8 Mpts cap)",
+          abs(plain.dt - 2e-6) < 1e-12 and plain.n > 16384
+          and awg.worst(awg.check(plain)) != "FAIL", (plain.n, plain.dt * 1e6))
+    keep, awg.MAX_PTS = awg.MAX_PTS, 16384
+    big = awg.ramp_hold(45.0, {"hold_ms": 30.0, "tail_ms": 1.0})
+    found = awg.check(big)
+    check("a record past 16384 points at 2 us goes on a coarser grid, said, not refused",
+          big.n <= awg.MAX_PTS and abs(big.dt - 2.5e-6) < 1e-12
+          and abs(big.hold[1] - big.hold[0] - 30e-3) < 1e-9
+          and not [m for lv, m in found if lv == "FAIL" and "points" in m]
+          and any("grid 2.5 us" in m for lv, m in found if lv == "INFO"),
+          (big.n, big.dt * 1e6, [m for _l, m in found][:2]))
+    awg.MAX_PTS = keep
     long_ = awg.ramp_hold(45.0, {"hold_ms": 20.0, "tail_ms": 2.0})
     check("the record is lead + rise + hold + fall + after (24.5 ms -> 12251 points)",
           abs(long_.period - 24.502e-3) < 1e-9 and long_.n == 12251
@@ -59,9 +75,13 @@ def wave_checks(eom):
     print("\nthe checks")
     f = awg.check(w, eom, trig_hz=3.7)
     check("45 deg ramp at 3.7 Hz passes", awg.worst(f) != "FAIL", [m for lv, m in f if lv != "INFO"])
+    keep, awg.MAX_PTS = awg.MAX_PTS, 16384
     big = awg.ramp_hold(45.0, {"hold_ms": 37.5, "dt_us": 2.0})
-    check("over 16384 points fails", any(lv == "FAIL" and "points" in m
-                                          for lv, m in awg.check(big, None)))
+    big.u = {k: np.repeat(v, 2) for k, v in big.u.items()}   # past the cap as built
+    big.t = np.arange(len(big.u["EO1"])) * big.dt
+    check("over MAX_PTS points fails", any(lv == "FAIL" and "points" in m
+                                           for lv, m in awg.check(big, None)))
+    awg.MAX_PTS = keep
     check("a record over 80 % of the trigger period fails",
           any(lv == "FAIL" and "trigger" in m for lv, m in awg.check(w, None, trig_hz=100)))
     hot = awg.ramp_hold(45.0, {"hold_ms": 60.0, "dt_us": 20.0})
