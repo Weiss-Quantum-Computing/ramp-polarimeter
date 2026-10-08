@@ -1103,7 +1103,7 @@ def er_vs_time(d, pol, half_deg=4.0, box_us=20.0, stride=1, gains=None):
     parabola's, else nan), n_near, method (1 parabola, 0 offset), and the
     angle sets used (`sets`: list of (first index, angles)). Shows what a
     hold or the tail after a fall does to the ER with the data that measured
-    it (8 Oct 2026)."""
+    it (8 Oct 2026). Vectorised over runs of samples that share an angle set."""
     t = d.t
     dt = float(np.median(np.diff(t)))
     th = np.asarray(pol["theta"], float)
@@ -1116,51 +1116,57 @@ def er_vs_time(d, pol, half_deg=4.0, box_us=20.0, stride=1, gains=None):
     nb = max(1, int(round(box_us * 1e-6 / dt)))
     box = np.ones(nb) / nb
     Is = np.array([np.convolve(x, box, mode="same") for x in I])
-    sems = sem / np.sqrt(nb)
+    sems2 = sem ** 2 / nb
     psi = np.asarray(pol["psi_u"], float)
     imax = np.asarray(pol["imax"], float)
-
-    def wrap(x):
-        return (x + 90.0) % 180.0 - 90.0
     idx = np.arange(0, len(t), max(int(stride), 1))
-    out = {k: [] for k in ("t", "imin", "sig_imin", "imax", "er", "er_lower", "crossed",
-                           "theta_min", "n_near", "method")}
-    sets, last = [], None
-    for n in idx:
-        crossed = psi[n] + 90.0
-        off = wrap(th - crossed)                     # each angle's offset from crossed
-        near = np.flatnonzero(np.abs(off) <= half_deg)
-        if not len(near):
-            continue
-        key = tuple(near)
-        if key != last:
-            sets.append((int(n), [float(th[k]) for k in near]))
-            last = key
-        y, s2 = Is[near, n], sems[near, n] ** 2
-        if len(near) >= 3:
-            c = np.polyfit(off[near], y, 2)
-            if c[0] > 0:
-                x0 = -c[1] / (2 * c[0])
-                imin = float(np.polyval(c, x0))
-                theta_min = float(np.mod(crossed + x0, 180.0))
-            else:                                   # concave: take the lowest point
-                k = int(np.argmin(y)); imin = float(y[k]); theta_min = float(np.mod(th[near[k]], 180.0))
-            sig = float(np.sqrt(np.mean(s2) / len(near)))
-            method = 1
-        else:
-            k = int(np.argmin(np.abs(off[near])))
-            imin = float(y[k] - imax[n] * np.sin(np.deg2rad(off[near][k])) ** 2)
-            sig = float(np.sqrt(s2[k]))
-            theta_min, method = np.nan, 0
-        lower = bool(imin < 2 * sig)
-        er = float(imax[n] / (2 * sig)) if lower and sig > 0 else float(imax[n] / imin) if imin > 0 else np.nan
-        out["t"].append(float(t[n])); out["imin"].append(imin); out["sig_imin"].append(sig)
-        out["imax"].append(float(imax[n])); out["er"].append(er); out["er_lower"].append(lower)
-        out["crossed"].append(float(np.mod(crossed, 180.0))); out["theta_min"].append(theta_min)
-        out["n_near"].append(int(len(near))); out["method"].append(method)
-    res = {k: np.asarray(v) for k, v in out.items()}
-    res["sets"] = sets
-    res["half_deg"], res["box_us"] = float(half_deg), float(box_us)
+    crossed = psi[idx] + 90.0
+    off = (th[None, :] - crossed[:, None] + 90.0) % 180.0 - 90.0        # (N, K)
+    near = np.abs(off) <= half_deg
+    keep = near.any(axis=1)
+    idx, crossed, off, near = idx[keep], crossed[keep], off[keep], near[keep]
+    N = len(idx)
+    imin = np.full(N, np.nan); sig = np.full(N, np.nan); theta_min = np.full(N, np.nan)
+    method = np.zeros(N, int); n_near = near.sum(axis=1)
+    sets = []
+    if N:
+        # runs of samples sharing the same angle set
+        code = near.astype(np.int64) @ (1 << np.arange(near.shape[1], dtype=np.int64))
+        bounds = np.flatnonzero(np.diff(code)) + 1
+        starts = np.r_[0, bounds]; stops = np.r_[bounds, N]
+        for a, b in zip(starts, stops):
+            cols = np.flatnonzero(near[a])
+            sets.append((int(idx[a]), [float(th[k]) for k in cols]))
+            x = off[a:b][:, cols]                                 # (n, m)
+            y = Is[cols][:, idx[a:b]].T                           # (n, m)
+            s2 = sems2[cols][:, idx[a:b]].T
+            if len(cols) >= 3:
+                X = np.stack([np.ones_like(x), x, x * x], axis=2)      # (n, m, 3)
+                A = np.einsum("nmi,nmj->nij", X, X)
+                bvec = np.einsum("nmi,nm->ni", X, y)
+                c = np.linalg.solve(A, bvec[..., None])[..., 0]     # (n, 3): c0 + c1 x + c2 x^2
+                convex = c[:, 2] > 0
+                x0 = np.where(convex, -c[:, 1] / (2 * np.where(convex, c[:, 2], 1.0)), 0.0)
+                vertex = c[:, 0] + c[:, 1] * x0 + c[:, 2] * x0 * x0
+                kmin = np.argmin(y, axis=1)
+                lowest = y[np.arange(len(y)), kmin]
+                imin[a:b] = np.where(convex, vertex, lowest)
+                theta_min[a:b] = np.where(convex, np.mod(crossed[a:b] + x0, 180.0),
+                                          np.mod(th[cols][kmin], 180.0))
+                sig[a:b] = np.sqrt(s2.mean(axis=1) / len(cols))
+                method[a:b] = 1
+            else:
+                k = np.argmin(np.abs(x), axis=1)
+                rows = np.arange(len(x))
+                imin[a:b] = y[rows, k] - imax[idx[a:b]] * np.sin(np.deg2rad(x[rows, k])) ** 2
+                sig[a:b] = np.sqrt(s2[rows, k])
+    lower = imin < 2 * sig
+    with np.errstate(divide="ignore", invalid="ignore"):
+        er = np.where(lower, np.where(sig > 0, imax[idx] / (2 * sig), np.nan),
+                      np.where(imin > 0, imax[idx] / imin, np.nan))
+    res = {"t": t[idx], "imin": imin, "sig_imin": sig, "imax": imax[idx], "er": er, "er_lower": lower,
+           "crossed": np.mod(crossed, 180.0), "theta_min": theta_min, "n_near": n_near, "method": method,
+           "sets": sets, "half_deg": float(half_deg), "box_us": float(box_us)}
     return res
 
 

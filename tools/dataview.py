@@ -26,6 +26,28 @@ sys.path.insert(0, os.path.dirname(HERE))
 from rampol import analysis as an, bias as biasmod, config as cfgmod, hw  # noqa: E402
 
 K_MON = {"MonX1": 90.0 / 5.1283, "MonX2": 90.0 / 5.1374}
+MAX_PTS = 3000             # points per line on screen: longer traces are thinned to a min/max envelope
+
+
+def thin(x, y, n=MAX_PTS):
+    """(x, y) reduced to about 2 n points keeping every bin's min and max, so
+    spikes survive; untouched when short enough."""
+    x, y = np.asarray(x), np.asarray(y, float)
+    if len(x) <= 2 * n:
+        return x, y
+    m = len(x) // n
+    k = m * n
+    yb = y[:k].reshape(n, m); xb = x[:k].reshape(n, m)
+    lo = np.argmin(np.where(np.isnan(yb), np.inf, yb), axis=1); hi = np.argmax(np.where(np.isnan(yb), -np.inf, yb), axis=1)
+    r = np.arange(n)
+    i1, i2 = np.minimum(lo, hi), np.maximum(lo, hi)
+    xs = np.column_stack([xb[r, i1], xb[r, i2]]).ravel(); ys = np.column_stack([yb[r, i1], yb[r, i2]]).ravel()
+    return xs, ys
+
+
+def plot_thin(ax, x, y, *args, **kw):
+    xs, ys = thin(x, y)
+    return ax.plot(xs, ys, *args, **kw)
 
 
 def run_kind(folder):
@@ -78,7 +100,9 @@ class Viewer(tk.Tk):
         self.outdir = outdir
         cfg = cfgmod.load()
         self.sg = hw.load_scope_grab(cfg["scope_grab_path"])
-        self.cache = {}
+        self.cache = {}            # folder -> load_scan's step cache
+        self.loaded = {}           # (folder, raw) -> (kind, data): runs already loaded
+        self.drawn = {}            # tab -> key of what it shows (skip a redraw when unchanged)
         self.cur = None            # (kind, folder, data)
         self.sel_point = 0
         self.raw = tk.BooleanVar(value=False)
@@ -127,7 +151,7 @@ class Viewer(tk.Tk):
         ttk.Label(row, text="map:").pack(side="left")
         self.map_key = tk.StringVar(value="er")
         for k in ("er", "imin", "theta_n", "creep", "after_1ms", "tau"):
-            ttk.Radiobutton(row, text=k, value=k, variable=self.map_key, command=self._draw_map).pack(side="left")
+            ttk.Radiobutton(row, text=k, value=k, variable=self.map_key, command=self._refresh_tab).pack(side="left")
         # null scan / tracking / traces / fit / er / summary
         self.null_plot = Plot(self.tabs["Null scan"]); self.null_plot.pack(fill="both", expand=True)
         self.track_plot = Plot(self.tabs["Tracking"]); self.track_plot.pack(fill="both", expand=True)
@@ -136,9 +160,9 @@ class Viewer(tk.Tk):
         ttk.Label(top, text="angles (ctrl-click to add):").pack(side="left")
         self.angle_list = tk.Listbox(top, selectmode="extended", height=4, width=60, exportselection=False)
         self.angle_list.pack(side="left", padx=4)
-        self.angle_list.bind("<<ListboxSelect>>", lambda _e: self._draw_traces())
+        self.angle_list.bind("<<ListboxSelect>>", lambda _e: self._refresh_tab())
         ttk.Checkbutton(top, text="raw (no dark subtraction)", variable=self.raw, command=self._on_raw).pack(side="left", padx=8)
-        ttk.Button(top, text="all", command=lambda: (self.angle_list.select_set(0, "end"), self._draw_traces())).pack(side="left")
+        ttk.Button(top, text="all", command=lambda: (self.angle_list.select_set(0, "end"), self._refresh_tab())).pack(side="left")
         ttk.Button(top, text="near crossed", command=self._select_near).pack(side="left")
         self.trace_plot = Plot(tf); self.trace_plot.pack(fill="both", expand=True)
         self.fit_plot = Plot(self.tabs["Fit"]); self.fit_plot.pack(fill="both", expand=True)
@@ -151,7 +175,7 @@ class Viewer(tk.Tk):
         self.er_box = tk.DoubleVar(value=20.0)
         ttk.Entry(top, textvariable=self.er_box, width=6).pack(side="left")
         ttk.Label(top, text="us").pack(side="left")
-        ttk.Button(top, text="recompute", command=self._draw_er).pack(side="left", padx=8)
+        ttk.Button(top, text="recompute", command=self._refresh_tab).pack(side="left", padx=8)
         self.er_plot = Plot(ef); self.er_plot.pack(fill="both", expand=True)
         self.summary = tk.Text(self.tabs["Summary"], wrap="none", font=("Consolas", 9))
         self.summary.pack(fill="both", expand=True)
@@ -187,15 +211,26 @@ class Viewer(tk.Tk):
         self.status.set(f"loading {name} ...")
         self.update_idletasks()
         try:
-            if kind == "bias":
+            key = (folder, self.raw.get())
+            note = ""
+            if key in self.loaded:
+                kind, data = self.loaded[key]
+                self.cur = (kind, folder, data)
+                if kind == "bias":
+                    self._fill_points(data)
+                else:
+                    self._fill_angles(data["d"])
+                    note = data["pol"].get("no_fit", "")
+                    note = f" - {note}: traces only, no fit" if note else ""
+            elif kind == "bias":
                 man = biasmod.load(folder)
                 self.cur = ("bias", folder, man)
                 self.sel_point = 0
                 self._fill_points(man)
+                self.loaded[key] = ("bias", man)
             else:
                 d = an.load_scan(folder, self.sg.load_capture, cache=self.cache.setdefault(folder, {}))
                 d.subtract_dark = not self.raw.get()
-                note = ""
                 try:
                     pol = an.polarization(d)
                 except ValueError as exc:
@@ -203,7 +238,9 @@ class Viewer(tk.Tk):
                     th, I, sem, steps = an.scan_matrix(d, "scan")
                     pol = {"theta": th, "I": I, "steps": steps, "rotation": None, "no_fit": str(exc)}
                     note = f" - {exc}: traces only, no fit"
-                self.cur = ("scan", folder, {"d": d, "pol": pol, "er": None, "direct": None})
+                data = {"d": d, "pol": pol, "er": None, "er_key": None, "direct": None}
+                self.cur = ("scan", folder, data)
+                self.loaded[key] = ("scan", data)
                 self._fill_angles(d)
             self.status.set(f"{name} ({kind}){note}")
             # land on a tab that applies to this kind of run
@@ -224,6 +261,13 @@ class Viewer(tk.Tk):
             return
         tab = self.nb.tab(self.nb.select(), "text")
         kind = self.cur[0]
+        # what this tab would show; skip the redraw when it is already on screen
+        key = (self.cur[1], self.sel_point if kind == "bias" else tuple(self.angle_list.curselection()),
+               self.raw.get(), self.map_key.get() if tab == "Points" else None,
+               (self.er_half.get(), self.er_box.get()) if tab == "ER(t)" else None)
+        if self.drawn.get(tab) == key:
+            return
+        self.drawn[tab] = key
         try:
             if kind == "bias":
                 {"Points": self._draw_map, "Null scan": self._draw_null, "Tracking": self._draw_track,
@@ -359,7 +403,7 @@ class Viewer(tk.Tk):
                     ax1.text(th.min(), 0, f"dark {val_[0]*1e3:+.3f} +- {val_[1]*1e3:.3f} mV subtracted", fontsize=7, va="bottom")
             ax1.set(title=f"null scan, point {p['i']} (X1 {p['x1']:g} / X2 {p['x2']:g}): ER {p['er'] or 0:.0f}" +
                     (f" +- {p['sig_er']:.0f}" if p.get("sig_er") else ""), xlabel="analyzer (deg)", ylabel="I (mV, dark-subtracted)")
-            ax1.legend(fontsize=7); ax1.grid(alpha=0.3)
+            ax1.legend(fontsize=7, loc="upper right"); ax1.grid(alpha=0.3)
             # the traces behind each window mean
             t = npz["t"] * 1e3
             cols = matplotlib.cm.viridis(np.linspace(0, 0.95, max(len(th), 2)))
@@ -371,7 +415,7 @@ class Viewer(tk.Tk):
             if dark_lv:
                 ax3.axhline(dark_lv[0] * 1e3, color="k", lw=0.8, ls="--", label=f"dark {dark_lv[0]*1e3:+.3f} mV (the fit's zero)")
             ax3.set(title="RAW PD traces at the null-scan angles (window mean minus the dark = the points above)", xlabel="t (ms)", ylabel="mV (raw)")
-            ax3.legend(fontsize=6, ncol=3); ax3.grid(alpha=0.3)
+            ax3.legend(fontsize=6, ncol=3, loc="upper right"); ax3.grid(alpha=0.3)
         else:
             ax1.text(0.5, 0.5, "no null scan (track-only point)", ha="center", transform=ax1.transAxes)
         # coarse 4 angles and bright
@@ -380,7 +424,7 @@ class Viewer(tk.Tk):
             ax2.plot(t, npz[key_], lw=0.7, label=key_)
         ax2.axvspan(w[0] * 1e3, w[1] * 1e3, color="orange", alpha=0.15)
         ax2.set(title=f"coarse scan at {man['coarse'][0]:g} V/div: Imax {p.get('imax') or 0:.3f} V, psi {p.get('psi_coarse') or 0:.2f}", xlabel="t (ms)", ylabel="V")
-        ax2.legend(fontsize=6); ax2.grid(alpha=0.3)
+        ax2.legend(fontsize=6, loc="upper right"); ax2.grid(alpha=0.3)
         self.null_plot.draw()
 
     def _draw_track(self):
@@ -393,28 +437,28 @@ class Viewer(tk.Tk):
         t = npz["t"] * 1e3
         for k in ("slope_hold_plus", "slope_hold_minus", "slope_rest_plus", "slope_rest_minus"):
             if k in npz.files:
-                ax1.plot(t, npz[k], lw=0.7, label=k)
+                plot_thin(ax1, t, npz[k], lw=0.7, label=k)
         ax1.set(title=f"slope-pair traces (null +- 45 deg), point {p['i']} X1 {p['x1']:g} / X2 {p['x2']:g}", ylabel="V")
-        ax1.axvspan(w[0] * 1e3, w[1] * 1e3, color="orange", alpha=0.15); ax1.legend(fontsize=6); ax1.grid(alpha=0.3)
+        ax1.axvspan(w[0] * 1e3, w[1] * 1e3, color="orange", alpha=0.15); ax1.legend(fontsize=6, loc="upper right"); ax1.grid(alpha=0.3)
         if "track_t" in npz.files:
             tt = npz["track_t"] * 1e3
             sense = p.get("sense", -1.0)
-            ax2.plot(tt, sense * npz["track_dpsi"], lw=0.7, label="light (hold pair, monitors' sense)")
-            ax2.plot(tt, npz["track_mon_rot"], lw=0.7, label="monitors (90 V / V90 summed)")
+            plot_thin(ax2, tt, sense * npz["track_dpsi"], lw=0.7, label="light (hold pair, monitors' sense)")
+            plot_thin(ax2, tt, npz["track_mon_rot"], lw=0.7, label="monitors (90 V / V90 summed)")
             if "track_dpsi_rest" in npz.files:
-                ax2.plot(tt, sense * npz["track_dpsi_rest"], lw=0.7, alpha=0.7, label="light (rest pair)")
-            ax2.set(ylabel="rotation (deg)"); ax2.legend(fontsize=6); ax2.grid(alpha=0.3)
+                plot_thin(ax2, tt, sense * npz["track_dpsi_rest"], lw=0.7, alpha=0.7, label="light (rest pair)")
+            ax2.set(ylabel="rotation (deg)"); ax2.legend(fontsize=6, loc="upper right"); ax2.grid(alpha=0.3)
             lm = npz["track_lm"] * 1e3
             v = npz["track_valid"].astype(bool)
-            ax3.plot(tt[v], lm[v], lw=0.7, label="light - monitors, hold pair (valid)")
+            plot_thin(ax3, tt[v], lm[v], lw=0.7, label="light - monitors, hold pair (valid)")
             if "track_lm_rest" in npz.files:
                 vr = npz["track_valid_rest"].astype(bool)
-                ax3.plot(tt[vr], npz["track_lm_rest"][vr] * 1e3, lw=0.7, label="rest pair (valid)")
+                plot_thin(ax3, tt[vr], npz["track_lm_rest"][vr] * 1e3, lw=0.7, label="rest pair (valid)")
             tk_ = p.get("track") or {}
             ax3.set(ylabel="mdeg", xlabel="t (ms)", ylim=(-1500, 800),
                     title=f"creep {tk_.get('hold_slope_mdeg_ms', float('nan')):+.1f} mdeg/ms, after 1 ms {tk_.get('after_1ms_mdeg', float('nan')):+.0f}, "
                           f"extreme {tk_.get('after_extreme_mdeg', float('nan')):+.0f} at {tk_.get('after_extreme_ms', float('nan')):.0f} ms, tau {tk_.get('tau_ms', float('nan')):.0f} ms")
-            ax3.legend(fontsize=6); ax3.grid(alpha=0.3)
+            ax3.legend(fontsize=6, loc="upper right"); ax3.grid(alpha=0.3)
         self.track_plot.draw()
 
     def _bias_summary(self):
@@ -452,7 +496,7 @@ class Viewer(tk.Tk):
         for k, s in enumerate(self._angles):
             if abs((s["landed"] - crossed + 90) % 180 - 90) <= 8:
                 self.angle_list.select_set(k)
-        self._draw_traces()
+        self._refresh_tab()
 
     def _draw_traces(self):
         data = self.cur[2]
@@ -465,20 +509,20 @@ class Viewer(tk.Tk):
         cols = matplotlib.cm.hsv(np.linspace(0, 0.95, max(len(th), 2)))
         for s in sel:
             k = int(np.argmin(np.abs(th - s["landed"])))
-            ax1.plot(t, I[k] * 1e3, color=cols[k], lw=0.6, label=f"{th[k]:.1f} deg")
+            plot_thin(ax1, t, I[k] * 1e3, color=cols[k], lw=0.6, label=f"{th[k]:.1f} deg")
         ax1.set(ylabel="PD (mV, dark-subtracted, drift-corrected)" if d.subtract_dark else "PD (mV, raw)",
                 title=f"{d.name}: PD traces per analyzer angle ({len(sel)} of {len(th)} shown)")
         if sel:
-            ax1.legend(fontsize=6, ncol=4)
+            ax1.legend(fontsize=6, ncol=4, loc="upper right")
         ax1.grid(alpha=0.3)
         for r in ("MonX1", "MonX2"):
             if r in d.roles:
                 m = np.mean([s["v"][r] for s in pol["steps"]], axis=0)
-                ax2.plot(t, K_MON[r] * (m - m[d.t < -0.1e-3].mean()), lw=0.7, label=f"{r} (deg)")
+                plot_thin(ax2, t, K_MON[r] * (m - m[d.t < -0.1e-3].mean()), lw=0.7, label=f"{r} (deg)")
         for r in ("CmdX1", "CmdX2"):
             if r in d.roles:
                 m = np.mean([s["v"][r] for s in pol["steps"]], axis=0)
-                ax2.plot(t, m - m[d.t < -0.1e-3].mean(), lw=0.7, ls=":", label=f"{r} (AWG V)")
+                plot_thin(ax2, t, m - m[d.t < -0.1e-3].mean(), lw=0.7, ls=":", label=f"{r} (AWG V)")
         mon_sum = np.zeros(len(t))
         for r in ("MonX1", "MonX2"):
             if r in d.roles:
@@ -486,8 +530,8 @@ class Viewer(tk.Tk):
                 mon_sum += K_MON[r] * (m - m[d.t < -0.1e-3].mean())
         sign = -1.0 if pol.get("rotation") is not None and np.ptp(mon_sum) > 1 and np.corrcoef(pol["rotation"], mon_sum)[0, 1] < 0 else 1.0
         if pol.get("rotation") is not None:
-            ax2.plot(t, sign * pol["rotation"], "k", lw=0.7, label="light rotation (fit, monitors' sense, deg)")
-        ax2.set(xlabel="t (ms)", ylabel="deg / V"); ax2.legend(fontsize=6); ax2.grid(alpha=0.3)
+            plot_thin(ax2, t, sign * pol["rotation"], "k", lw=0.7, label="light rotation (fit, monitors' sense, deg)")
+        ax2.set(xlabel="t (ms)", ylabel="deg / V"); ax2.legend(fontsize=6, loc="upper right"); ax2.grid(alpha=0.3)
         self.trace_plot.draw()
 
     def _draw_fit(self):
@@ -506,14 +550,14 @@ class Viewer(tk.Tk):
                 mon += K_MON[r] * (m - m[d.t < -0.1e-3].mean())
         rot = pol["rotation"]
         sign = -1.0 if np.corrcoef(rot, mon)[0, 1] < 0 else 1.0
-        ax1.plot(t, sign * rot, lw=0.7, label="light (monitors' sense)"); ax1.plot(t, mon, lw=0.7, label="monitors")
-        ax1.set(ylabel="rotation (deg)", title=f"{d.name}: harmonic fit against time ({len(pol['theta'])} angles)"); ax1.legend(fontsize=6); ax1.grid(alpha=0.3)
+        plot_thin(ax1, t, sign * rot, lw=0.7, label="light (monitors' sense)"); plot_thin(ax1, t, mon, lw=0.7, label="monitors")
+        ax1.set(ylabel="rotation (deg)", title=f"{d.name}: harmonic fit against time ({len(pol['theta'])} angles)"); ax1.legend(fontsize=6, loc="upper right"); ax1.grid(alpha=0.3)
         lm = (sign * rot - mon) * 1e3
-        ax2.plot(t, lm - np.median(lm[d.t < -0.1e-3]), lw=0.6, color="C3"); ax2.set(ylabel="light - monitors (mdeg)", ylim=(-2000, 2000)); ax2.grid(alpha=0.3)
-        ax3.plot(t, pol["imax"], lw=0.6, label="Imax (V)"); ax3.plot(t, pol["imin"] * 100, lw=0.6, label="Imin x 100 (V)")
-        ax3.set(ylabel="V"); ax3.legend(fontsize=6); ax3.grid(alpha=0.3)
-        ax4.plot(t, pol["rms"] * 1e3, lw=0.6, label="fit rms (mV)"); ax4.plot(t, pol["sig_psi"] * 1e3, lw=0.6, label="sig psi (mdeg)")
-        ax4.set(xlabel="t (ms)", ylabel="mV / mdeg", yscale="log"); ax4.legend(fontsize=6); ax4.grid(alpha=0.3)
+        plot_thin(ax2, t, lm - np.median(lm[d.t < -0.1e-3]), lw=0.6, color="C3"); ax2.set(ylabel="light - monitors (mdeg)", ylim=(-2000, 2000)); ax2.grid(alpha=0.3)
+        plot_thin(ax3, t, pol["imax"], lw=0.6, label="Imax (V)"); plot_thin(ax3, t, pol["imin"] * 100, lw=0.6, label="Imin x 100 (V)")
+        ax3.set(ylabel="V"); ax3.legend(fontsize=6, loc="upper right"); ax3.grid(alpha=0.3)
+        plot_thin(ax4, t, pol["rms"] * 1e3, lw=0.6, label="fit rms (mV)"); plot_thin(ax4, t, pol["sig_psi"] * 1e3, lw=0.6, label="sig psi (mdeg)")
+        ax4.set(xlabel="t (ms)", ylabel="mV / mdeg", yscale="log"); ax4.legend(fontsize=6, loc="upper right"); ax4.grid(alpha=0.3)
         self.fit_plot.draw()
 
     def _draw_er(self):
@@ -523,14 +567,18 @@ class Viewer(tk.Tk):
             self.status.set(f"{d.name}: {pol['no_fit']} - only the Traces tab applies")
             fig = self.er_plot.clear(); fig.text(0.5, 0.5, pol['no_fit'] + ' - only the Traces tab applies', ha='center'); self.er_plot.draw(); return
         half, box = float(self.er_half.get()), float(self.er_box.get())
-        er = an.er_vs_time(d, pol, half_deg=half, box_us=box, stride=1, gains=pol.get("angle_gain"))
-        data["er"] = er
+        if data.get("er") is None or data.get("er_key") != (half, box):
+            data["er"] = an.er_vs_time(d, pol, half_deg=half, box_us=box, stride=1, gains=pol.get("angle_gain"))
+            data["er_key"] = (half, box)
+        er = data["er"]
         if data.get("direct") is None:
             data["direct"] = an.direct_er(d, pol, gains=pol.get("angle_gain"))
         fig = self.er_plot.clear()
         t = d.t * 1e3
         ax1 = fig.add_subplot(311); ax2 = fig.add_subplot(312, sharex=ax1); ax3 = fig.add_subplot(313, sharex=ax1)
         if len(er["t"]):
+            st = max(1, len(er["t"]) // 6000)
+            er = {k: (v[::st] if isinstance(v, np.ndarray) else v) for k, v in er.items()}
             te = er["t"] * 1e3
             par = er["method"] == 1
             ax1.plot(te[par], er["er"][par], ".", ms=2, label=f"parabola through >= 3 angles within +-{half:g} deg")
@@ -554,15 +602,15 @@ class Viewer(tk.Tk):
         ax2.axhline(vdiv * 8 / 256 * 1e3, color="gray", lw=0.5, ls=":", label=f"one 8-bit code at {vdiv:g} V/div")
         ax1.set(yscale="log", ylabel="ER", title=f"{d.name}: extinction ratio against time from the angles near crossed (Imax from the fit)")
         ax1.legend(fontsize=6, loc="upper right"); ax1.grid(alpha=0.3, which="both")
-        ax2.set(ylabel="mV", yscale="symlog", title="Imin and its 2-sigma noise"); ax2.legend(fontsize=6); ax2.grid(alpha=0.3)
+        ax2.set(ylabel="mV", yscale="symlog", title="Imin and its 2-sigma noise"); ax2.legend(fontsize=6, loc="upper right"); ax2.grid(alpha=0.3)
         # the angle traces that feed it
         th = pol["theta"]; I = pol["I"]
         used = sorted({a for _n, angs in er["sets"] for a in angs})
         for a in used:
             k = int(np.argmin(np.abs(th - a)))
-            ax3.plot(t, I[k] * 1e3, lw=0.6, label=f"{a:.1f} deg")
+            plot_thin(ax3, t, I[k] * 1e3, lw=0.6, label=f"{a:.1f} deg")
         ax3.plot(t, np.where(len(er["t"]) and True, np.interp(d.t, er["t"], er["imin"], left=np.nan, right=np.nan) * 1e3, np.nan), "k", lw=0.8, label="Imin(t)")
-        ax3.set(xlabel="t (ms)", ylabel="mV", yscale="symlog", title="the near-crossed angle traces behind it"); ax3.legend(fontsize=6, ncol=4); ax3.grid(alpha=0.3)
+        ax3.set(xlabel="t (ms)", ylabel="mV", yscale="symlog", title="the near-crossed angle traces behind it"); ax3.legend(fontsize=6, ncol=4, loc="upper right"); ax3.grid(alpha=0.3)
         self.er_plot.draw()
 
     def _scan_summary(self):
