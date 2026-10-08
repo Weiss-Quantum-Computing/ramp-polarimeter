@@ -454,7 +454,8 @@ def stage_compensate(st, cfg, parts, log, ask, prov):
         hold = (t >= t_hold0 + 0.5e-3) & (t <= t_hold1 - 0.1e-3)
         ref = (t >= t_hold0 + 0.5e-3) & (t <= t_hold0 + 1.5e-3)
         err[hold] = sense * (tr["dpsi"][hold] - tr["dpsi"][ref].mean())
-        tail = t >= t_fall + 1.0e-3
+        t_end = t_fall + float(plan["tail_ms"]) * 1e-3 + float(plan.get("track_ms") or 0) * 1e-3
+        tail = (t >= t_fall + 1.0e-3) & (t <= t_end - 0.5e-3)
         if "dpsi_rest" in tr:
             v = tr.get("valid_rest", np.ones(len(t), bool))
             err[tail & v] = sense * tr["dpsi_rest"][tail & v]
@@ -531,7 +532,7 @@ def stage_transients(st, cfg, parts, log, ask, prov):
     for h in hold_list:
         tail = float(st.get("tail_ms", 0.5))
         rec = float(st.get("lead_ms", 0.5)) + 2 * float(st.get("rise_ms", 1.0)) + h + tail
-        track_ms = max(5.0, min(float(st.get("track_ms", 200.0)), period - rec - 5.0))
+        track_ms = max(5.0, min(float(st.get("track_ms", 200.0)), period - rec - 10.0))
         plan = dict(biasmod.PLAN, **cfg["bias"])
         plan.pop("name", None)
         skip = ("stage", "name", "hold_ms_list", "period_ms", "nulls_from")

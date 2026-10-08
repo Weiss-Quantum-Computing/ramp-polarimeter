@@ -469,7 +469,7 @@ def track_azimuth(t, I_plus, I_minus, imin, mons, ref, sense=-1.0, chan=CHAN):
             "a0_rel": a0 / a0[m].mean() - 1.0, "valid": np.abs(ratio) < 0.95}
 
 
-def track_summary(t, lm_hold, w, t_fall, lm_rest=None, valid_rest=None):
+def track_summary(t, lm_hold, w, t_fall, lm_rest=None, valid_rest=None, t_end=None):
     """Numbers from light minus monitors (deg) against t (s): the creep
     slope through the hold window `w` (mdeg/ms) from the hold pair; from
     the rest pair (else the hold pair) the value 1 ms after the fall ends
@@ -487,6 +487,8 @@ def track_summary(t, lm_hold, w, t_fall, lm_rest=None, valid_rest=None):
     lm = lm_rest if lm_rest is not None else lm_hold
     out["after_from"] = "rest pair" if lm_rest is not None else "hold pair"
     a = t >= t_fall + 1.0e-3
+    if t_end is not None:
+        a &= t <= t_end - 0.5e-3           # not past the record (the next burst)
     if valid_rest is not None:
         a &= valid_rest
     if a.sum() >= 20:
@@ -746,7 +748,11 @@ class BiasRun:
         try:
             # the scope covers the record (and the tracked tail): 10 divisions
             # from the lead's start
-            div = _nice_up(span * 1.05 / 10)
+            # rounded up to two significant figures (the scope takes e.g. 19
+            # ms/div): a 1-2-5 step took a 193 ms span to 500 ms on 8 Oct
+            # 2026, past the 270 ms trigger period, and the next burst sat
+            # in the tracked tail
+            div = _nice2(span * 1.02 / 10)
             sc.put(":TIMebase:REFerence", "LEFT")
             sc.put(":TIMebase:SCALe", f"{div:.6g}")
             sc.put(":TIMebase:POSition", f"{-0.2e-3 + div:.6g}")   # LEFT: start 1 div before
@@ -969,8 +975,9 @@ class BiasRun:
               "fit": None, "scan": None, "imax": imax4, "sig_imax": None,
               "imin": None, "sig_imin": None, "er": None, "er_lower": None, "sense": sense,
               "hold_ms": float(p["hold_ms"])}
+        t_end = t_fall + float(p["tail_ms"]) * 1e-3 + float(p.get("track_ms") or 0) * 1e-3
         pt["track"] = track_summary(t, tr["lm"], w, t_fall, tr.get("lm_rest"),
-                                    tr.get("valid_rest"))
+                                    tr.get("valid_rest"), t_end=t_end)
         extra = {f"track_{k}": v for k, v in tr.items() if isinstance(v, np.ndarray)}
         np.savez_compressed(os.path.join(self.folder, f"point_{i:02d}.npz"),
                             t=t[::10], **{k: v[::10] for k, v in traces.items()}, **extra)
@@ -1110,8 +1117,9 @@ class BiasRun:
               "imax": imax, "sig_imax": imax_s, **er}
         pt["sense"] = sense
         if tr is not None:
+            t_end = t_fall + float(p["tail_ms"]) * 1e-3 + float(p.get("track_ms") or 0) * 1e-3
             pt["track"] = track_summary(tr["t"], tr["lm"], w, t_fall, tr.get("lm_rest"),
-                                        tr.get("valid_rest"))
+                                        tr.get("valid_rest"), t_end=t_end)
             pt["track"]["a0_hold_rel"] = float(np.mean(
                 tr["a0_rel"][(tr["t"] >= w[0]) & (tr["t"] <= w[1])]))
         extra = {} if tr is None else {f"track_{k}": v for k, v in tr.items()
@@ -1150,6 +1158,12 @@ def _jsonable(x):
 
 def _key(setting):
     return f"{setting[0]:.6g}V/div@{setting[1]:+.6g}"
+
+
+def _nice2(x):
+    """x rounded UP to two significant figures."""
+    e = math.floor(math.log10(x)) - 1
+    return math.ceil(x / 10 ** e - 1e-9) * 10 ** e
 
 
 def _nice_up(x):
