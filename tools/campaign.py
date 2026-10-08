@@ -14,6 +14,12 @@ plan.json:
        "darks_from": "ER_grid_15deg"}
     ]}
 
+A 'compensate' stage cancels the slow drift at one held point by iterating
+a correction on the plateau from the tracked light-minus-monitors (x1, x2,
+iterations, beta, done_mdeg, tail_ms). A 'transients' stage tracks the
+azimuth through and after holds of a list of lengths (hold_ms_list), the
+nulls taken from a finished grid (nulls_from), no null scan.
+
 A 'grid' stage is a Fixed rotations run (rampol.bias.BiasRun): any plan key
 of bias.PLAN may be given; `darks_from` reuses another run's darks (no beam
 block), else the run asks for one in this terminal. A stage whose folder
@@ -358,7 +364,185 @@ def stage_ramps(st, cfg, parts, log, ask, prov):
     log(f"Stage {base} done")
 
 
-STAGES = {"grid": stage_grid, "ramps": stage_ramps}
+def _bias_run(cfg, parts, log, ask, prov, name, plan, resume=False):
+    sg, link, rot, sess, eom, bench = parts
+    roles = {r: ch for ch, (r, _n) in cfgmod.channel_roles(cfg).items()}
+    if bench is not None:
+        def ask_sim(title, text):
+            if "Block the beam" in text:
+                bench._imax_saved, bench.imax = bench.imax, 0.0
+            elif "Unblock" in text:
+                bench.imax = bench._imax_saved
+            return True
+        ask = ask_sim
+    run = biasmod.BiasRun(cfg["outdir"], name, link, rot, sess.awg, roles, plan=plan, log=log,
+                          ask=ask, progress=lambda d, t, s: log(f"  [{d}/{t}] {s}"),
+                          eomilc=eom, ilc_bench=sess.ib, provenance=prov, session=sess,
+                          resume=resume)
+    return run.run()
+
+
+def stage_compensate(st, cfg, parts, log, ask, prov):
+    """Cancel the slow drift at one held point by pre-distorting the drive:
+    each iteration measures the point (Fixed rotations, the azimuth tracked
+    at the hold's null and at the rest null) and adds -beta x the tracked
+    light-minus-monitors (deg -> AWG volts of the held crystal) to the
+    plateau: through the hold (its creep, referenced to the hold's first
+    ms) and through the tail after the fall (the after-fall offset and its
+    relaxation, referenced to the lead). The edges are left alone. The tail
+    of the plateau is long (tail_ms) so the correction has room after the
+    fall. Stops when the error's rms is under `done_mdeg` or after
+    `iterations`. Records every iteration's point and the correction (CSV,
+    JSON) under <outdir>/<name>/."""
+    sg, link, rot, sess, eom, bench = parts
+    base = scanmod.safe_name(st["name"])
+    e1, e2 = float(st.get("x1", 0) or 0), float(st.get("x2", 0) or 0)
+    chan = "EO1" if e1 or not e2 else "EO2"
+    plan = dict(biasmod.PLAN, **cfg["bias"])
+    plan.pop("name", None)
+    skip = ("stage", "name", "iterations", "beta", "done_mdeg", "smooth_ms")
+    plan.update({k: v for k, v in st.items() if k not in skip})
+    plan.update(x1=f"{e1:g}", x2=f"{e2:g}", how="pairs", idle=awg_idle(cfg), end="park",
+                predict_null=False)
+    plan.setdefault("tail_ms", 150.0)
+    plan.setdefault("dt_us", 20.0)
+    plan.setdefault("track_ms", 20.0)
+    plan.setdefault("sense", float(cfg["awg"].get("seq_sense", -1.0) or -1.0))
+    iters = int(st.get("iterations", 4))
+    beta = float(st.get("beta", 0.7))
+    done_mdeg = float(st.get("done_mdeg", 10.0))
+    smooth_ms = float(st.get("smooth_ms", 1.0))
+    cal = calib.get(cfg)
+    dpv = calib.deg_per_awg_v(cal, chan)
+    folder = os.path.join(cfg["outdir"], base)
+    os.makedirs(folder, exist_ok=True)
+    hist_path = os.path.join(folder, "compensation.json")
+    hist = {"name": base, "x1": e1, "x2": e2, "channel": chan, "deg_per_V": dpv, "beta": beta,
+            "iterations": []}
+    if os.path.isfile(hist_path):
+        with open(hist_path, encoding="utf-8") as fh:
+            hist = json.load(fh)
+        if hist.get("finished"):
+            log(f"Stage {base}: already finished - skipped")
+            return
+    corr = hist.get("correction")          # {t_s, u_V} of the last iteration, or None
+    t_hold0 = (plan["lead_ms"] + plan["rise_ms"]) * 1e-3
+    t_hold1 = t_hold0 + plan["hold_ms"] * 1e-3
+    t_fall = t_hold1 + plan["rise_ms"] * 1e-3
+    for k in range(len(hist["iterations"]), iters):
+        it_plan = dict(plan, correction={chan: corr} if corr else None)
+        name = f"{base}_it{k}"
+        log(f"Compensation {base}, iteration {k}: "
+            + ("no correction yet" if corr is None else
+               f"correction peak {np.max(np.abs(corr['u_V'])) * 1e3:.1f} mV"))
+        pts = _bias_run(cfg, parts, log, ask, prov, name, it_plan,
+                        resume=os.path.isfile(os.path.join(cfg["outdir"], name, "bias.json")))
+        tr = biasmod.load_tracks(os.path.join(cfg["outdir"], name)).get(0)
+        if tr is None:
+            raise RuntimeError(f"{name}: no tracked azimuth on record")
+        t = tr["t"]
+        # the error: hold creep from the hold pair, referenced to the hold's
+        # first ms after the rise; the tail from the rest pair (when there is
+        # one) referenced to the lead
+        err = np.zeros(len(t))
+        hold = (t >= t_hold0 + 0.5e-3) & (t <= t_hold1 - 0.1e-3)
+        ref = (t >= t_hold0 + 0.5e-3) & (t <= t_hold0 + 1.5e-3)
+        err[hold] = tr["lm"][hold] - tr["lm"][ref].mean()
+        tail = t >= t_fall + 1.0e-3
+        if "lm_rest" in tr:
+            v = tr.get("valid_rest", np.ones(len(t), bool))
+            err[tail & v] = tr["lm_rest"][tail & v]
+        elif abs(e1 + e2) <= 25.0:
+            err[tail] = tr["lm"][tail] - tr["lm"][t < t_hold0 - 0.2e-3].mean()
+        # smooth over smooth_ms (the per-sample azimuth is ~10 mdeg of noise)
+        dt = float(np.median(np.diff(t)))
+        n = max(1, int(round(smooth_ms * 1e-3 / dt)))
+        if n > 1:
+            box = np.ones(n) / n
+            err = np.convolve(np.r_[np.full(n, err[0]), err, np.full(n, err[-1])], box,
+                              mode="same")[n:-n]
+        err[~(hold | tail)] = 0.0
+        rms = float(np.sqrt(np.mean(err[hold | tail] ** 2))) * 1e3
+        pt = pts[-1]
+        tk = pt.get("track") or {}
+        rec = {"iteration": k, "run": name, "err_rms_mdeg": rms,
+               "creep_mdeg_ms": tk.get("hold_slope_mdeg_ms"),
+               "after_1ms_mdeg": tk.get("after_1ms_mdeg"),
+               "after_extreme_mdeg": tk.get("after_extreme_mdeg"), "tau_ms": tk.get("tau_ms"),
+               "er": pt.get("er") or pt.get("er_lower"), "imin_mV": pt["imin"] * 1e3,
+               "null_deg": pt["theta_n"], "phi_mon_deg": pt.get("phi_mon")}
+        hist["iterations"].append(rec)
+        log(f"  iteration {k}: error rms {rms:.1f} mdeg over hold + tail; creep "
+            f"{tk.get('hold_slope_mdeg_ms', float('nan')):+.1f} mdeg/ms, after-fall "
+            f"{tk.get('after_1ms_mdeg', float('nan')):+.0f} mdeg, ER {rec['er']:.0f}")
+        # the update: the error in deg -> volts on the driven channel, on the
+        # scope's time grid (the plateau interpolates it onto its own)
+        u_prev = np.zeros(len(t)) if corr is None else np.interp(
+            t, corr["t_s"], corr["u_V"], left=0.0, right=0.0)
+        u_new = u_prev - beta * err / dpv
+        corr = {"t_s": t.tolist(), "u_V": u_new.tolist()}
+        hist["correction"] = corr
+        with open(os.path.join(folder, f"correction_it{k + 1}.csv"), "w", encoding="utf-8") as fh:
+            fh.write(f"# {base}: correction on {chan} after iteration {k} (AWG volts added to "
+                     f"the plateau), {dpv:.4f} deg per V\n")
+            fh.write("time_s,u_V\n")
+            for a, b in zip(t, u_new):
+                fh.write(f"{a:.6e},{b:.6e}\n")
+        with open(hist_path, "w", encoding="utf-8") as fh:
+            json.dump(hist, fh, indent=1)
+        if rms < done_mdeg:
+            log(f"  error under {done_mdeg:g} mdeg: done")
+            break
+    hist["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
+    with open(hist_path, "w", encoding="utf-8") as fh:
+        json.dump(hist, fh, indent=1)
+    log(f"Stage {base} done: " + "; ".join(f"it{r['iteration']} {r['err_rms_mdeg']:.0f} mdeg"
+                                           for r in hist["iterations"]))
+
+
+def stage_transients(st, cfg, parts, log, ask, prov):
+    """The azimuth against time at held points for a list of hold lengths
+    (hold_ms_list, e.g. 0.5 .. 200 ms), tracked only: no null scan, the
+    hold's null taken from the run `nulls_from` (a finished grid) for each
+    (x1, x2), the two slope pairs read at the coarse V/div (no overdrive, so
+    holds under a millisecond are fine) through the hold and after the fall
+    for as long as the trigger period allows (period_ms, default 270). One
+    Fixed rotations run per hold length, named <name>_h<hold>."""
+    hold_list = [float(x) for x in st["hold_ms_list"]]
+    period = float(st.get("period_ms", 270.0))
+    nulls = []
+    if st.get("nulls_from"):
+        with open(os.path.join(cfg["outdir"], st["nulls_from"], "bias.json"), encoding="utf-8") as fh:
+            nulls = [[q["x1"], q["x2"], q["theta_n"]] for q in json.load(fh).get("points", [])
+                     if q.get("theta_n") is not None]
+        log(f"  nulls from {st['nulls_from']}: {len(nulls)} points")
+    for h in hold_list:
+        tail = float(st.get("tail_ms", 0.5))
+        rec = float(st.get("lead_ms", 0.5)) + 2 * float(st.get("rise_ms", 1.0)) + h + tail
+        track_ms = max(5.0, min(float(st.get("track_ms", 200.0)), period - rec - 5.0))
+        plan = dict(biasmod.PLAN, **cfg["bias"])
+        plan.pop("name", None)
+        skip = ("stage", "name", "hold_ms_list", "period_ms", "nulls_from")
+        plan.update({k: v for k, v in st.items() if k not in skip})
+        plan.update(hold_ms=h, settle_ms=0.0, tail_ms=tail, track_ms=track_ms, track=True,
+                    track_only=True, idle=awg_idle(cfg), end="park", nulls=nulls,
+                    sense=float(cfg["awg"].get("seq_sense", -1.0) or -1.0))
+        plan.setdefault("dt_us", 10.0 if h >= 50 else 2.0)
+        name = f"{scanmod.safe_name(st['name'])}_h{h:g}".replace(".", "p")
+        folder = os.path.join(cfg["outdir"], name)
+        if os.path.isfile(os.path.join(folder, "bias.json")):
+            with open(os.path.join(folder, "bias.json"), encoding="utf-8") as fh:
+                if json.load(fh).get("finished"):
+                    log(f"Stage {name}: already finished - skipped")
+                    continue
+        log(f"Transients {name}: hold {h:g} ms, tracked {track_ms:g} ms after the record")
+        _bias_run(cfg, parts, log, ask, prov, name, plan,
+                  resume=os.path.isfile(os.path.join(folder, "bias.json")))
+    log(f"Stage {st['name']} done: holds " + ", ".join(f"{h:g}" for h in hold_list) + " ms")
+
+
+STAGES = {"grid": stage_grid, "ramps": stage_ramps, "compensate": stage_compensate,
+          "transients": stage_transients}
 
 
 def main(argv=None):

@@ -40,7 +40,16 @@ def main():
         {"stage": "ramps", "name": "r", "x1": "0, 40", "x2": "0", "how": "pairs",
          "darks_from": "g"},
         {"stage": "grid", "name": "g2", "x1": "20", "x2": "20", "how": "pairs", "shots": 2,
-         "points": 4000, "upload_settle_s": 0.0, "darks_from": "g", "track": False}]}
+         "points": 4000, "upload_settle_s": 0.0, "darks_from": "g", "track": False},
+        {"stage": "compensate", "name": "c", "x1": 40, "x2": 0, "iterations": 2, "shots": 2,
+         "points": 4000, "upload_settle_s": 0.0, "darks_from": "g", "tail_ms": 30.0,
+         "dt_us": 20.0, "track_ms": 10.0},
+        {"stage": "transients", "name": "t", "x1": "40, 0", "x2": "0, 40", "how": "pairs",
+         "hold_ms_list": [0.5, 5.0], "nulls_from": "g", "darks_from": "g", "shots": 2,
+         "points": 4000, "upload_settle_s": 0.0, "period_ms": 100.0},
+        {"stage": "grid", "name": "neg", "x1": "-30", "x2": "0", "how": "pairs", "shots": 2,
+         "points": 4000, "upload_settle_s": 0.0, "darks_from": "g", "track": False,
+         "allow_negative": True}]}
     plan_path = os.path.join(tmp, "plan.json")
     with open(plan_path, "w", encoding="utf-8") as fh:
         json.dump(plan, fh)
@@ -82,11 +91,39 @@ def main():
     reach = float(np.max(np.abs(pol["rotation"])))
     check("the 40 deg ramp scan analyses: rest / up / hold / down / after, hold near 40 deg",
           segs == ["rest", "up", "hold", "down", "after"] and abs(reach - 40) < 2, (segs, reach))
+    cfold = os.path.join(cfg["outdir"], "c")
+    hist = json.load(open(os.path.join(cfold, "compensation.json"), encoding="utf-8"))
+    its = hist.get("iterations", [])
+    c1 = bias.load(os.path.join(cfg["outdir"], "c_it1"))
+    corr = c1["plan"].get("correction", {}).get("EO1")
+    check("compensate stage: 2 iterations, the second played with the first's correction, "
+          "the correction on file, the drift-free bench's error small",
+          len(its) == 2 and hist.get("finished") and corr and len(corr["u_V"]) > 100
+          and os.path.isfile(os.path.join(cfold, "correction_it2.csv"))
+          and all(r["err_rms_mdeg"] < 100 for r in its),
+          [(r["iteration"], round(r["err_rms_mdeg"], 1)) for r in its])
+    for h, nm in ((0.5, "t_h0p5"), (5.0, "t_h5")):
+        th = bias.load(os.path.join(cfg["outdir"], nm))
+        tk = [q.get("track") or {} for q in th["points"]]
+        trk = bias.load_tracks(os.path.join(cfg["outdir"], nm))
+        check(f"transients at a {h:g} ms hold: 2 track-only points, the null from the grid "
+              f"where it has the point and from 4 angles where not, creep and after-fall "
+              f"numbers, traces on disk",
+              len(th["points"]) == 2 and all(q.get("track_only") for q in th["points"])
+              and [q["null_from"] for q in th["points"]] == ["plan", "4 angles"]
+              and all("hold_slope_mdeg_ms" in x and "after_1ms_mdeg" in x for x in tk)
+              and len(trk) == 2 and th["points"][0]["hold_ms"] == h,
+              [(q["x1"], q["x2"], q["null_from"], round(x.get("after_1ms_mdeg", 0))) for q, x in zip(th["points"], tk)])
+    neg = bias.load(os.path.join(cfg["outdir"], "neg"))
+    check("a negative bias is driven when the plan allows it, and read",
+          len(neg["points"]) == 1 and neg["points"][0]["x1"] == -30.0 and neg["points"][0].get("er")
+          and abs(neg["points"][0]["phi_mon"] + 30) < 1.0,
+          (neg["points"][0].get("phi_mon"), neg["points"][0].get("er")))
     # a second run of the same plan: everything finished, nothing measured again
     r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     out2 = r2.stdout + r2.stderr
     check("run again: finished stages skipped, ramp scans resumed with 0 steps to measure",
-          r2.returncode == 0 and out2.count("already finished") == 2 and "0 steps to measure" in out2,
+          r2.returncode == 0 and out2.count("already finished") == 6 and "0 steps to measure" in out2,
           out2[-800:] if not (r2.returncode == 0 and "0 steps to measure" in out2) else "")
     print()
     if FAILS:

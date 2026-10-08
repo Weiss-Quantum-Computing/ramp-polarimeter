@@ -147,6 +147,21 @@ def uses_pairs(p):
     return bool(str(dict(PLAN, **p).get("x1", "")).strip())
 
 
+def correction_on(t, p, name):
+    """The plan's correction for channel `name` (p['correction'] = {name:
+    {'t_s': [...], 'u_V': [...]}}, the drive added to the plateau - the
+    cancellation stage's learned pre-distortion), interpolated onto `t`, 0
+    outside its span and when there is none. Both ends are forced to 0 so
+    the record still starts and ends at idle."""
+    c = (p.get("correction") or {}).get(name)
+    if not c:
+        return np.zeros(len(t))
+    u = np.interp(np.asarray(t, float), np.asarray(c["t_s"], float),
+                  np.asarray(c["u_V"], float), left=0.0, right=0.0)
+    u[[0, -1]] = 0.0
+    return u
+
+
 def plateau(amp, p, idle=0.0):
     """(t, u): idle lead, raised-cosine rise to idle + amp, hold, raised-
     cosine fall, idle tail, on p['dt_us'] - one sample longer than the
@@ -238,8 +253,11 @@ def plateau_wave(item, p):
     u, t = {}, None
     for name in CHAN:
         t, u[name] = plateau(volts[name], p, float(idle.get(name, 0.0)))
+        u[name] = u[name] + correction_on(t, p, name)
     label = (f"bias X1 {e1:g} / X2 {e2:g} deg" if isinstance(item, (tuple, list, dict))
              else f"bias {float(item):g} deg")
+    if p.get("correction"):
+        label += " + correction"
     w = awgmod.Wave(t, u, p["dt_us"] * 1e-6, label,
                     hold=((p["lead_ms"] + p["rise_ms"]) * 1e-3,
                           (p["lead_ms"] + p["rise_ms"] + p["hold_ms"]) * 1e-3),
@@ -253,8 +271,9 @@ def windows(p):
     t_hold = (p["lead_ms"] + p["rise_ms"]) * 1e-3
     w = (t_hold + p["settle_ms"] * 1e-3, t_hold + (p["hold_ms"] - 0.2) * 1e-3)
     idle = (-1.0, (p["lead_ms"] - 0.05) * 1e-3)
-    if w[1] - w[0] < 0.5e-3:
-        raise ValueError(f"the hold ({p['hold_ms']} ms) leaves under 0.5 ms after "
+    least = 0.1e-3 if p.get("track_only") else 0.5e-3
+    if w[1] - w[0] < least:
+        raise ValueError(f"the hold ({p['hold_ms']} ms) leaves under {least*1e3:g} ms after "
                          f"the {p['settle_ms']} ms settle")
     return w, idle
 
@@ -276,9 +295,9 @@ def check_plateaus(items, p, eomilc=None):
         seen.append((e1, e2))
         what = f"bias {b:g} deg" if not isinstance(b, (tuple, list, dict)) else \
             f"bias X1 {e1:g} / X2 {e2:g} deg"
-        if e1 < 0 or e2 < 0:
-            raise ValueError(f"{what}: negative biases are not driven "
-                             f"(the ramps' drives are unipolar)")
+        if (e1 < 0 or e2 < 0) and not p.get("allow_negative"):
+            raise ValueError(f"{what}: negative biases are not driven unless the plan says "
+                             f"allow_negative (the ramps' drives are unipolar)")
         v = ends_volts(e1, e2)
         msgs = []
         for name, amp in v.items():
@@ -293,7 +312,11 @@ def check_plateaus(items, p, eomilc=None):
                 from eomilc.config import CHANNELS
                 from eomilc.ilc import check_limits
                 ch = CHANNELS[name]
-                _, u = plateau(amp, p, i0)
+                t_, u = plateau(amp, p, i0)
+                u = u + correction_on(t_, p, name)
+                if np.max(np.abs(u)) > p["awg_max"]:
+                    raise ValueError(f"{what}, {name}: with the correction the drive reaches "
+                                     f"{np.max(np.abs(u)):.2f} V, past the {p['awg_max']:g} V cap")
                 rep = check_limits(u, u * CHAN[name]["gain"], dt, ch, ch.limits)
                 if not rep.ok:
                     raise ValueError(f"{what}, {name}: {rep}")
@@ -376,7 +399,7 @@ def transfer(points, ref=0):
     from the null angle) against the rotation the monitors predict, both
     relative to the point with bias `ref`. Fits psi = g x phi_mon + c; returns
     dict(phi_mon, rot_light, resid, gain, offset, v90_scale, up/down split)."""
-    pts = [p for p in points if p.get("theta_n") is not None]
+    pts = [p for p in points if p.get("theta_n") is not None and not p.get("track_only")]
     if len(pts) < 2:
         return None
     psi = np.unwrap(np.deg2rad(2 * np.array([p["theta_n"] - 90 for p in pts]))) / 2
@@ -879,8 +902,92 @@ class BiasRun:
             half = math.degrees(math.asin(math.sqrt(min(need, 0.25))))
         return min(max(half, float(self.p["null_half_deg"])), 30.0)
 
+    def _point_track_only(self, i, e, direction, coarse, w, idle, prev, t_fall):
+        """A point read at the slope angles only: the hold's null from the
+        plan's `nulls` ([[x1, x2, theta_n], ...], a finished grid's) or, when
+        the point is not there, 4 coarse angles; then the two slope pairs as
+        _point does. No null scan, no ER: the hold may be shorter than the
+        scope's recovery at mV/div (0.5 ms holds, 7 Oct 2026's hold-time
+        series)."""
+        p = self.p
+        e1, e2 = float(e[0]), float(e[1])
+        b = e1 + e2
+        what = f"X1 {e1:g} / X2 {e2:g}"
+        dark_c = self.dark[_key(coarse)][0]
+        mons, traces = {}, {}
+        sense = sense_from(self.points, float(p.get("sense", -1.0)))
+        known = next((float(n[2]) for n in (p.get("nulls") or [])
+                      if abs(float(n[0]) - e1) < 1e-6 and abs(float(n[1]) - e2) < 1e-6), None)
+        rest_known = next((float(n[2]) for n in (p.get("nulls") or [])
+                           if abs(float(n[0])) < 1e-6 and abs(float(n[1])) < 1e-6), None)
+        psi = imax4 = imin4 = None
+        if known is not None:
+            theta_n = known
+        else:
+            base = 0.0 if prev is None else prev.get("psi", 0.0)
+            psi, imax4, imin4 = self._coarse_azimuth(base, coarse, w, dark_c, mons, traces)
+            theta_n = (psi + 90) % 180
+        rest_null = rest_known if rest_known is not None else theta_n - sense * b
+        pairs = [("hold", theta_n)]
+        if abs(b) > 25.0:
+            pairs.append(("rest", rest_null))
+        got = {}
+        t = None
+        for which, centre in pairs:
+            slope = {}
+            for sign, name in ((+1, "plus"), (-1, "minus")):
+                t, s = self._acquire((centre + sign * 45.0) % 180, coarse)
+                slope[name] = s["PD"].mean(axis=0) - dark_c
+                for r in ("MonX1", "MonX2"):
+                    if r in s:
+                        mons.setdefault(r, []).append(s[r])
+                traces[f"slope_{which}_{name}"] = slope[name]
+            mon_t = {r: np.vstack(v).mean(axis=0) for r, v in mons.items()}
+            ref = w if which == "hold" else (max(t[0], idle[0]), idle[1])
+            got[which] = track_azimuth(t, slope["plus"], slope["minus"], 0.0, mon_t, ref,
+                                       sense=sense)
+        tr = got["hold"]
+        tr["t"] = t
+        if "rest" in got:
+            tr["lm_rest"] = got["rest"]["lm"]
+            tr["dpsi_rest"] = got["rest"]["dpsi"]
+            tr["valid_rest"] = got["rest"]["valid"]
+        mv, phi = {}, 0.0
+        for name, c in CHAN.items():
+            r = c["mon"]
+            if r in mons:
+                stk = np.vstack(mons[r])
+                hold = self._window(t, stk, w)[0]
+                lead = self._window(t, stk, (max(t[0], idle[0]), idle[1]))[0]                     if (t < idle[1]).sum() > 5 else 0.0
+                mv[r] = hold - lead
+                phi += 90 * mv[r] / c["v90"]
+        pt = {"i": i, "bias": b, "x1": e1, "x2": e2, "dir": direction,
+              "awg": ends_volts(e1, e2), "mon_V": mv, "phi_mon": phi if mv else None,
+              "psi_coarse": psi, "imax4": imax4, "imin4": imin4, "track_only": True,
+              "null_from": "plan" if known is not None else "4 angles",
+              "theta_n": float(theta_n), "sig_theta_n": None, "psi": (theta_n - 90) % 180,
+              "fit": None, "scan": None, "imax": imax4, "sig_imax": None,
+              "imin": None, "sig_imin": None, "er": None, "er_lower": None, "sense": sense,
+              "hold_ms": float(p["hold_ms"])}
+        pt["track"] = track_summary(t, tr["lm"], w, t_fall, tr.get("lm_rest"),
+                                    tr.get("valid_rest"))
+        extra = {f"track_{k}": v for k, v in tr.items() if isinstance(v, np.ndarray)}
+        np.savez_compressed(os.path.join(self.folder, f"point_{i:02d}.npz"),
+                            t=t[::10], **{k: v[::10] for k, v in traces.items()}, **extra)
+        tk = pt["track"]
+        self.log(f"  {what} deg, hold {p['hold_ms']:g} ms: tracked at null {theta_n:.2f} "
+                 f"({pt['null_from']}); creep {tk.get('hold_slope_mdeg_ms', float('nan')):+.1f} "
+                 f"mdeg/ms, after-fall {tk.get('after_1ms_mdeg', float('nan')):+.0f} mdeg, "
+                 f"extreme {tk.get('after_extreme_mdeg', float('nan')):+.0f} at "
+                 f"{tk.get('after_extreme_ms', float('nan')):.0f} ms"
+                 + (f", tau {tk['tau_ms']:.0f} ms" if "tau_ms" in tk else "")
+                 + f", monitors {phi:+.2f} deg")
+        return pt
+
     def _point(self, i, e, direction, coarse, null_sets, w, idle, prev, track=False,
                t_fall=None):
+        if self.p.get("track_only"):
+            return self._point_track_only(i, e, direction, coarse, w, idle, prev, t_fall)
         """One point: the null (angle and Imin), the bright angle (Imax),
         the monitors, and with `track` the azimuth against time. `e` is the
         (x1, x2) pair, `prev` the previous point (None for the first)."""
