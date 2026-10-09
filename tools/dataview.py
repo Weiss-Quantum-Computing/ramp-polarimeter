@@ -12,8 +12,20 @@ tab follows it; for a ramp scan the analyzer angles to show and the direct
 extinction-ratio points - pick one and the plots mark its time and show its
 angle. Only the tabs that apply to the run are shown:
 
-    bias run:   Overview | Null scan | Tracking | Details
-    ramp scan:  Traces | Fit | ER(t) | Details
+    bias run:   Overview | Null scan | Tracking | Compare | Details
+    ramp scan:  Traces | Fit | ER(t) | Compare | Details
+
+Compare: runs added with '+ add' under the run list (a selected series adds
+all its runs) are drawn in colour with the run on screen in black - for bias
+runs the selected point's X1 / X2 in each (light minus monitors, the
+monitors' rotation, and one number per run, against the hold when the holds
+differ), for ramp scans the light's rotation, light minus monitors, the PD at
+the chosen angle and ER(t). t = 0 at the trigger or at the end of the fall.
+
+Light minus monitors (Tracking, Fit, Compare) can be taken against the
+monitors moved later by a delay - fixed, or fitted per run to the spikes it
+leaves on the edges (fit_delay) - so a measurement delay of a few us does
+not show up as an error on every edge.
 
 Runs load in the background (a 19-angle scan takes ~10 s) and stay cached;
 the toolbar's save button offers <run>_<tab>.png in the run's folder (its
@@ -30,6 +42,7 @@ warnings.filterwarnings("ignore", message="All-NaN slice encountered")
 warnings.filterwarnings("ignore", message="Mean of empty slice")
 warnings.filterwarnings("ignore", message="No artists with labels found")
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,8 +51,8 @@ from rampol import analysis as an, bias as biasmod, config as cfgmod, hw  # noqa
 
 K_MON = {"MonX1": 90.0 / 5.1283, "MonX2": 90.0 / 5.1374}
 MAX_PTS = 3000             # points per line on screen: longer traces are thinned to a min/max envelope
-TABS = {"bias": ("Overview", "Null scan", "Tracking", "Details"),
-        "scan": ("Traces", "Fit", "ER(t)", "Details")}
+TABS = {"bias": ("Overview", "Null scan", "Tracking", "Compare", "Details"),
+        "scan": ("Traces", "Fit", "ER(t)", "Compare", "Details")}
 # Overview quantities: key -> (label, unit-bearing axis label)
 QUANT = {"er": ("ER", "extinction ratio"),
          "imin": ("Imin", "Imin (mV)"),
@@ -220,6 +233,138 @@ def light_sign(pol, mon_sum):
     return -1.0 if np.corrcoef(rot, mon_sum)[0, 1] < 0 else 1.0
 
 
+def track_series(npz, p, man):
+    """A tracked point's traces in display form: t (ms), the monitors'
+    rotation (deg), light minus monitors (mdeg) per pair and the light in the
+    monitors' frame (deg) per pair, each pair masked to where it reads the
+    light. A pair reads the light only within 45 deg of its own null; its
+    'valid' flag (|ratio| < 0.95) also passes 90 deg away, where the ratio is
+    ~0 again. Each pair is therefore kept only where the monitors put the
+    light within 40 deg of that pair's null: the hold pair's null is the
+    rotation in the ER window, the rest pair's the rotation at the end."""
+    tt = npz["track_t"] * 1e3
+    w = man["window_s"]
+    sense = p.get("sense", -1.0)
+    rot = npz["track_mon_rot"]
+    w_ms = (tt >= w[0] * 1e3) & (tt <= w[1] * 1e3)
+    rot_hold = float(np.mean(rot[w_ms])) if w_ms.any() else 0.0
+    rot_rest = float(np.median(rot[-max(len(rot) // 20, 1):]))
+    out = {"t": tt, "rot": rot}
+    pairs = [("hold", "track_lm", "track_valid", rot_hold), ("rest", "track_lm_rest", "track_valid_rest", rot_rest)]
+    for name, klm, kv, r0 in pairs:
+        if klm in npz.files:
+            v = npz[kv].astype(bool) & (np.abs(rot - r0) < 40)
+            out["lm_" + name] = np.where(v, npz[klm] * 1e3, np.nan)
+            # light in the monitors' frame: dpsi = lm + sense x rotation
+            out["light_" + name] = np.where(v, rot + sense * npz[klm], np.nan)
+    return out
+
+
+def fit_delay(t, rot, es, frac=0.1, pad=3):
+    """The light's delay behind the monitors (s) and its sigma, from the
+    spikes light minus monitors shows on the edges: with the light at
+    rot(t - tau), e = light - rot ~ -tau d(rot)/dt. Fitted by least squares
+    over the edges (|d rot/dt| above `frac` of its peak, widened by `pad`
+    samples), with an offset and a slope of its own on every edge so creep
+    and offsets do not leak into tau. `es`: error traces (deg, monitors'
+    frame, NaN where not valid) on the time base t (s) of rot (deg). (nan,
+    nan) when the monitors have no edges. On 9 Oct 2026 data: +2.8..+3.3 us
+    on the 0.8 us ramp scans, 1..5 us on the 12 us tracking records; it
+    removes ~3/4 of the edge error there, not test-4's rotation-dependent
+    error."""
+    t = np.asarray(t, float)
+    dm = np.gradient(np.asarray(rot, float), t)
+    if not np.any(np.isfinite(dm)) or np.nanmax(np.abs(dm)) < 1e3:        # < 1 deg/ms: no edges
+        return np.nan, np.nan
+    edge = np.abs(dm) > frac * np.nanmax(np.abs(dm))
+    edge = np.convolve(edge.astype(float), np.ones(2 * pad + 1), "same") > 0
+    blocks = []
+    for e in es:
+        idx = np.nonzero(edge & np.isfinite(e) & np.isfinite(dm))[0]
+        for seg in np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1):
+            if len(seg) >= 5:
+                blocks.append((seg, e))
+    if not blocks:
+        return np.nan, np.nan
+    n = sum(len(sg) for sg, _ in blocks)
+    A = np.zeros((n, 1 + 2 * len(blocks))); y = np.zeros(n)
+    r = 0
+    for j, (seg, e) in enumerate(blocks):
+        k = len(seg)
+        A[r:r + k, 0] = -dm[seg]
+        A[r:r + k, 1 + 2 * j] = 1.0
+        A[r:r + k, 2 + 2 * j] = t[seg] - t[seg].mean()
+        y[r:r + k] = e[seg]
+        r += k
+    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    res = y - A @ coef
+    cov = np.linalg.pinv(A.T @ A) * float(res @ res) / max(n - A.shape[1], 1)
+    return float(coef[0]), float(np.sqrt(max(cov[0, 0], 0.0)))
+
+
+def delayed(t, y, tau):
+    """y moved later by tau (same units as t): y(t - tau)."""
+    return np.interp(np.asarray(t) - tau, t, y) if tau else y
+
+
+def track_delay(tr, tau_s, sense):
+    """track_series() output with light minus monitors taken against the
+    monitors moved later by tau_s: lm = dpsi - sense rot(t - tau), i.e.
+    lm + sense (rot - rot(t - tau)); 'rot_d' is the moved rotation."""
+    out = dict(tr)
+    rd = delayed(tr["t"], tr["rot"], tau_s * 1e3)
+    corr = sense * (tr["rot"] - rd) * 1e3
+    for k in ("lm_hold", "lm_rest"):
+        if k in tr:
+            out[k] = tr[k] + corr
+    out["rot_d"] = rd
+    return out
+
+
+def note(ax, text):
+    """A method note as a legend entry without a line, so it never covers
+    data (the legend sits outside the axes)."""
+    if text:
+        import textwrap
+        ax.plot([], [], ls="none", label=textwrap.fill(text, 34))
+
+
+def scan_fall_ms(d, mon_sum):
+    """(t in ms, how) of the end of a ramp scan's last fall: from the drive
+    record when it has one (hold end + fall time), else where the monitors
+    come half way down from their extreme for the last time; None when the
+    monitors do not move."""
+    drv = d.manifest.get("drive") or {}
+    hm, rp = drv.get("hold_ms"), drv.get("ramp") or {}
+    if hm and rp.get("fall_ms") is not None:
+        return float(hm[1]) + float(rp["fall_ms"]), "end of the fall (drive)"
+    n = max(len(mon_sum) // 20, 1)
+    dev = mon_sum - np.median(mon_sum[-n:])
+    k = int(np.argmax(np.abs(dev)))
+    if abs(dev[k]) < 2.0:
+        return None, "monitors do not move"
+    above = np.nonzero(np.abs(dev) >= 0.5 * abs(dev[k]))[0]
+    return float(d.t[above[-1]] * 1e3), "monitors half way down"
+
+
+def natural_key(name):
+    """Sort key with the numbers in a name compared as numbers ('p' as the
+    decimal point): h0p5 < h1 < h2 < h10 < h200."""
+    import re
+    return [float(x.replace("p", ".")) if x[0].isdigit() else x.lower()
+            for x in re.findall(r"\d+(?:p\d+)?|[^\d]+", name)]
+
+
+def short_labels(names):
+    """(common prefix, labels): names without their shared prefix (cut at an
+    underscore) when that leaves something to tell them apart."""
+    pre = os.path.commonprefix(names) if len(names) > 1 else ""
+    pre = pre[:pre.rfind("_") + 1] if "_" in pre else ""
+    if len(pre) < 4:
+        return "", list(names)
+    return pre.rstrip("_"), [n[len(pre):] or n for n in names]
+
+
 # ---------------------------------------------------------------------- plots
 class Toolbar(NavigationToolbar2Tk):
     def save_figure(self, *args):
@@ -246,6 +391,7 @@ class Plot(ttk.Frame):
 
     def clear(self, folder=None, name=None):
         self.fig.clear()
+        self.rect = None            # tight_layout's rect: leave room for a figure legend
         if folder:
             self.canvas.save_dir = folder
         if name:
@@ -254,7 +400,7 @@ class Plot(ttk.Frame):
 
     def draw(self):
         try:
-            self.fig.tight_layout()
+            self.fig.tight_layout(rect=getattr(self, "rect", None))
         except Exception:
             pass
         self.canvas.draw_idle()
@@ -278,6 +424,11 @@ class Viewer(tk.Tk):
         self.mark = None           # (t_ms, theta) picked in the direct-ER table
         self.raw = tk.BooleanVar(value=False)
         self._q = queue.Queue()
+        self.compare = []          # run names in the Compare tab, besides the one on screen
+        self._cmp_q = queue.Queue()
+        self._cmp_busy = set()     # (folder, raw) queued or loading for the comparison
+        self._cmp_err = {}
+        threading.Thread(target=self._cmp_worker, daemon=True).start()
         self._job = 0
         self._pending = None
         self._after = None
@@ -288,6 +439,10 @@ class Viewer(tk.Tk):
 
     # ---------------------------------------------------------------- layout
     def _build(self):
+        # light minus monitors: the monitors moved later by a delay (off | fixed | fitted per run)
+        self.dly_mode = tk.StringVar(value="off")
+        self.dly_us = tk.DoubleVar(value=3.0)
+        self._dly_fit = {}         # (folder, point or raw) -> (tau, sigma)
         style = ttk.Style(self)
         style.configure("Head.TLabel", font=("Segoe UI", 12, "bold"))
         style.configure("Sub.TLabel", foreground="#444")
@@ -319,6 +474,19 @@ class Viewer(tk.Tk):
         self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y"); self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        cf = ttk.Frame(lp)
+        lp.add(cf, weight=0)
+        row = ttk.Frame(cf); row.pack(fill="x")
+        ttk.Label(row, text="compare with (right-click a run)").pack(side="left")
+        ttk.Button(row, text="clear", width=6, command=self._cmp_clear).pack(side="right")
+        ttk.Button(row, text="remove", width=7, command=self._cmp_remove).pack(side="right")
+        ttk.Button(row, text="+ add", width=6, command=self._cmp_add).pack(side="right")
+        self.cmp_list = tk.Listbox(cf, height=5, selectmode="extended", exportselection=False)
+        self.cmp_list.pack(fill="x")
+        self.tree.bind("<Insert>", lambda _e: self._cmp_add())
+        # right-click adds a run (or a whole series) without opening it
+        self.tree_menu = tk.Menu(self, tearoff=0)
+        self.tree.bind("<Button-3>", self._tree_menu)
         self.run_info = tk.Text(lp, height=11, wrap="word", font=("Segoe UI", 9), relief="flat", background=self.cget("background"))
         lp.add(self.run_info, weight=1)
 
@@ -338,7 +506,7 @@ class Viewer(tk.Tk):
         self.nb = ttk.Notebook(rp)
         rp.add(self.nb, weight=1)
         self.tabs = {}
-        for name in ("Overview", "Null scan", "Tracking", "Traces", "Fit", "ER(t)", "Details"):
+        for name in ("Overview", "Null scan", "Tracking", "Traces", "Fit", "ER(t)", "Compare", "Details"):
             f = ttk.Frame(self.nb)
             self.nb.add(f, text=name)
             self.tabs[name] = f
@@ -358,8 +526,10 @@ class Viewer(tk.Tk):
         self.ov_plot.canvas.mpl_connect("button_press_event", self._on_ov_click)
         self._ov_hit = None
         self.null_plot = Plot(self.tabs["Null scan"]); self.null_plot.pack(fill="both", expand=True)
+        self._delay_row(self.tabs["Tracking"])
         self.track_plot = Plot(self.tabs["Tracking"]); self.track_plot.pack(fill="both", expand=True)
         self.trace_plot = Plot(self.tabs["Traces"]); self.trace_plot.pack(fill="both", expand=True)
+        self._delay_row(self.tabs["Fit"])
         self.fit_plot = Plot(self.tabs["Fit"]); self.fit_plot.pack(fill="both", expand=True)
         ef = self.tabs["ER(t)"]
         row = ttk.Frame(ef); row.pack(fill="x", padx=4, pady=2)
@@ -372,6 +542,23 @@ class Viewer(tk.Tk):
         ttk.Label(row, text="us").pack(side="left")
         ttk.Button(row, text="recompute", command=self._refresh_tab).pack(side="left", padx=8)
         self.er_plot = Plot(ef); self.er_plot.pack(fill="both", expand=True)
+        cf = self.tabs["Compare"]
+        row = ttk.Frame(cf); row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="t = 0 at:").pack(side="left")
+        self.cmp_align = tk.StringVar(value="trigger")
+        for v, lab in (("trigger", "the trigger"), ("fall", "the end of the (last) fall")):
+            self._cmp_last_radio = ttk.Radiobutton(row, text=lab, value=v, variable=self.cmp_align, command=self._refresh_tab)
+            self._cmp_last_radio.pack(side="left", padx=2)
+        self.cmp_key_row = ttk.Frame(row)
+        self.cmp_key_row.pack(side="left", padx=12)
+        ttk.Label(self.cmp_key_row, text="number per run:").pack(side="left")
+        self.cmp_key = tk.StringVar(value=QUANT["after"][0])
+        cb = ttk.Combobox(self.cmp_key_row, textvariable=self.cmp_key, values=[v[0] for v in QUANT.values()], state="readonly", width=16)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_tab())
+        ttk.Label(row, text="  (the run on screen in black, compared runs in colour)", style="Sub.TLabel").pack(side="left")
+        self._delay_row(cf)
+        self.cmp_plot = Plot(cf); self.cmp_plot.pack(fill="both", expand=True)
         df = self.tabs["Details"]
         row = ttk.Frame(df); row.pack(fill="x", padx=4, pady=2)
         ttk.Button(row, text="open folder", command=lambda: self.cur and os.startfile(self.cur[1])).pack(side="left")
@@ -380,6 +567,61 @@ class Viewer(tk.Tk):
         ys = ttk.Scrollbar(df, orient="vertical", command=self.details.yview)
         self.details.configure(yscrollcommand=ys.set)
         ys.pack(side="right", fill="y"); self.details.pack(fill="both", expand=True)
+
+    def _delay_row(self, parent):
+        """The delay-correction controls; the three tabs that show light minus
+        monitors share one setting."""
+        row = ttk.Frame(parent); row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="light - monitors, delay correction:").pack(side="left")
+        ttk.Radiobutton(row, text="off", value="off", variable=self.dly_mode, command=self._refresh_tab).pack(side="left", padx=2)
+        ttk.Radiobutton(row, text="fixed", value="fixed", variable=self.dly_mode, command=self._refresh_tab).pack(side="left", padx=2)
+        e = ttk.Entry(row, textvariable=self.dly_us, width=5)
+        e.pack(side="left")
+        e.bind("<Return>", lambda _e: self._refresh_tab()); e.bind("<FocusOut>", lambda _e: self._refresh_tab())
+        ttk.Label(row, text="us").pack(side="left")
+        ttk.Radiobutton(row, text="fitted per run", value="fit", variable=self.dly_mode, command=self._refresh_tab).pack(side="left", padx=6)
+        ttk.Label(row, text="  (the light against the monitors moved later by the delay; positive = light behind)",
+                  style="Sub.TLabel").pack(side="left")
+
+    def _dly(self):
+        try:
+            us = float(self.dly_us.get())
+        except (tk.TclError, ValueError):
+            us = 0.0
+        return self.dly_mode.get(), us
+
+    def _delay(self, key, t_s, rot, es):
+        """(tau in s, note) for light minus monitors under the chosen
+        correction; fits are cached per run (per point for bias runs)."""
+        mode, us = self._dly()
+        if mode == "off":
+            return 0.0, ""
+        if mode == "fixed":
+            return us * 1e-6, f"monitors delayed {us:g} us"
+        if key not in self._dly_fit:
+            self._dly_fit[key] = fit_delay(t_s, rot, es)
+        tau, sig = self._dly_fit[key]
+        if not np.isfinite(tau):
+            return 0.0, "no delay fitted (the monitors have no edges)"
+        return tau, f"monitors delayed {tau*1e6:.2f} +- {sig*1e6:.2f} us (fitted to the edges)"
+
+    def _track_corrected(self, folder, p, man, npz):
+        """A tracked point's display traces with the delay correction."""
+        tr = track_series(npz, p, man)
+        sense = p.get("sense", -1.0)
+        es = [sense * tr["lm_" + k] * 1e-3 for k in ("hold", "rest") if "lm_" + k in tr]
+        tau, txt = self._delay((folder, p["i"]), tr["t"] * 1e-3, tr["rot"], es)
+        return (track_delay(tr, tau, sense) if tau else tr), tau, txt
+
+    def _scan_lm(self, folder, d, light, mon):
+        """Light minus monitors (mdeg) of a ramp scan, zeroed before t = 0,
+        with the delay correction."""
+        tau, txt = self._delay((folder, bool(self.raw.get())), d.t, mon, [light - mon])
+        lm = (light - delayed(d.t, mon, tau)) * 1e3
+        pre0 = d.t < -0.1e-3
+        if pre0.any():
+            lm = lm - np.median(lm[pre0])
+        return lm, tau, txt
 
     def _build_point_table(self):
         f = self.point_frame = ttk.Frame(self.sel_area)
@@ -576,6 +818,13 @@ class Viewer(tk.Tk):
     def _on_loaded(self, job, name, kind, folder, raw, data, err):
         if data is not None:
             self.loaded[(folder, raw)] = data
+        if job == -1:               # a compared run
+            self._cmp_busy.discard((folder, raw))
+            if err:
+                self._cmp_err[name] = err
+            if self._tab() == "Compare":
+                self._refresh_tab()
+            return
         if job != self._job:
             return              # the user has moved on; kept in the cache
         self._loading = None
@@ -638,13 +887,15 @@ class Viewer(tk.Tk):
         key = (self.cur[1], self.raw.get() if kind == "scan" else None,
                self.sel_point if kind == "bias" else (tuple(self.angle_list.curselection()), self.mark),
                self.ov_key.get() if tab == "Overview" else None,
-               (self.er_half.get(), self.er_box.get()) if tab == "ER(t)" else None)
+               (self.er_half.get(), self.er_box.get()) if tab == "ER(t)" else None,
+               self._cmp_state() if tab == "Compare" else None,
+               self._dly() if tab in ("Tracking", "Fit", "Compare") else None)
         if self.drawn.get(tab) == key:
             return
         self.drawn[tab] = key
         draw = {"Overview": self._draw_overview, "Null scan": self._draw_null, "Tracking": self._draw_track,
                 "Traces": self._draw_traces, "Fit": self._draw_fit, "ER(t)": self._draw_er,
-                "Details": self._details}[tab]
+                "Compare": self._draw_compare, "Details": self._details}[tab]
         try:
             draw()
         except Exception as exc:
@@ -898,30 +1149,16 @@ class Viewer(tk.Tk):
                 plot_thin(axs[0], t, npz[k], lw=0.7, label=lab)
         axs[0].axvspan(w[0] * 1e3, w[1] * 1e3, color="orange", alpha=0.15, label="ER window")
         axs[0].set(title=f"Slope-pair traces, point {p['i']} (X1 {p['x1']:g} / X2 {p['x2']:g})", ylabel="PD (V)")
-        tt = npz["track_t"] * 1e3
-        sense = p.get("sense", -1.0)
-        rot = npz["track_mon_rot"]
-        # A pair reads the light only within 45 deg of its own null; its 'valid'
-        # flag (|ratio| < 0.95) also passes 90 deg away, where the ratio is ~0
-        # again. Each pair is therefore shown only where the monitors put the
-        # light within 40 deg of that pair's null: the hold pair's null is the
-        # rotation in the ER window, the rest pair's the rotation at the end.
-        w_ms = (tt >= w[0] * 1e3) & (tt <= w[1] * 1e3)
-        rot_hold = float(np.mean(rot[w_ms])) if w_ms.any() else 0.0
-        rot_rest = float(np.median(rot[-max(len(rot) // 20, 1):]))
-        v = npz["track_valid"].astype(bool) & (np.abs(rot - rot_hold) < 40)
-        lm = np.where(v, npz["track_lm"] * 1e3, np.nan)
-        plot_thin(axs[1], tt, rot, lw=0.9, color="C1", label="monitors (summed)")
-        # light in the monitors' frame: dpsi = lm + sense x rotation
-        plot_thin(axs[1], tt, np.where(v, rot + sense * npz["track_lm"], np.nan), lw=0.7, color="C0", label="light, hold pair")
-        plot_thin(axs[2], tt, lm, lw=0.7, color="C0", label="hold pair")
-        series = [lm]
-        if "track_lm_rest" in npz.files:
-            vr = npz["track_valid_rest"].astype(bool) & (np.abs(rot - rot_rest) < 40)
-            plot_thin(axs[1], tt, np.where(vr, rot + sense * npz["track_lm_rest"], np.nan), lw=0.7, color="C2", label="light, rest pair")
-            lr = np.where(vr, npz["track_lm_rest"] * 1e3, np.nan)
-            plot_thin(axs[2], tt, lr, lw=0.7, color="C2", label="rest pair")
-            series.append(lr)
+        tr, tau, dtxt = self._track_corrected(self.cur[1], p, man, npz)
+        tt = tr["t"]
+        plot_thin(axs[1], tt, tr.get("rot_d", tr["rot"]), lw=0.9, color="C1",
+                  label="monitors (summed)" + (f", +{tau*1e6:.2f} us" if tau else ""))
+        series = []
+        for pair, col in (("hold", "C0"), ("rest", "C2")):
+            if "lm_" + pair in tr:
+                plot_thin(axs[1], tt, tr["light_" + pair], lw=0.7, color=col, label=f"light, {pair} pair")
+                plot_thin(axs[2], tt, tr["lm_" + pair], lw=0.7, color=col, label=f"{pair} pair")
+                series.append(tr["lm_" + pair])
         axs[1].set(title="Rotation (each light pair shown within 40 deg of its null, by the monitors)", ylabel="rotation (deg)")
         robust_ylim(axs[2], *series, min_span=50)
         tk_ = p.get("track") or {}
@@ -930,6 +1167,7 @@ class Viewer(tk.Tk):
                          f"1 ms after the fall {fnum(tk_.get('after_1ms_mdeg'), '+.0f')} mdeg,\n"
                          f"extreme {fnum(tk_.get('after_extreme_mdeg'), '+.0f')} mdeg at {fnum(tk_.get('after_extreme_ms'), '.0f')} ms "
                          f"after the fall, relaxation tau {fnum(tk_.get('tau_ms'), '.0f')} ms")
+        note(axs[2], dtxt + ("; the numbers in the title are the run's own, without it" if tau else ""))
         if mons:
             tm = npz["t"] * 1e3
             for k in mons:
@@ -1109,11 +1347,11 @@ class Viewer(tk.Tk):
         plot_thin(axs[0], t, mon, lw=0.9, color="C1", label="monitors")
         plot_thin(axs[0], t, light, lw=0.7, color="C0", label="light")
         axs[0].set(ylabel="rotation (deg)", title=f"Harmonic fit over {len(pol['theta'])} angles, {d.name}")
-        lm = (light - mon) * 1e3
-        lm -= np.median(lm[d.t < -0.1e-3]) if np.any(d.t < -0.1e-3) else 0.0
+        lm, _tau, dtxt = self._scan_lm(self.cur[1], d, light, mon)
         plot_thin(axs[2], t, lm, lw=0.6, color="C3")
         robust_ylim(axs[2], lm, min_span=50)
         axs[2].set(ylabel="light - monitors (mdeg)", title="Light minus monitors, zeroed before t = 0")
+        note(axs[2], dtxt)
         plot_thin(axs[4], t, pol["sig_psi"] * 1e3, lw=0.6, color="C4")
         axs[4].set(ylabel="mdeg", yscale="log", title="Fit uncertainty of the light's rotation")
         plot_thin(axs[1], t, pol["imax"], lw=0.6, color="C0")
@@ -1181,6 +1419,274 @@ class Viewer(tk.Tk):
         for ax in axs:
             ax.set_xlabel("t (ms)"); ax.grid(alpha=0.3, which="both"); legend(ax)
         self.er_plot.draw()
+
+
+    # ---------------------------------------------------------------- compare
+    def _kind(self, name):
+        if not hasattr(self, "_kinds"):
+            self._kinds = {f: k for f, k, _m in self._all_runs}
+        return self._kinds.get(name) or run_kind(os.path.join(self.outdir, name))
+
+    def _cmp_worker(self):
+        """One thread loads the compared runs, one after the other."""
+        while True:
+            self._load_worker(-1, *self._cmp_q.get())
+
+    def _tree_menu(self, ev):
+        iid = self.tree.identify_row(ev.y)
+        if not iid:
+            return
+        m = self.tree_menu
+        m.delete(0, "end")
+        if iid.startswith("grp:"):
+            kids = self.tree.get_children(iid)
+            m.add_command(label=f"Compare the whole series ({len(kids)} runs)", command=lambda: self._cmp_add(iid))
+        else:
+            m.add_command(label=("Remove from compare" if iid in self.compare else "Add to compare"),
+                          command=(lambda: self._cmp_drop(iid)) if iid in self.compare else (lambda: self._cmp_add(iid)))
+            m.add_command(label="Open", command=lambda: (self.tree.selection_set(iid), self.tree.see(iid)))
+        m.tk_popup(ev.x_root, ev.y_root)
+
+    def _cmp_drop(self, name):
+        if name in self.compare:
+            self.compare.remove(name)
+            self._cmp_changed()
+
+    def _cmp_add(self, iid=None):
+        """Add a run, or every run of a series, to the comparison: `iid` from
+        the right-click menu, else the selected row of the run list."""
+        if iid is None:
+            sel = self.tree.selection()
+            if not sel:
+                return
+            iid = sel[0]
+        names = list(self.tree.get_children(iid)) if iid.startswith("grp:") else [iid]
+        for n in names:
+            if n not in self.compare:
+                self.compare.append(n)
+        self.compare.sort(key=natural_key)
+        self._cmp_changed()
+        if self.cur:
+            self.nb.select(self.tabs["Compare"])
+
+    def _cmp_remove(self):
+        for i in sorted(self.cmp_list.curselection(), reverse=True):
+            del self.compare[i]
+        self._cmp_changed()
+
+    def _cmp_clear(self):
+        self.compare = []
+        self._cmp_changed()
+
+    def _cmp_changed(self):
+        self.cmp_list.delete(0, "end")
+        for n in self.compare:
+            self.cmp_list.insert("end", n)
+        self._cmp_ensure()
+        self._refresh_tab()
+
+    def _cmp_key(self, name):
+        raw = bool(self.raw.get()) if self._kind(name) == "scan" else False
+        return (os.path.join(self.outdir, name), raw)
+
+    def _cmp_ensure(self):
+        """Queue the compared runs that are not loaded yet."""
+        for n in self.compare:
+            key = self._cmp_key(n)
+            if self._kind(n) is None or key in self.loaded or key in self._cmp_busy or n in self._cmp_err:
+                continue
+            self._cmp_busy.add(key)
+            self._cmp_q.put((n, self._kind(n), key[0], key[1], self.cache.setdefault(key[0], {})))
+
+    def _cmp_state(self):
+        return (tuple(self.compare), tuple(self._cmp_key(n) in self.loaded for n in self.compare),
+                tuple(sorted(self._cmp_err)), self.cmp_align.get(), self.cmp_key.get())
+
+    def _draw_compare(self):
+        kind, folder, data = self.cur
+        me = os.path.basename(folder)
+        if kind == "bias":
+            self.cmp_key_row.pack(side="left", padx=12, after=self._cmp_last_radio)
+        else:
+            self.cmp_key_row.pack_forget()
+        fig = self.cmp_plot.clear(folder, self._name("compare", f"_p{self.sel_point:02d}" if kind == "bias" else ""))
+        self._cmp_ensure()
+        runs, waiting, skipped = [(me, data)], [], []
+        for n in self.compare:
+            if n == me:
+                continue
+            if self._kind(n) != kind:
+                skipped.append(f"{n} (other run type)")
+            elif n in self._cmp_err:
+                skipped.append(f"{n} ({self._cmp_err[n]})")
+            elif self._cmp_key(n) not in self.loaded:
+                waiting.append(n)
+            else:
+                runs.append((n, self.loaded[self._cmp_key(n)]))
+        notes = []
+        if waiting:
+            notes.append(f"loading {len(waiting)} more ({', '.join(waiting)})")
+        if skipped:
+            notes.append("left out: " + ", ".join(skipped))
+        if len(runs) == 1 and not waiting:
+            message(fig, "Nothing to compare yet.\n\nSelect a run, or a whole series, in the list on the left and press "
+                         "'+ add' (or Insert).\nThe run on screen is drawn in black, the compared runs in colour."
+                    + ("\n\n" + "\n".join(notes) if notes else ""))
+            self.cmp_plot.draw(); return
+        pre, labs = short_labels([n for n, _ in runs])
+        cols = ["k"] + [f"C{i % 10}" for i in range(len(runs) - 1)]
+        notes += (self._cmp_bias if kind == "bias" else self._cmp_scan)(fig, runs, labs, cols)
+        handles, texts = [Line2D([], [], color=c, lw=1.6) for c in cols], list(labs)
+        if self._dly_note():
+            import textwrap
+            handles.append(Line2D([], [], ls="none")); texts.append("\n" + textwrap.fill(self._dly_note(), 30))
+        leg = fig.legend(handles, texts, loc="upper right", fontsize=7, title=pre or "runs", title_fontsize=8)
+        # leave the legend its own strip on the right
+        wfrac = leg.get_window_extent(self.cmp_plot.canvas.get_renderer()).width / fig.bbox.width
+        self.cmp_plot.rect = (0, 0, max(0.5, 0.99 - wfrac), 1)
+        self.status.set(f"Compare: {len(runs)} runs" + ("; " + "; ".join(notes) if notes else ""))
+        self.cmp_plot.draw()
+
+    def _dly_note(self):
+        mode, us = self._dly()
+        return {"off": "", "fixed": f"monitors delayed {us:g} us",
+                "fit": "monitors delayed by each run's fitted delay (values in the status line)"}[mode]
+
+    def _cmp_bias(self, fig, runs, labs, cols):
+        """The selected point's X1 / X2 in every run: light minus monitors and
+        the monitors' rotation against time, and one number per run."""
+        p0 = self._point()
+        x1, x2 = p0["x1"], p0["x2"]
+        fall = self.cmp_align.get() == "fall"
+        qkey = next((k for k, v in QUANT.items() if v[0] == self.cmp_key.get()), "after")
+        gs = fig.add_gridspec(2, 2, width_ratios=[3, 1.2])
+        ax1 = fig.add_subplot(gs[0, 0]); ax2 = fig.add_subplot(gs[1, 0], sharex=ax1); ax3 = fig.add_subplot(gs[:, 1])
+        series, rows, missing, taus = [], [], [], []
+        for (n, dat), lab, c in zip(runs, labs, cols):
+            man = dat["man"]
+            p = next((q for q in man["points"] if abs(q["x1"] - x1) < 1e-6 and abs(q["x2"] - x2) < 1e-6), None)
+            if p is None:
+                missing.append(lab)
+                continue
+            rows.append((lab, c, p.get("hold_ms") or (man.get("plan") or {}).get("hold_ms"), self._qval(p, qkey)))
+            try:
+                npz = np.load(os.path.join(self.outdir, n, f"point_{p['i']:02d}.npz"))
+            except OSError:
+                continue
+            if "track_t" not in npz.files:
+                continue
+            tr, tau, _txt = self._track_corrected(os.path.join(self.outdir, n), p, man, npz)
+            taus.append((lab, tau))
+            t = tr["t"] - (man.get("t_fall_s", 0.0) * 1e3 if fall else 0.0)
+            for pair in ("hold", "rest"):
+                if "lm_" + pair in tr:
+                    plot_thin(ax1, t, tr["lm_" + pair], color=c, lw=0.7)
+                    series.append(tr["lm_" + pair])
+            plot_thin(ax2, t, tr["rot"], color=c, lw=0.8)
+        robust_ylim(ax1, *series, min_span=50)
+        xl = "t from the end of the fall (ms)" if fall else "t (ms)"
+        ax1.set(title=f"Light minus monitors at X1 {x1:g} / X2 {x2:g} (hold and rest pairs)", ylabel="light - monitors (mdeg)", xlabel=xl)
+        ax2.set(title="Rotation from the monitors", ylabel="rotation (deg)", xlabel=xl)
+        for ax in (ax1, ax2):
+            ax.grid(alpha=0.3)
+            if fall:
+                ax.axvline(0, color="0.5", lw=0.6, ls=":")
+        # one number per run, against the hold when the runs differ in hold
+        lab_q, axlab = QUANT[qkey]
+        holds = [r[2] for r in rows]
+        by_hold = len(set(holds)) > 1 and all(h is not None for h in holds)
+        vals = []
+        for j, (lab, c, hold, (v, sg, lo)) in enumerate(rows):
+            x = hold if by_hold else j
+            if not np.isfinite(v):
+                continue
+            vals.append(v)
+            if lo:
+                ax3.plot([x], [v], "o", ms=7, mfc="none", mec=c)
+                ax3.plot([x, x], [v, v * 3], ":", color=c)
+            else:
+                ax3.errorbar([x], [v], [sg] if np.isfinite(sg) else None, fmt="o", ms=6, color=c, capsize=2)
+        if by_hold:
+            ax3.set_xlabel("hold (ms)")
+            if max(holds) / max(min(holds), 1e-9) > 20:
+                ax3.set_xscale("log")
+        else:
+            ax3.set_xticks(range(len(rows)))
+            ax3.set_xticklabels([r[0] for r in rows], rotation=60, ha="right", fontsize=7)
+            ax3.set_xlabel("run")
+        if qkey == "er" and any(v > 0 for v in vals):
+            ax3.set_yscale("log")
+        if not vals:
+            ax3.text(0.5, 0.5, f"no {lab_q} values", ha="center", transform=ax3.transAxes)
+        ax3.set(ylabel=axlab, title=f"{lab_q} at X1 {x1:g} / X2 {x2:g}")
+        ax3.grid(alpha=0.3, which="both")
+        out = [f"no X1 {x1:g} / X2 {x2:g} point in: " + ", ".join(missing)] if missing else []
+        if self._dly()[0] == "fit":
+            out.append("delays (us): " + ", ".join(f"{lb} {tau*1e6:.2f}" for lb, tau in taus))
+        return out
+
+    def _cmp_scan(self, fig, runs, labs, cols):
+        """Ramp scans side by side: the light's rotation, light minus
+        monitors, the PD at one analyzer angle and the ER against time."""
+        fall = self.cmp_align.get() == "fall"
+        sel = list(self.angle_list.curselection())
+        a0 = self._angles[sel[0]] if sel else (self._angles[0] if self._angles else None)
+        axs = [fig.add_subplot(2, 2, k + 1) for k in range(4)]
+        for ax in axs[1:]:
+            ax.sharex(axs[0])
+        ax_rot, ax_lm, ax_pd, ax_er = axs
+        lms, notes, picked, taus = [], [], [], []
+        for (n, dat), lab, c in zip(runs, labs, cols):
+            d, pol = dat["d"], dat["pol"]
+            _m, mon = mon_rotation(d, pol["steps"])
+            shift = 0.0
+            if fall:
+                shift, how = scan_fall_ms(d, mon)
+                if shift is None:
+                    notes.append(f"{lab}: no fall ({how}), not shifted")
+                    shift = 0.0
+                elif how != "end of the fall (drive)":
+                    notes.append(f"{lab}: fall from the {how}")
+            t = d.t * 1e3 - shift
+            if pol.get("rotation") is not None:
+                light = light_sign(pol, mon) * pol["rotation"]
+                plot_thin(ax_rot, t, light, color=c, lw=0.8)
+                lm, tau, _txt = self._scan_lm(os.path.join(self.outdir, n), d, light, mon)
+                taus.append((lab, tau))
+                plot_thin(ax_lm, t, lm, color=c, lw=0.7)
+                lms.append(lm)
+                if dat.get("er_cmp") is None:
+                    dat["er_cmp"] = an.er_vs_time(d, pol, half_deg=4.0, box_us=20.0, stride=1, gains=pol.get("angle_gain"))
+                er = dat["er_cmp"]
+                ok = ~er["er_lower"]
+                st = max(1, int(ok.sum()) // 4000)
+                ax_er.plot(er["t"][ok][::st] * 1e3 - shift, er["er"][ok][::st], ".", ms=1.5, color=c)
+            else:
+                plot_thin(ax_rot, t, mon, color=c, lw=0.8, ls="--")
+                notes.append(f"{lab}: no fit (dashed = monitors)")
+            if a0 is not None:
+                th = np.asarray(pol["theta"], float)
+                k = int(np.argmin(np.abs((th - a0 + 90) % 180 - 90)))
+                plot_thin(ax_pd, t, pol["I"][k] * 1e3, color=c, lw=0.7)
+                picked.append(th[k])
+        robust_ylim(ax_lm, *lms, lo=0.2, hi=99.8, min_span=100)
+        same = picked and max(picked) - min(picked) < 0.5
+        ax_rot.set(title="Light rotation (harmonic fit)", ylabel="rotation (deg)")
+        ax_lm.set(title="Light minus monitors, zeroed before t = 0", ylabel="mdeg")
+        if self._dly()[0] == "fit" and taus:
+            notes.append("delays (us): " + ", ".join(f"{lb} {tau*1e6:.2f}" for lb, tau in taus))
+        ax_pd.set(title=(f"PD at analyzer {picked[0]:.1f} deg" if same else
+                         f"PD at the angle nearest {a0:.1f} deg (mod 180)") if a0 is not None else "PD",
+                  ylabel="PD (mV)")
+        ax_er.set(title="ER vs time (+-4 deg of crossed, no lower bounds)", ylabel="ER", yscale="log")
+        xl = "t from the end of the fall (ms)" if fall else "t (ms)"
+        for ax in axs:
+            ax.set_xlabel(xl); ax.grid(alpha=0.3, which="both")
+            if fall:
+                ax.axvline(0, color="0.5", lw=0.6, ls=":")
+        if a0 is not None and not same:
+            notes.append("PD angles: " + ", ".join(f"{lb} {a:.1f}" for lb, a in zip(labs, picked)))
+        return notes
 
 
 def main():
