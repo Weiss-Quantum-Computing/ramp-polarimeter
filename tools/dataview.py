@@ -23,7 +23,7 @@ differ), for ramp scans the light's rotation, light minus monitors, the PD at
 the chosen angle and ER(t). t = 0 at the trigger or at the end of the fall.
 
 Light minus monitors (Tracking, Fit, Compare) can be taken against the
-monitors moved later by a delay - fixed, or fitted per run to the spikes it
+monitors moved later by a delay - set on a slider (-10..+10 us), or fitted per run to the spikes it
 leaves on the edges (fit_delay) - so a measurement delay of a few us does
 not show up as an error on every edge.
 
@@ -388,6 +388,30 @@ class Plot(ttk.Frame):
         self.toolbar = Toolbar(self.canvas, self)
         self.toolbar.update()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        # Tk sends the wheel to the widget with the focus: take it on entry
+        self.canvas.get_tk_widget().bind("<Enter>", lambda _e: self.canvas.get_tk_widget().focus_set())
+
+    def _on_scroll(self, ev):
+        """Mouse wheel: zoom around the cursor (shift: y only, ctrl: x only).
+        Each step is pushed on the toolbar's view stack, so Back / Home undo
+        it; axes that share x follow."""
+        ax = ev.inaxes
+        if ax is None or ev.xdata is None or ev.ydata is None:
+            return
+        f = 1 / 1.3 if ev.button == "up" else 1.3
+        key = ev.key or ""
+        self.toolbar.push_current()
+        for axis, get, set_, c, on in ((ax.xaxis, ax.get_xlim, ax.set_xlim, ev.xdata, "shift" not in key),
+                                       (ax.yaxis, ax.get_ylim, ax.set_ylim, ev.ydata, "control" not in key and "ctrl" not in key)):
+            if not on:
+                continue
+            tr = axis.get_transform()          # zoom in the axis' own scale (log, symlog, linear)
+            lo, hi = tr.transform(np.array(get(), float))
+            cc = float(tr.transform(np.array([c], float))[0])
+            new = tr.inverted().transform(np.array([cc - (cc - lo) * f, cc + (hi - cc) * f]))
+            set_(*new)
+        self.canvas.draw_idle()
 
     def clear(self, folder=None, name=None):
         self.fig.clear()
@@ -412,6 +436,10 @@ class Viewer(tk.Tk):
         super().__init__()
         self.title(f"rampol data viewer - {outdir}")
         self.geometry("1500x940")
+        try:
+            self.state("zoomed")       # maximized: the plots need the height
+        except tk.TclError:
+            pass
         self.outdir = outdir
         cfg = cfgmod.load()
         self.sg = hw.load_scope_grab(cfg["scope_grab_path"])
@@ -442,6 +470,12 @@ class Viewer(tk.Tk):
         # light minus monitors: the monitors moved later by a delay (off | fixed | fitted per run)
         self.dly_mode = tk.StringVar(value="off")
         self.dly_us = tk.DoubleVar(value=3.0)
+        self._dly_after = None
+        self.dly_us.trace_add("write", lambda *_a: self._on_dly_slide())
+        # light minus monitors y range: all the data (default) or without the edge spikes
+        self.y_clip = tk.BooleanVar(value=False)
+        # Tracking panels shown
+        self.trk_show = {k: tk.BooleanVar(value=True) for k in ("slope", "rot", "lm", "mon")}
         self._dly_fit = {}         # (folder, point or raw) -> (tau, sigma)
         style = ttk.Style(self)
         style.configure("Head.TLabel", font=("Segoe UI", 12, "bold"))
@@ -527,6 +561,10 @@ class Viewer(tk.Tk):
         self._ov_hit = None
         self.null_plot = Plot(self.tabs["Null scan"]); self.null_plot.pack(fill="both", expand=True)
         self._delay_row(self.tabs["Tracking"])
+        row = ttk.Frame(self.tabs["Tracking"]); row.pack(fill="x", padx=4)
+        ttk.Label(row, text="panels:").pack(side="left")
+        for k, lab in (("slope", "slope-pair traces"), ("rot", "rotation"), ("lm", "light - monitors"), ("mon", "monitor / command traces")):
+            ttk.Checkbutton(row, text=lab, variable=self.trk_show[k], command=self._refresh_tab).pack(side="left", padx=4)
         self.track_plot = Plot(self.tabs["Tracking"]); self.track_plot.pack(fill="both", expand=True)
         self.trace_plot = Plot(self.tabs["Traces"]); self.trace_plot.pack(fill="both", expand=True)
         self._delay_row(self.tabs["Fit"])
@@ -574,14 +612,32 @@ class Viewer(tk.Tk):
         row = ttk.Frame(parent); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="light - monitors, delay correction:").pack(side="left")
         ttk.Radiobutton(row, text="off", value="off", variable=self.dly_mode, command=self._refresh_tab).pack(side="left", padx=2)
-        ttk.Radiobutton(row, text="fixed", value="fixed", variable=self.dly_mode, command=self._refresh_tab).pack(side="left", padx=2)
-        e = ttk.Entry(row, textvariable=self.dly_us, width=5)
-        e.pack(side="left")
-        e.bind("<Return>", lambda _e: self._refresh_tab()); e.bind("<FocusOut>", lambda _e: self._refresh_tab())
+        ttk.Radiobutton(row, text="slider", value="fixed", variable=self.dly_mode, command=self._refresh_tab).pack(side="left", padx=2)
+        # one variable behind the slider on every tab; moving it selects 'slider' and redraws once it stops
+        tk.Scale(row, variable=self.dly_us, from_=-10.0, to=10.0, resolution=0.05, orient="horizontal", length=260,
+                 showvalue=True, digits=4, sliderlength=14, width=10, highlightthickness=0).pack(side="left", padx=(2, 0))
         ttk.Label(row, text="us").pack(side="left")
         ttk.Radiobutton(row, text="fitted per run", value="fit", variable=self.dly_mode, command=self._refresh_tab).pack(side="left", padx=6)
-        ttk.Label(row, text="  (the light against the monitors moved later by the delay; positive = light behind)",
-                  style="Sub.TLabel").pack(side="left")
+        ttk.Label(row, text="(+ = light behind)", style="Sub.TLabel").pack(side="left")
+        ttk.Checkbutton(row, text="y range without the edge spikes", variable=self.y_clip,
+                        command=self._refresh_tab).pack(side="left", padx=(16, 0))
+        ttk.Label(row, text="   wheel: zoom (shift: y, ctrl: x)", style="Sub.TLabel").pack(side="left")
+
+    def _on_dly_slide(self):
+        if self.dly_mode.get() != "fixed":
+            self.dly_mode.set("fixed")
+        if self._dly_after:
+            self.after_cancel(self._dly_after)
+        self._dly_after = self.after(150, self._dly_redraw)
+
+    def _dly_redraw(self):
+        self._dly_after = None
+        self._refresh_tab()
+
+    def _ylim(self, ax, *ys, **kw):
+        """Clip the y range to the bulk of the data only when asked."""
+        if self.y_clip.get():
+            robust_ylim(ax, *ys, **kw)
 
     def _dly(self):
         try:
@@ -597,7 +653,7 @@ class Viewer(tk.Tk):
         if mode == "off":
             return 0.0, ""
         if mode == "fixed":
-            return us * 1e-6, f"monitors delayed {us:g} us"
+            return us * 1e-6, (f"monitors delayed {us:g} us (slider)" if us else "")
         if key not in self._dly_fit:
             self._dly_fit[key] = fit_delay(t_s, rot, es)
         tau, sig = self._dly_fit[key]
@@ -889,7 +945,8 @@ class Viewer(tk.Tk):
                self.ov_key.get() if tab == "Overview" else None,
                (self.er_half.get(), self.er_box.get()) if tab == "ER(t)" else None,
                self._cmp_state() if tab == "Compare" else None,
-               self._dly() if tab in ("Tracking", "Fit", "Compare") else None)
+               (self._dly(), self.y_clip.get()) if tab in ("Tracking", "Fit", "Compare") else None,
+               tuple(v.get() for v in self.trk_show.values()) if tab == "Tracking" else None)
         if self.drawn.get(tab) == key:
             return
         self.drawn[tab] = key
@@ -1139,42 +1196,60 @@ class Viewer(tk.Tk):
             self.track_plot.draw(); return
         w = man["window_s"]
         mons = [k for k in npz.files if k.startswith("mon_")]
-        n = 4 if mons else 3
-        axs = [fig.add_subplot(n, 1, k + 1) for k in range(n)]
+        panels = [k for k in ("slope", "rot", "lm", "mon") if self.trk_show[k].get() and (k != "mon" or mons)]
+        if not panels:
+            message(fig, "all panels are switched off (tick one above)")
+            self.track_plot.draw(); return
+        # light minus monitors gets the most height; all panels share the time axis
+        ratio = {"slope": 1.0, "rot": 1.0, "lm": 2.4, "mon": 1.0}
+        gs = fig.add_gridspec(len(panels), 1, height_ratios=[ratio[k] for k in panels])
+        ax = {}
+        for j, k in enumerate(panels):
+            ax[k] = fig.add_subplot(gs[j], sharex=ax[panels[0]] if j else None)
+        where = f"point {p['i']} (X1 {p['x1']:g} / X2 {p['x2']:g})"
         t = npz["t"] * 1e3
-        names = {"slope_hold_plus": "hold pair, null + 45", "slope_hold_minus": "hold pair, null - 45",
-                 "slope_rest_plus": "rest pair, null + 45", "slope_rest_minus": "rest pair, null - 45"}
-        for k, lab in names.items():
-            if k in npz.files:
-                plot_thin(axs[0], t, npz[k], lw=0.7, label=lab)
-        axs[0].axvspan(w[0] * 1e3, w[1] * 1e3, color="orange", alpha=0.15, label="ER window")
-        axs[0].set(title=f"Slope-pair traces, point {p['i']} (X1 {p['x1']:g} / X2 {p['x2']:g})", ylabel="PD (V)")
+        if "slope" in ax:
+            names = {"slope_hold_plus": "hold pair, null + 45", "slope_hold_minus": "hold pair, null - 45",
+                     "slope_rest_plus": "rest pair, null + 45", "slope_rest_minus": "rest pair, null - 45"}
+            for k, lab in names.items():
+                if k in npz.files:
+                    plot_thin(ax["slope"], t, npz[k], lw=0.7, label=lab)
+            ax["slope"].axvspan(w[0] * 1e3, w[1] * 1e3, color="orange", alpha=0.15, label="ER window")
+            ax["slope"].set(title=f"Slope-pair traces, {where}", ylabel="PD (V)")
         tr, tau, dtxt = self._track_corrected(self.cur[1], p, man, npz)
         tt = tr["t"]
-        plot_thin(axs[1], tt, tr.get("rot_d", tr["rot"]), lw=0.9, color="C1",
-                  label="monitors (summed)" + (f", +{tau*1e6:.2f} us" if tau else ""))
+        if "rot" in ax:
+            plot_thin(ax["rot"], tt, tr.get("rot_d", tr["rot"]), lw=0.9, color="C1",
+                      label="monitors (summed)" + (f", +{tau*1e6:.2f} us" if tau else ""))
         series = []
         for pair, col in (("hold", "C0"), ("rest", "C2")):
             if "lm_" + pair in tr:
-                plot_thin(axs[1], tt, tr["light_" + pair], lw=0.7, color=col, label=f"light, {pair} pair")
-                plot_thin(axs[2], tt, tr["lm_" + pair], lw=0.7, color=col, label=f"{pair} pair")
+                if "rot" in ax:
+                    plot_thin(ax["rot"], tt, tr["light_" + pair], lw=0.7, color=col, label=f"light, {pair} pair")
+                if "lm" in ax:
+                    plot_thin(ax["lm"], tt, tr["lm_" + pair], lw=0.7, color=col, label=f"{pair} pair")
                 series.append(tr["lm_" + pair])
-        axs[1].set(title="Rotation (each light pair shown within 40 deg of its null, by the monitors)", ylabel="rotation (deg)")
-        robust_ylim(axs[2], *series, min_span=50)
-        tk_ = p.get("track") or {}
-        axs[2].set(ylabel="light - monitors (mdeg)",
-                   title=f"Light minus monitors: drift in the hold {fnum(tk_.get('hold_slope_mdeg_ms'), '+.1f')} mdeg/ms, "
-                         f"1 ms after the fall {fnum(tk_.get('after_1ms_mdeg'), '+.0f')} mdeg,\n"
-                         f"extreme {fnum(tk_.get('after_extreme_mdeg'), '+.0f')} mdeg at {fnum(tk_.get('after_extreme_ms'), '.0f')} ms "
-                         f"after the fall, relaxation tau {fnum(tk_.get('tau_ms'), '.0f')} ms")
-        note(axs[2], dtxt + ("; the numbers in the title are the run's own, without it" if tau else ""))
-        if mons:
-            tm = npz["t"] * 1e3
+        if "rot" in ax:
+            ax["rot"].set(title=f"Rotation, {where} (each light pair within 40 deg of its null, by the monitors)",
+                          ylabel="rotation (deg)")
+        if "lm" in ax:
+            a = ax["lm"]
+            self._ylim(a, *series, min_span=50)
+            tk_ = p.get("track") or {}
+            a.set(ylabel="light - monitors (mdeg)", title=f"Light minus monitors, {where}")
+            note(a, ("The run's numbers" + (" (no delay correction)" if tau else "") + ":"
+                     f" drift in the hold {fnum(tk_.get('hold_slope_mdeg_ms'), '+.1f')} mdeg/ms;"
+                     f" 1 ms after the fall {fnum(tk_.get('after_1ms_mdeg'), '+.0f')} mdeg;"
+                     f" extreme {fnum(tk_.get('after_extreme_mdeg'), '+.0f')} mdeg at"
+                     f" {fnum(tk_.get('after_extreme_ms'), '.0f')} ms after the fall;"
+                     f" relaxation tau {fnum(tk_.get('tau_ms'), '.0f')} ms"))
+            note(a, dtxt)
+        if "mon" in ax:
             for k in mons:
-                plot_thin(axs[3], tm, npz[k], lw=0.7, label=k[4:])
-            axs[3].set(title="Monitor and command traces", ylabel="V")
-        for ax in axs:
-            ax.set_xlabel("t (ms)"); ax.grid(alpha=0.3); legend(ax)
+                plot_thin(ax["mon"], t, npz[k], lw=0.7, label=k[4:])
+            ax["mon"].set(title=f"Monitor and command traces, {where}", ylabel="V")
+        for a in ax.values():
+            a.set_xlabel("t (ms)"); a.grid(alpha=0.3); legend(a)
         self.track_plot.draw()
 
     def _details(self):
@@ -1349,7 +1424,7 @@ class Viewer(tk.Tk):
         axs[0].set(ylabel="rotation (deg)", title=f"Harmonic fit over {len(pol['theta'])} angles, {d.name}")
         lm, _tau, dtxt = self._scan_lm(self.cur[1], d, light, mon)
         plot_thin(axs[2], t, lm, lw=0.6, color="C3")
-        robust_ylim(axs[2], lm, min_span=50)
+        self._ylim(axs[2], lm, min_span=50)
         axs[2].set(ylabel="light - monitors (mdeg)", title="Light minus monitors, zeroed before t = 0")
         note(axs[2], dtxt)
         plot_thin(axs[4], t, pol["sig_psi"] * 1e3, lw=0.6, color="C4")
@@ -1357,7 +1432,7 @@ class Viewer(tk.Tk):
         plot_thin(axs[1], t, pol["imax"], lw=0.6, color="C0")
         axs[1].set(ylabel="Imax (V)", title="Imax")
         plot_thin(axs[3], t, pol["imin"] * 1e3, lw=0.6, color="C2")
-        robust_ylim(axs[3], pol["imin"] * 1e3)
+        self._ylim(axs[3], pol["imin"] * 1e3)
         axs[3].set(ylabel="Imin (mV)", title="Imin")
         plot_thin(axs[5], t, pol["rms"] * 1e3, lw=0.6, color="C5")
         axs[5].set(ylabel="mV", yscale="log", title="Fit residual rms over the angles")
@@ -1549,7 +1624,7 @@ class Viewer(tk.Tk):
 
     def _dly_note(self):
         mode, us = self._dly()
-        return {"off": "", "fixed": f"monitors delayed {us:g} us",
+        return {"off": "", "fixed": f"monitors delayed {us:g} us (slider)" if us else "",
                 "fit": "monitors delayed by each run's fitted delay (values in the status line)"}[mode]
 
     def _cmp_bias(self, fig, runs, labs, cols):
@@ -1583,7 +1658,7 @@ class Viewer(tk.Tk):
                     plot_thin(ax1, t, tr["lm_" + pair], color=c, lw=0.7)
                     series.append(tr["lm_" + pair])
             plot_thin(ax2, t, tr["rot"], color=c, lw=0.8)
-        robust_ylim(ax1, *series, min_span=50)
+        self._ylim(ax1, *series, min_span=50)
         xl = "t from the end of the fall (ms)" if fall else "t (ms)"
         ax1.set(title=f"Light minus monitors at X1 {x1:g} / X2 {x2:g} (hold and rest pairs)", ylabel="light - monitors (mdeg)", xlabel=xl)
         ax2.set(title="Rotation from the monitors", ylabel="rotation (deg)", xlabel=xl)
@@ -1669,7 +1744,7 @@ class Viewer(tk.Tk):
                 k = int(np.argmin(np.abs((th - a0 + 90) % 180 - 90)))
                 plot_thin(ax_pd, t, pol["I"][k] * 1e3, color=c, lw=0.7)
                 picked.append(th[k])
-        robust_ylim(ax_lm, *lms, lo=0.2, hi=99.8, min_span=100)
+        self._ylim(ax_lm, *lms, lo=0.2, hi=99.8, min_span=100)
         same = picked and max(picked) - min(picked) < 0.5
         ax_rot.set(title="Light rotation (harmonic fit)", ylabel="rotation (deg)")
         ax_lm.set(title="Light minus monitors, zeroed before t = 0", ylabel="mdeg")
