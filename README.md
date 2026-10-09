@@ -585,7 +585,9 @@ output to a free scope channel (Settings..., default CH2).
 the modulator is Hi-Z, so the voltage there is twice what is programmed:
 the program sends half (OFFS, AMPL) and shows both. Into Hi-Z it reaches
 +-10 V. Settings... has *the modulator takes lo to hi V*: set it to the
-modulator input's rating - a gate outside it is refused (defaults 0..1 V).
+modulator input's rating - a gate outside it is refused (defaults 0..4.2 V: the
+AOM controller's input on this bench, 2.1 V programmed; light on at 4.2 V -
+lower *light on* if the AOM normally runs below full drive).
 The dry run reads the output on a Hi-Z scope channel: a 50 Ohm load or
 terminator shows as gain 0.5 and is named.
 

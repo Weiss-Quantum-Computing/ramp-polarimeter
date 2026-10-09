@@ -269,7 +269,9 @@ DEFAULTS = {
     # modulator input may see - set them to its rating; a gate outside is
     # refused. idle: the light's level outside the windows and between
     # bursts; windows (ms from the trigger) take the other level.
-    "ds345": {"on_v": 1.0, "off_v": 0.0, "load_min_v": 0.0, "load_max_v": 1.0,
+    # This bench (9 Oct 2026): the DS345 drives the home-built VCO/VCA AOM
+    # controller's input, which takes up to ~4.2 V (2.1 V programmed).
+    "ds345": {"on_v": 4.2, "off_v": 0.0, "load_min_v": 0.0, "load_max_v": 4.2,
               "idle": "on", "windows": "", "edge_us": 20.0, "record_ms": 0.0,
               "dry_ch": 2, "dry_shots": 4, "margin_ms": 0.3, "recover_ms": 0.5,
               "gate_refine": False},
