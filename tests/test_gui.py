@@ -584,11 +584,51 @@ def main():
     check("Malus follows the cursor without a rebuild",
           app.fig_malus.axes[0] is ax0 and "t = 3.0" in ax0.get_title(), ax0.get_title())
 
-    class Ev:
-        button, inaxes, xdata, ydata = 3, ax0, 12.5, 3.25
-    app.copy_coords(Ev())
-    check("right-click copies x and y", root.clipboard_get() == "12.5\t3.25",
-          repr(root.clipboard_get()))
+    from matplotlib.backend_bases import MouseEvent
+    cx, cy = 0.5 * sum(ax0.get_xlim()), 0.5 * sum(ax0.get_ylim())
+    px, py = ax0.transData.transform((cx, cy))
+    ev = MouseEvent("button_press_event", app.fig_malus._canvas, px, py, button=3)
+    app.fig_malus._canvas.callbacks.process("button_press_event", ev)
+    want = f"{gui.labplot.fmt_num(ev.xdata)}\t{gui.labplot.fmt_num(ev.ydata)}"
+    check("right-click copies x and y (the panel)", ev.inaxes is ax0
+          and root.clipboard_get() == want and abs(ev.xdata - cx) < 1e-6,
+          f"{root.clipboard_get()!r} vs {want!r}")
+
+    print("\nthe panel: a zoom is held across a redraw; Home releases it")
+    app.nb.select(app.fig_angle._frame)
+    root.update()
+    panel = app.fig_angle._panel
+    check("the figure carries its panel, canvas and toolbar",
+          panel.fig is app.fig_angle and app.fig_angle._canvas is panel.canvas
+          and app.fig_angle._toolbar is panel.toolbar and not panel.view_locked)
+    ax = app.fig_angle.axes[0]
+    full, yfull = ax.get_xlim(), ax.get_ylim()
+    cx, cy = 0.5 * (full[0] + full[1]), 0.5 * (yfull[0] + yfull[1])
+    panel.zoom_at(ax, cx, cy, 0.5)                 # one wheel step in, about the centre
+    zoomed = ax.get_xlim()
+    check("wheel zoom halves the x range about the cursor and locks the view",
+          panel.view_locked and abs((zoomed[1] - zoomed[0]) - 0.5 * (full[1] - full[0]))
+          < 1e-9 * (full[1] - full[0]) and "Home" in panel.view_note.cget("text"),
+          f"{full} -> {zoomed}; note {panel.view_note.cget('text')!r}")
+    app.plot_dirty.add(app.fig_angle._frame)       # mark dirty + draw: a full rebuild
+    app.draw_visible()
+    root.update()
+    ax2 = app.fig_angle.axes[0]
+    check("the view is held across the rebuild", ax2 is not ax and panel.view_locked
+          and abs(ax2.get_xlim()[0] - zoomed[0]) < 1e-9 and abs(ax2.get_xlim()[1] - zoomed[1]) < 1e-9,
+          f"{ax2.get_xlim()} vs {zoomed}")
+    app.cursor_var.set("3.5")                      # a cursor move keeps it too (in place)
+    app.set_cursor_text()
+    root.update()
+    check("... and across a cursor move", app.fig_angle.axes[0] is ax2
+          and abs(ax2.get_xlim()[0] - zoomed[0]) < 1e-9, f"{ax2.get_xlim()}")
+    panel.home()
+    root.update()
+    ax3 = app.fig_angle.axes[0]
+    check("Home releases the view and redraws auto-scaled", not panel.view_locked
+          and panel.view_note.cget("text") == "" and ax3 is not ax2
+          and abs(ax3.get_xlim()[0] - full[0]) < 1e-9 and abs(ax3.get_xlim()[1] - full[1]) < 1e-9,
+          f"{ax3.get_xlim()} vs {full}")
 
     print("\ncompare scans")
     i = list(app.cmp_lb.get(0, "end")).index("gui_test")
@@ -770,6 +810,27 @@ def main():
     xl = app.fig_shots.axes[0].get_xlim()
     check("a time window, read at full resolution", abs(xl[0] - 1.0) < 1e-6 and abs(xl[1] - 1.5) < 1e-6)
     app.fig_shots.savefig(os.path.join(out, "Shots_window.png"))
+    ax = app.fig_shots.axes[0]
+    panel = app.fig_shots._panel
+    panel.zoom_at(ax, 1.25, 0.5 * sum(ax.get_ylim()), 0.5)    # wheel: 1.0-1.5 -> 1.125-1.375 ms
+    check("a wheel zoom on Shots fires the xlim hook: the window entries follow",
+          (app.shots_t0.get(), app.shots_t1.get()) == ("1.1250", "1.3750"),
+          (app.shots_t0.get(), app.shots_t1.get()))
+    t_end = time.time() + 1.0                                 # the re-read is scheduled 150 ms on
+    while time.time() < t_end:
+        root.update()
+        time.sleep(0.02)
+    ax2 = app.fig_shots.axes[0]
+    xl = ax2.get_xlim()
+    check("... the files are re-read over the new window and the view is held",
+          ax2 is not ax and panel.view_locked and abs(xl[0] - 1.125) < 1e-6 and abs(xl[1] - 1.375) < 1e-6
+          and len(ax2.lines) >= 2, f"{xl}, locked {panel.view_locked}, {len(ax2.lines)} lines")
+    app.shots_whole()
+    root.update()
+    check("Whole record releases the held view and shows the record",
+          not panel.view_locked and app.shots_t0.get() == ""
+          and app.fig_shots.axes[0].get_xlim()[1] - app.fig_shots.axes[0].get_xlim()[0] > 5,
+          app.fig_shots.axes[0].get_xlim())
     app.cursor_t = 2.0e-3
     app.shots_crossed()
     root.update()
@@ -1020,6 +1081,11 @@ def main():
     gui.filedialog.asksaveasfilename = fake_save
     app.nb.select(app.fig_ext._frame)
     root.update()
+    panel = app.fig_ext._panel
+    stem = panel.proposed_name()
+    check("Save proposes <scan>_<tab> in the scan's saved_figures (the panel's callables)",
+          panel.proposed_dir() == os.path.join(app.result["d"].folder, "saved_figures")
+          and stem.startswith("awg_driven_Extinction_vs_"), f"{panel.proposed_dir()} | {stem}")
     app.fig_ext._toolbar._buttons["Save"].invoke()
     root.update()
     check("Save (toolbar): the scan's saved_figures folder and a filled-in name",
@@ -1027,6 +1093,48 @@ def main():
           and asked.get("initialfile", "").startswith("awg_driven_Extinction_vs_")
           and os.path.isfile(os.path.join(asked["initialdir"], asked["initialfile"])),
           f"{asked.get('initialdir')} | {asked.get('initialfile')}")
+    check("... the next Save proposes _2, and the log says where it went",
+          panel.proposed_name() == stem + "_2" and panel.last_saved == os.path.join(
+              asked["initialdir"], asked["initialfile"])
+          and "saved figure: " in app.logbox.get("1.0", "end"), panel.proposed_name())
+
+    print("\nthe data viewer's panel (tools/dataview.py)")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "dataview", os.path.join(os.path.dirname(HERE), "tools", "dataview.py"))
+    dv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dv)
+    top = tk.Toplevel(root)
+    top.withdraw()
+    homed = []
+    dvp = dv.Plot(top, on_home=lambda: homed.append(1))
+    dvp.pack(fill="both", expand=True)
+    xs = np.linspace(0, 10, 50000)
+
+    def draw_dv():
+        fig = dvp.clear(SANDBOX, "run_1 Traces")
+        ax_ = fig.add_subplot(111)
+        dv.plot_thin(ax_, xs, np.sin(xs), label="sin")
+        dv.legend(ax_)
+        dvp.draw()
+        return ax_
+    ax = draw_dv()
+    check("dataview: the panel builds, thins 50k points to an envelope, names the save",
+          len(ax.lines) == 1 and len(ax.lines[0].get_xdata()) <= 2 * dv.MAX_PTS + 2
+          and dvp.proposed_name() == "run_1_Traces" and dvp.proposed_dir() == SANDBOX,
+          f"{len(ax.lines[0].get_xdata())} pts | {dvp.proposed_name()} | {dvp.proposed_dir()}")
+    lo, hi = ax.get_xlim()
+    dvp.zoom_at(ax, 5.0, 0.0, 0.5)
+    want = (5.0 - (5.0 - lo) * 0.5, 5.0 + (hi - 5.0) * 0.5)
+    ax2 = draw_dv()
+    xl = ax2.get_xlim()
+    check("dataview: a wheel zoom is held across the tab's redraw", dvp.view_locked
+          and ax2 is not ax and abs(xl[0] - want[0]) < 1e-9 and abs(xl[1] - want[1]) < 1e-9,
+          f"{xl} vs {want}")
+    dvp.home()
+    check("dataview: Home releases the view and asks the viewer for a redraw",
+          not dvp.view_locked and homed == [1])
+    top.destroy()
 
     print("\nAWG sequence: X1 / X2 end points, one ramp scan each, with the analyzer")
     app.av["seq_x1"].set("30")

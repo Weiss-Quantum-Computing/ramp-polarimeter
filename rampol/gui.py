@@ -25,7 +25,15 @@ import numpy as np
 
 import matplotlib
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+# The figure tabs are the lab's shared plot panel, labplot.py, vendored at
+# the repo root (polarimeter.py and `python -m rampol` put it on the path).
+try:
+    import labplot
+except ImportError:
+    labplot = None
+LABPLOT_MISSING = ("labplot.py is missing: it belongs at the repo root next to "
+                   "polarimeter.py (vendored from Weiss-Quantum-Computing/lab-plot)")
 
 from . import __version__
 from . import analysis as an
@@ -135,7 +143,8 @@ class App(LightTab):
         win_w = min(1360, root.winfo_screenwidth() - 80)
         win_h = min(960, root.winfo_screenheight() - 120)
         root.geometry(f"{win_w}x{win_h}+40+20")
-        matplotlib.rcParams["font.size"] = 8
+        if labplot is not None:
+            labplot.apply_style()         # 8 pt, 7 pt legends, 150 dpi saves, no tick offsets
 
         body = ttk.Frame(root)
         body.pack(fill="both", expand=True)
@@ -757,21 +766,42 @@ class App(LightTab):
     def _fig_tab(self, name, draw, click=False):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text=name)
-        ctl = ttk.Frame(frame)
-        ctl.pack(fill="x", padx=4, pady=(4, 0))
-        fig = Figure(figsize=(7.2, 5.0), dpi=100, constrained_layout=True)
-        canvas = FigureCanvasTkAgg(fig, master=frame)
-        toolbar = NavigationToolbar2Tk(canvas, frame)
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-        fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, ctl, frame
-        self._hook_save(fig, toolbar)
+        panel = self._plot_panel(frame, frame, draw, figsize=(7.2, 5.0),
+                                 on_click=self.on_click if click else None)
+        fig = panel.fig
+        fig._ctl = panel.controls         # the tab's control row, above the figure
+        panel.controls.pack_configure(padx=4, pady=(4, 0))
+        return fig
+
+    def _plot_panel(self, parent, frame, draw, figsize=(7.2, 5.0), on_click=None):
+        """A labplot.PlotPanel in `parent` for the tab `frame`, registered as
+        a plot tab. The figure carries what the draw functions and the cursor
+        code read: _panel, _canvas, _toolbar, _frame (and _ctl, set by the
+        caller). The panel gives every tab the lab's toolbar behaviour: the
+        view held across redraws once zoomed (Home releases), wheel zoom,
+        right-click copying x<TAB>y, Save into the scan's saved_figures/.
+        `on_click(ev, fig)` gets left clicks outside the toolbar modes."""
+        if labplot is None:
+            ttk.Label(parent, text=LABPLOT_MISSING, foreground="#c60",
+                      wraplength=600).pack(fill="both", expand=True)
+            raise RuntimeError(LABPLOT_MISSING)
+        panel = labplot.PlotPanel(parent, figsize=figsize, dpi=100, constrained=True,
+                                  on_status=self.log)
+        panel.pack(fill="both", expand=True)
+        fig = panel.fig
+        fig._panel, fig._canvas, fig._toolbar, fig._frame = panel, panel.canvas, panel.toolbar, frame
+        fig._ctl = panel.controls
+        panel.save_name = lambda: self._save_name(fig)
+        panel.save_dir = lambda: self._save_dir(fig)
+        if on_click is not None:
+            panel.on_click = lambda ev: on_click(ev, fig)
+        # the wheel leaves the Poincaré sphere (a 3-D axes) alone
+        zoom_at = panel.zoom_at
+        panel.zoom_at = (lambda ax, *a, **k: None if getattr(ax, "name", "") == "3d"
+                         else zoom_at(ax, *a, **k))
         self.plot_tabs[frame] = (fig, draw)
         self.plot_dirty.add(frame)
-        canvas.mpl_connect("button_press_event", self.copy_coords)
-        if click:
-            canvas.mpl_connect("button_press_event",
-                               lambda ev, fig=fig: self.on_click(ev, fig))
-        return fig
+        return panel
 
     # one colour per compared scan; the shown scan keeps its own (the leg colours)
     CMP_COLS = ("#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#17becf")
@@ -884,16 +914,6 @@ class App(LightTab):
         self.log(f"Extinction ratio of {self.result['d'].name}: {n} rows on the clipboard "
                  f"(CSV with a '#' header) - paste it anywhere")
 
-    def _hook_save(self, fig, toolbar):
-        """The toolbar's Save button: our dialog (a name and a folder filled
-        in), not matplotlib's ('image' in the working directory). The button
-        took its command when the toolbar was built, so it is re-pointed."""
-        toolbar.save_figure = lambda *_a: self.save_figure(fig)
-        try:
-            toolbar._buttons["Save"].configure(command=toolbar.save_figure)
-        except (AttributeError, KeyError, tk.TclError):
-            pass
-
     def _figure_name(self, fig):
         """(folder, file stem) for saving a tab's figure: under the shown
         scan's folder (the output folder for the tabs that are not about a
@@ -932,24 +952,25 @@ class App(LightTab):
         stem = scanmod.safe_name(stem).replace("/", "_")
         return os.path.join(folder, "saved_figures"), stem
 
-    def save_figure(self, fig):
-        folder, stem = self._figure_name(fig)
+    def _save_dir(self, fig):
+        """The panel's Save folder: the scan's saved_figures/, made now (its
+        parent when that fails)."""
+        folder = self._figure_name(fig)[0]
         try:
             os.makedirs(folder, exist_ok=True)
         except OSError:
             folder = os.path.dirname(folder)
+        return folder
+
+    def _save_name(self, fig):
+        """The panel's proposed file stem: scan_tab[_view], with _2, _3 ...
+        when a PNG of that name is already in the folder."""
+        stem = self._figure_name(fig)[1]
+        folder = self._save_dir(fig)
         name, k = stem, 2
         while os.path.exists(os.path.join(folder, name + ".png")):
             name, k = f"{stem}_{k}", k + 1
-        p = filedialog.asksaveasfilename(
-            parent=self.root, title="Save the figure", initialdir=folder,
-            initialfile=name + ".png", defaultextension=".png",
-            filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg"), ("All", "*.*")])
-        if not p:
-            return None
-        fig.savefig(p, dpi=150)
-        self.log(f"Figure saved: {p}")
-        return p
+        return name
 
     def build_table_tab(self):
         frame = ttk.Frame(self.nb)
@@ -3456,31 +3477,31 @@ class App(LightTab):
         for var in (self.shots_t0, self.shots_t1):
             e = ttk.Entry(r, textvariable=var, width=7)
             e.pack(side="left", padx=2)
-            e.bind("<Return>", lambda _e: self.redraw(self.fig_shots))
+            e.bind("<Return>", lambda _e: self.shots_draw())
             if var is self.shots_t0:
                 ttk.Label(r, text="to").pack(side="left")
         ttk.Label(r, text="ms").pack(side="left")
         r = ttk.Frame(side)
         r.pack(fill="x", pady=(4, 0))
-        ttk.Button(r, text="Draw", command=lambda: self.redraw(self.fig_shots)).pack(side="left")
+        ttk.Button(r, text="Draw", command=self.shots_draw).pack(side="left")
         ttk.Button(r, text="Crossed at cursor", command=self.shots_crossed).pack(
             side="left", padx=4)
         ttk.Button(r, text="Whole record", command=self.shots_whole).pack(side="left")
         self.shots_info = CopyLabel(side, text="", foreground="#666", width=34)
         self.shots_info.pack(anchor="w", pady=(4, 0))
-        fig = Figure(figsize=(7.0, 5.0), dpi=100, constrained_layout=True)
-        canvas = FigureCanvasTkAgg(fig, master=right)
-        toolbar = NavigationToolbar2Tk(canvas, right)
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-        fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, side, frame
-        self._hook_save(fig, toolbar)
-        canvas.mpl_connect("button_press_event", lambda ev: self._shots_click(ev))
-        canvas.mpl_connect("button_press_event", self.copy_coords)
-        self.plot_tabs[frame] = (fig, self.draw_shots)
-        self.plot_dirty.add(frame)
+        panel = self._plot_panel(right, frame, self.draw_shots, figsize=(7.0, 5.0),
+                                 on_click=lambda ev, _fig: self._shots_click(ev))
+        fig = panel.fig
+        fig._ctl = side                   # this tab's controls are its side panel
         self.fig_shots = fig
         self._shot_cache = {}
         self._shots_drawing = False
+
+    def shots_draw(self):
+        """Draw the window the entries ask for: a view held by a zoom is
+        released first, or it would override them."""
+        self.fig_shots._panel.lock_view(False)
+        self.redraw(self.fig_shots)
 
     def _step_label(self, s):
         k = s["kind"]
@@ -3558,7 +3579,10 @@ class App(LightTab):
 
     @staticmethod
     def _decimate(t, y, n=3000):
-        """Min and max of each bin, so a dip survives the thinning."""
+        """Min and max of each bin, so a dip survives the thinning. Not
+        labplot.thin: that keeps samples, so two calls on the same t (a
+        band's low and high edge) would not share an abscissa; this returns
+        the bin centres, the same for both edges of a fill_between."""
         if len(t) <= 2 * n:
             return t, y
         k = len(t) // n
@@ -3688,11 +3712,18 @@ class App(LightTab):
         self._shots_drawing = False
 
     def _shots_zoomed(self, ax):
+        """The view changed (toolbar, wheel, Back): re-read the files at full
+        resolution over the new window. The panel re-applies a held view
+        after every redraw, which fires this again with the same limits -
+        then nothing changes and nothing is scheduled."""
         if self._shots_drawing:
             return
         a, b = ax.get_xlim()
-        self.shots_t0.set(f"{a:.4f}")
-        self.shots_t1.set(f"{b:.4f}")
+        t0, t1 = f"{a:.4f}", f"{b:.4f}"
+        if (t0, t1) == (self.shots_t0.get(), self.shots_t1.get()):
+            return
+        self.shots_t0.set(t0)
+        self.shots_t1.set(t1)
         if getattr(self, "_shots_after", None):
             self.root.after_cancel(self._shots_after)
         self._shots_after = self.root.after(150, lambda: self.redraw(self.fig_shots))
@@ -3706,7 +3737,7 @@ class App(LightTab):
     def shots_whole(self):
         self.shots_t0.set("")
         self.shots_t1.set("")
-        self.redraw(self.fig_shots)
+        self.shots_draw()
 
     def shots_crossed(self):
         """Select the scan angle closest to crossed at the cursor time, and
@@ -3730,7 +3761,7 @@ class App(LightTab):
         self.log(f"Crossed at {self.cursor_t*1e3:.3f} ms: azimuth {pol['psi'][j]:.2f} deg, "
                  f"nearest crossed analyzer {d.steps[best]['landed']:.2f} deg")
         self.nb.select(self.fig_shots._frame)
-        self.redraw(self.fig_shots)
+        self.shots_draw()
 
     # -- build: how the angles add up -------------------------------------------------
     def build_build_tab(self):
@@ -5869,15 +5900,9 @@ class App(LightTab):
             "box. The scans compared here are also drawn on the Extinction, "
             "Malus, Angle, Poincaré and Diagnostics tabs when their 'compare "
             "scans' box is ticked.")).pack(anchor="w", pady=(4, 0))
-        fig = Figure(figsize=(7.0, 5.0), dpi=100, constrained_layout=True)
-        canvas = FigureCanvasTkAgg(fig, master=right)
-        toolbar = NavigationToolbar2Tk(canvas, right)
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-        fig._canvas, fig._toolbar, fig._ctl, fig._frame = canvas, toolbar, side, frame
-        self._hook_save(fig, toolbar)
-        canvas.mpl_connect("button_press_event", self.copy_coords)
-        self.plot_tabs[frame] = (fig, self.draw_compare)
-        self.plot_dirty.add(frame)
+        panel = self._plot_panel(right, frame, self.draw_compare, figsize=(7.0, 5.0))
+        fig = panel.fig
+        fig._ctl = side                   # this tab's controls are its side panel
         self.fig_cmp = fig
         self._ylog_box(fig, True, "log y (ER)", parent=None)
 
@@ -6131,7 +6156,14 @@ class App(LightTab):
 
     # -- drawing -------------------------------------------------------------------
     def mark_dirty(self):
+        """Every tab is stale; the one on show redraws now, the others when
+        selected (draw_visible). plot_dirty is the set of stale tabs, frames
+        included for the Table, which has no panel; each panel's own `dirty`
+        flag is kept in step so the panel API says the same."""
         self.plot_dirty = set(self.plot_tabs)
+        for fig, _draw in self.plot_tabs.values():
+            if fig is not None:
+                fig._panel.mark_dirty()
         self.draw_visible()
 
     def draw_visible(self):
@@ -6192,20 +6224,13 @@ class App(LightTab):
             except Exception:
                 pass
 
-    def copy_coords(self, ev):
-        """Right-click on a plot: its x, y at the mouse to the clipboard."""
-        if getattr(ev, "button", None) != 3 or ev.inaxes is None or ev.xdata is None \
-                or getattr(ev.inaxes, "name", "") == "3d":
-            return
-        txt = f"{ev.xdata:.6g}\t{ev.ydata:.6g}"
-        self.root.clipboard_clear()
-        self.root.clipboard_append(txt)
-        lx, ly = ev.inaxes.get_xlabel() or "x", ev.inaxes.get_ylabel() or "y"
-        self.plot_status.configure(text=f"copied {lx} = {ev.xdata:.6g}, {ly} = {ev.ydata:.6g}",
-                                   foreground="#060")
-
     def redraw(self, fig, draw=None):
+        """Rebuild a tab's figure on its panel, which holds the view when the
+        user has zoomed or panned (Home releases it)."""
         draw = draw or self.plot_tabs[fig._frame][1]
+        fig._panel.draw(lambda _f: self._draw_into(fig, draw))
+
+    def _draw_into(self, fig, draw):
         fig.clear()
         fig._cursor_axes, fig._cursor_update = [], None
         if fig._frame in getattr(self, "free_tabs", ()):
@@ -6253,7 +6278,6 @@ class App(LightTab):
                 ax.text(0.02, 0.5, f"Could not draw: {exc}", transform=ax.transAxes)
                 ax.set_axis_off()
                 self.log(f"draw: {exc}")
-        fig._canvas.draw_idle()
 
     def on_click(self, ev, fig):
         if getattr(ev, "button", 1) != 1:

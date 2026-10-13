@@ -27,9 +27,12 @@ monitors moved later by a delay - set on a slider (-10..+10 us), or fitted per r
 leaves on the edges (fit_delay) - so a measurement delay of a few us does
 not show up as an error on every edge.
 
-Runs load in the background (a 19-angle scan takes ~10 s) and stay cached;
-the toolbar's save button offers <run>_<tab>.png in the run's folder (its
-saved_figures/ when that exists). The viewer never writes to the data.
+Runs load in the background (a 19-angle scan takes ~10 s) and stay cached.
+The plots sit on the lab's shared plot panel (labplot.py at the repo root):
+the view is held across redraws once zoomed (Home releases it), the wheel
+zooms about the cursor, right-click copies x<TAB>y, and the toolbar's Save
+offers <run>_<tab>.png in the run's folder (its saved_figures/ when that
+exists). The viewer never writes to the data.
 """
 import glob, json, os, queue, sys, threading, time, traceback
 import tkinter as tk
@@ -41,12 +44,11 @@ matplotlib.use("TkAgg")
 warnings.filterwarnings("ignore", message="All-NaN slice encountered")
 warnings.filterwarnings("ignore", message="Mean of empty slice")
 warnings.filterwarnings("ignore", message="No artists with labels found")
-from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+import labplot  # noqa: E402  (the repo root: the lab's shared plot panel)
 from rampol import analysis as an, bias as biasmod, config as cfgmod, hw  # noqa: E402
 
 K_MON = {"MonX1": 90.0 / 5.1283, "MonX2": 90.0 / 5.1374}
@@ -65,10 +67,15 @@ QUANT = {"er": ("ER", "extinction ratio"),
 # --------------------------------------------------------------------- helpers
 def thin(x, y, n=MAX_PTS):
     """(x, y) reduced to about 2 n points keeping every bin's min and max, so
-    spikes survive; untouched when short enough."""
+    spikes survive; untouched when short enough. labplot.thin, except for a
+    trace with NaN in it (a gap), where labplot's argmin/argmax would land on
+    the NaN and swallow the bin: those keep the NaN-aware envelope here."""
     x, y = np.asarray(x), np.asarray(y, float)
     if len(x) <= 2 * n:
         return x, y
+    if not np.isnan(y).any():
+        xs, ys, _step = labplot.thin(x, y, 2 * n)
+        return xs, ys
     m = len(x) // n
     k = m * n
     yb = y[:k].reshape(n, m); xb = x[:k].reshape(n, m)
@@ -366,68 +373,72 @@ def short_labels(names):
 
 
 # ---------------------------------------------------------------------- plots
-class Toolbar(NavigationToolbar2Tk):
-    def save_figure(self, *args):
-        d = getattr(self.canvas, "save_dir", None)
-        if d:
-            sub = os.path.join(d, "saved_figures")
-            matplotlib.rcParams["savefig.directory"] = sub if os.path.isdir(sub) else d
-        return super().save_figure(*args)
+class Plot(labplot.PlotPanel):
+    """The lab's plot panel with the viewer's clear() / draw() contract: the
+    tabs draw into the figure between the two. clear(folder, name) empties
+    it and remembers where Save goes (<run>_<tab>.png in the run's folder,
+    its saved_figures/ when that exists); draw() lays it out (tight_layout,
+    `rect` leaving room for a figure legend) and shows it, putting a held
+    view back. Home redraws the tab through `on_home` (the viewer's refresh)
+    so limits the tab sets itself (robust_ylim) come back too."""
 
-
-class Plot(ttk.Frame):
-    """A matplotlib figure with a toolbar in a frame."""
-
-    def __init__(self, master, **kw):
-        super().__init__(master)
-        self.fig = Figure(figsize=(9, 6), dpi=96, **kw)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-        self.canvas.save_dir = None
-        self.canvas.save_name = "figure.png"
-        self.canvas.get_default_filename = lambda: self.canvas.save_name
-        self.toolbar = Toolbar(self.canvas, self)
-        self.toolbar.update()
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+    def __init__(self, master, on_home=None):
+        super().__init__(master, figsize=(9, 6), dpi=96, constrained=False,
+                         save_name=lambda: self._save_name, save_dir=self._save_folder)
+        self.on_home = on_home
+        self._save_dir = None
+        self._save_name = "figure"
+        self.rect = None            # tight_layout's rect: leave room for a figure legend
+        self._held = None
         # Tk sends the wheel to the widget with the focus: take it on entry
         self.canvas.get_tk_widget().bind("<Enter>", lambda _e: self.canvas.get_tk_widget().focus_set())
 
-    def _on_scroll(self, ev):
-        """Mouse wheel: zoom around the cursor (shift: y only, ctrl: x only).
-        Each step is pushed on the toolbar's view stack, so Back / Home undo
-        it; axes that share x follow."""
-        ax = ev.inaxes
-        if ax is None or ev.xdata is None or ev.ydata is None:
-            return
-        f = 1 / 1.3 if ev.button == "up" else 1.3
-        key = ev.key or ""
-        self.toolbar.push_current()
-        for axis, get, set_, c, on in ((ax.xaxis, ax.get_xlim, ax.set_xlim, ev.xdata, "shift" not in key),
-                                       (ax.yaxis, ax.get_ylim, ax.set_ylim, ev.ydata, "control" not in key and "ctrl" not in key)):
-            if not on:
-                continue
-            tr = axis.get_transform()          # zoom in the axis' own scale (log, symlog, linear)
-            lo, hi = tr.transform(np.array(get(), float))
-            cc = float(tr.transform(np.array([c], float))[0])
-            new = tr.inverted().transform(np.array([cc - (cc - lo) * f, cc + (hi - cc) * f]))
-            set_(*new)
-        self.canvas.draw_idle()
+    def _save_folder(self):
+        d = self._save_dir
+        if d:
+            sub = os.path.join(d, "saved_figures")
+            return sub if os.path.isdir(sub) else d
+        return None
 
     def clear(self, folder=None, name=None):
+        # the limits to put back after the redraw, when the user has zoomed
+        # (only onto the same layout: labplot's layout_key)
+        self._held = ((self.layout_key(), [(ax.get_xlim(), ax.get_ylim()) for ax in self.fig.axes])
+                      if self.view_locked else None)
         self.fig.clear()
-        self.rect = None            # tight_layout's rect: leave room for a figure legend
+        self.rect = None
         if folder:
-            self.canvas.save_dir = folder
+            self._save_dir = folder
         if name:
-            self.canvas.save_name = name.replace(" ", "_").replace("(", "").replace(")", "") + ".png"
+            self._save_name = name.replace(" ", "_").replace("(", "").replace(")", "")
         return self.fig
 
-    def draw(self):
+    def draw(self, fn=None):
+        if fn is not None:          # the panel's own contract, for completeness
+            return super().draw(fn)
         try:
-            self.fig.tight_layout(rect=getattr(self, "rect", None))
+            self.fig.tight_layout(rect=self.rect)
         except Exception:
             pass
+        self.toolbar.update()       # new axes: a fresh Back stack
+        held, self._held = self._held, None
+        if held is not None:
+            key, limits = held
+            if key == self.layout_key():
+                for ax, (xl, yl) in zip(self.fig.axes, limits):
+                    ax.set_xlim(xl)
+                    ax.set_ylim(yl)
+            else:
+                self.lock_view(False)
         self.canvas.draw_idle()
+        self.dirty = False
+
+    def home(self):
+        self.lock_view(False)
+        if self.on_home is not None:
+            self.on_home()
+        else:
+            super().home()
 
 
 # --------------------------------------------------------------------- viewer
@@ -441,6 +452,7 @@ class Viewer(tk.Tk):
         except tk.TclError:
             pass
         self.outdir = outdir
+        labplot.apply_style()
         cfg = cfgmod.load()
         self.sg = hw.load_scope_grab(cfg["scope_grab_path"])
         self.cache = {}            # folder -> load_scan's step cache
@@ -556,19 +568,19 @@ class Viewer(tk.Tk):
         for k, (lab, _) in QUANT.items():
             ttk.Radiobutton(row, text=lab, value=k, variable=self.ov_key, command=self._on_ov_key).pack(side="left", padx=2)
         ttk.Label(row, text="  (click a point in the plot to select it)", style="Sub.TLabel").pack(side="left")
-        self.ov_plot = Plot(f); self.ov_plot.pack(fill="both", expand=True)
+        self.ov_plot = Plot(f, on_home=self._redraw_tab); self.ov_plot.pack(fill="both", expand=True)
         self.ov_plot.canvas.mpl_connect("button_press_event", self._on_ov_click)
         self._ov_hit = None
-        self.null_plot = Plot(self.tabs["Null scan"]); self.null_plot.pack(fill="both", expand=True)
+        self.null_plot = Plot(self.tabs["Null scan"], on_home=self._redraw_tab); self.null_plot.pack(fill="both", expand=True)
         self._delay_row(self.tabs["Tracking"])
         row = ttk.Frame(self.tabs["Tracking"]); row.pack(fill="x", padx=4)
         ttk.Label(row, text="panels:").pack(side="left")
         for k, lab in (("slope", "slope-pair traces"), ("rot", "rotation"), ("lm", "light - monitors"), ("mon", "monitor / command traces")):
             ttk.Checkbutton(row, text=lab, variable=self.trk_show[k], command=self._refresh_tab).pack(side="left", padx=4)
-        self.track_plot = Plot(self.tabs["Tracking"]); self.track_plot.pack(fill="both", expand=True)
-        self.trace_plot = Plot(self.tabs["Traces"]); self.trace_plot.pack(fill="both", expand=True)
+        self.track_plot = Plot(self.tabs["Tracking"], on_home=self._redraw_tab); self.track_plot.pack(fill="both", expand=True)
+        self.trace_plot = Plot(self.tabs["Traces"], on_home=self._redraw_tab); self.trace_plot.pack(fill="both", expand=True)
         self._delay_row(self.tabs["Fit"])
-        self.fit_plot = Plot(self.tabs["Fit"]); self.fit_plot.pack(fill="both", expand=True)
+        self.fit_plot = Plot(self.tabs["Fit"], on_home=self._redraw_tab); self.fit_plot.pack(fill="both", expand=True)
         ef = self.tabs["ER(t)"]
         row = ttk.Frame(ef); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="angles within +-").pack(side="left")
@@ -579,7 +591,7 @@ class Viewer(tk.Tk):
         ttk.Entry(row, textvariable=self.er_box, width=6).pack(side="left")
         ttk.Label(row, text="us").pack(side="left")
         ttk.Button(row, text="recompute", command=self._refresh_tab).pack(side="left", padx=8)
-        self.er_plot = Plot(ef); self.er_plot.pack(fill="both", expand=True)
+        self.er_plot = Plot(ef, on_home=self._redraw_tab); self.er_plot.pack(fill="both", expand=True)
         cf = self.tabs["Compare"]
         row = ttk.Frame(cf); row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="t = 0 at:").pack(side="left")
@@ -596,7 +608,7 @@ class Viewer(tk.Tk):
         cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_tab())
         ttk.Label(row, text="  (the run on screen in black, compared runs in colour)", style="Sub.TLabel").pack(side="left")
         self._delay_row(cf)
-        self.cmp_plot = Plot(cf); self.cmp_plot.pack(fill="both", expand=True)
+        self.cmp_plot = Plot(cf, on_home=self._redraw_tab); self.cmp_plot.pack(fill="both", expand=True)
         df = self.tabs["Details"]
         row = ttk.Frame(df); row.pack(fill="x", padx=4, pady=2)
         ttk.Button(row, text="open folder", command=lambda: self.cur and os.startfile(self.cur[1])).pack(side="left")
@@ -931,6 +943,11 @@ class Viewer(tk.Tk):
             return self.nb.tab(self.nb.select(), "text")
         except tk.TclError:
             return None
+
+    def _redraw_tab(self):
+        """The tab on show again from scratch (a plot's Home)."""
+        self.drawn.pop(self._tab(), None)
+        self._refresh_tab()
 
     def _refresh_tab(self):
         if not self.cur:

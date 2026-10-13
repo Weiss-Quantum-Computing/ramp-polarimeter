@@ -747,6 +747,13 @@ for the scan and the tab - `<scan>_Extinction_vs_rotation.png`,
 `<scan>_Malus_t12.000ms.png`, `compare_<scans>.png` - with _2, _3 ... when
 it exists; PNG at 150 dpi, or PDF / SVG.
 
+The figure tabs use the lab's shared plot panel (labplot.py, vendored from Weiss-Quantum-Computing/lab-plot). Toolbar: Home, Back, Forward, Pan, Zoom, Save. Once you zoom or pan (toolbar or mouse wheel) the view is held across redraws and a blue note says 'zoomed - Home to auto-scale'; Home releases it. The mouse wheel zooms about the cursor (Shift keeps the x range, Ctrl keeps the y range) and each step goes on the Back stack. Right-click copies the cursor position as x<TAB>y to the clipboard. Save proposes <scan>_<tab> in the scan's saved_figures folder and writes PNG at 150 dpi.
+
+On the Shots tab a zoom (toolbar, wheel or Back) also re-reads the files at
+full resolution over the new window; the *t from / to* entries, *Draw*,
+*Whole record* and *Crossed at cursor* ask for a window of their own and
+release a held view first.
+
 With no scan loaded, the Compare tab draws the compared scans (the
 difference from the first of them), and so do the tabs with a *compare
 scans* box: the first compared scan stands in for the shown one.
