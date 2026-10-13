@@ -20,6 +20,40 @@ instead. The second leg takes the same durations and its own start. The
 target is mapped through the same warp: that is the polarization the
 experiment's waveform was meant to produce.
 
+SEVERAL TRANSPORTS IN ONE RECORD (13 Oct 2026). The polarization drifts in a
+hold at high voltage and the drift carries into the next transport, so the
+ILC may train a record holding two or more transports at the spin echo's
+spacing (transport 1, idle, transport 2 16.667 ms later), each getting its
+own learned correction. `transports` splits the record's target into its
+transports (stretches above 0.1 % of the maximum separated by idle, each
+with its own 99.9 % hold); `landmarks` is their envelope, which for a
+one-transport record is that transport, so nothing changes there. The time
+map's knots are ALL transports' landmarks: `fit_time_map` fits each
+transport on its own (fit_timing: start and its three durations, in a
+window that stops halfway through the idle on either side) and the warp runs
+through the concatenated knots, idle stretched linearly between them. A
+second leg (the whole record played again leg_gap_ms later, when that is
+past the record's last fall) keeps every duration and spacing and fits its
+own start.
+    per transport   its landmarks, and from the whole record (band-limited at
+                    f_cut, the EOM-ILC panel's definitions): the signed
+                    extreme of light - monitors and light - target over its
+                    hold +- 0.3 ms and over the first ms after its fall, and
+                    their rms over its active stretch plus that ms
+                    (summary["transports"] for leg 1; summary["legs"][k]
+                    ["transports"] for each leg; a one-transport record gives a
+                    one-element list)
+    whole record    the time map's gain, offset and rms, the per-leg gain /
+                    offset / delay decomposition, the correction (one file per
+                    crystal over the whole record, faded to zero only where
+                    the target rests, i.e. at every transport's ends and in the
+                    idle between them) and its per-crystal numbers, the line
+                    ripple (fitted on the undriven stretches: before the first
+                    transport, between the transports and between the legs).
+summary["timing"][k]["landmarks_ms"] and summary["source_landmarks_ms"]
+stay one array each (the envelope); "transports_ms" and
+"source_transports_ms" hold each transport's.
+
 On each leg:
     light - target      the total error
     monitors - target   the drive's own error as the Trek monitors see it:
@@ -77,35 +111,141 @@ def load_ilc(path):
             "channel": str(z["channel"]), "path": os.path.abspath(path)}
 
 
+def transports(tt, T, min_gap=0.1e-3, min_peak=0.05):
+    """The transports in a target record: one landmark array per transport,
+    [rise start, hold start, hold end, fall end]. A transport is a stretch
+    where T > 0.1 % of the record's maximum, separated from the next by at
+    least min_gap of idle; its hold is where it is above 99.9 % of its OWN
+    maximum. A stretch peaking under min_peak of the record's maximum (an
+    ILC ripple after a fall, say) is not a transport: it joins the one before
+    it (the first one, when it comes before them all). In record order."""
+    T = np.asarray(T, float)
+    idx = np.flatnonzero(T > 1e-3 * T.max())
+    if not idx.size:
+        raise ValueError("the target never leaves zero: no transport in it")
+    br = np.flatnonzero(np.diff(idx) > 1)
+    runs = [[a, b] for a, b in zip(np.r_[idx[0], idx[br + 1]], np.r_[idx[br], idx[-1]])]
+    merged = [runs[0]]
+    for a, b in runs[1:]:
+        if tt[a] - tt[merged[-1][1]] < min_gap:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    big = [r for r in merged if T[r[0]:r[1] + 1].max() >= min_peak * T.max()]
+    for r in merged:
+        if r in big:
+            continue
+        host = max((b for b in big if b[0] < r[0]), key=lambda b: b[0], default=big[0])
+        host[0], host[1] = min(host[0], r[0]), max(host[1], r[1])
+    out = []
+    for a, b in big:
+        seg = T[a:b + 1]
+        hold = np.flatnonzero(seg > 0.999 * seg.max()) + a
+        out.append(np.array([tt[a], tt[hold[0]], tt[hold[-1]], tt[b]]))
+    return out
+
+
+def envelope(tr):
+    """One landmark array over several transports: the first's rise start and
+    hold start, the last's hold end and fall end."""
+    return np.array([tr[0][0], tr[0][1], tr[-1][2], tr[-1][3]])
+
+
 def landmarks(tt, T):
-    """Rise start, hold start, hold end, fall end of a target (0.1 % / 99.9 %)."""
-    on = np.flatnonzero(T > 1e-3 * T.max())
-    hold = np.flatnonzero(T > 0.999 * T.max())
-    return np.array([tt[on[0]], tt[hold[0]], tt[hold[-1]], tt[on[-1]]])
+    """Rise start, hold start, hold end, fall end of a target (0.1 % / 99.9 %).
+    For a record with one transport this is that transport (transports()[0]);
+    with several, their envelope (first rise and hold start, last hold end
+    and fall end) - transports() has each one."""
+    return envelope(transports(tt, T))
 
 
 def warp(S, E, tx):
-    """Experiment time -> ILC-record time through landmark pairs E -> S."""
+    """Experiment time -> ILC-record time through landmark pairs E -> S. S and
+    E: one transport's 4 landmarks, or the knots of several (a list of them,
+    or concatenated), in time order."""
+    S, E = np.ravel(np.asarray(S, float)), np.ravel(np.asarray(E, float))
     return np.interp(tx, np.r_[E[0] - 1, E, E[-1] + 1], np.r_[S[0] - 1, S, S[-1] + 1])
 
 
-def fit_timing(t, y, src_t, src_y, S, start_guess, durations=None, window=12e-3):
+def _gain_offset(t, y, src_t, src_y, S, E, m):
+    """Command gain and offset of src_y mapped through S -> E onto y over the
+    mask m, by linear least squares; and the rms left."""
+    x = np.interp(warp(S, E, t[m]), src_t, src_y)
+    A = np.column_stack([x, np.ones_like(x)])
+    (g, o), *_ = np.linalg.lstsq(A, y[m], rcond=None)
+    return float(g), float(o), float(np.std(A @ [g, o] - y[m]))
+
+
+def fit_time_map(t, y, src_t, src_y, S_tr, start_guess, window=12e-3, log=None):
+    """The time map of a record with one or more transports (S_tr, from
+    transports()). Each transport is fitted on its own (fit_timing: start and
+    its three durations) inside a window that stops halfway through the idle
+    on either side; the first starts from start_guess, each next one from the
+    previous one's fitted start plus the record's start-to-start spacing,
+    refined by a coarse search over +-1 ms. Returns (E_tr, gain, offset, rms):
+    one landmark array per transport, and the command gain, offset and rms of
+    the whole map (for one transport exactly fit_timing's)."""
+    if len(S_tr) == 1:
+        E, g, o, r = fit_timing(t, y, src_t, src_y, S_tr[0], start_guess, window=window)
+        return [E], g, o, r
+    E_tr, masks = [], []
+    for j, S in enumerate(S_tr):
+        if j == 0:
+            guess, lo = start_guess, -np.inf
+        else:
+            Ep, Sp = E_tr[-1], S_tr[j - 1]
+            guess = Ep[0] + (S[0] - Sp[0])
+            lo = Ep[3] + 0.5 * (S[0] - Sp[3])
+        hi = (guess + (S[3] - S[0]) + 0.5 * (S_tr[j + 1][0] - S[3])
+              if j + 1 < len(S_tr) else np.inf)
+        if j > 0:
+            # the spacing in the experiment need not be the record's
+            best = None
+            for sh in np.arange(-1e-3, 1e-3 + 1e-9, 10e-6):
+                m = (t > max(lo, guess + sh - 1.5e-3)) & (t < min(hi, guess + sh + window))
+                if m.sum() < 20:
+                    continue
+                r = _gain_offset(t, y, src_t, src_y, S, S - S[0] + guess + sh, m)[2]
+                if best is None or r < best[0]:
+                    best = (r, sh)
+            if best is not None:
+                guess += best[1]
+        E, g, o, r = fit_timing(t, y, src_t, src_y, S, guess, window=window, span=(lo, hi))
+        E_tr.append(E)
+        masks.append((t > max(lo, guess - 1.5e-3)) & (t < min(hi, guess + window)))
+        if log:
+            log(f"  transport {j + 1}: rise {np.diff(E)[0]*1e3:.3f} / hold "
+                f"{np.diff(E)[1]*1e3:.3f} / fall {np.diff(E)[2]*1e3:.3f} ms from "
+                f"{E[0]*1e3:.3f} ms, gain {g:.4f}, {r*1e3:.1f} mV rms")
+    m = np.any(masks, axis=0)
+    g, o, r = _gain_offset(t, y, src_t, src_y, np.concatenate(S_tr), np.concatenate(E_tr), m)
+    return E_tr, g, o, r
+
+
+def fit_timing(t, y, src_t, src_y, S, start_guess, durations=None, window=12e-3, span=None):
     """Fit the time map (and gain, offset) taking src_y on its record onto y,
     the recorded trace. Free: start, and unless given the rise, hold and fall
-    durations. Returns (E landmarks, gain, offset, rms)."""
+    durations. S: one transport's 4 landmarks; with `durations` given it may
+    hold the knots of several (len(S) - 1 durations: only the start is free).
+    span (lo, hi): the fit window is also kept inside it (the halfway points
+    of the idle to the neighbouring transports). Returns (E landmarks, gain,
+    offset, rms)."""
     from scipy.optimize import least_squares
+    S = np.ravel(np.asarray(S, float))
     m = (t > start_guess - 1.5e-3) & (t < start_guess + window)
+    if span is not None:
+        m &= (t > span[0]) & (t < span[1])
     S_d = np.diff(S)
 
     def unpack(p):
-        d = np.abs(p[1:4]) if durations is None else durations
+        d = np.abs(p[1:len(S)]) if durations is None else durations
         return np.cumsum(np.r_[p[0], d]), p[-2], p[-1]
 
     def resid(p):
         E, g, o = unpack(p)
         return g * np.interp(warp(S, E, t[m]), src_t, src_y) + o - y[m]
     p0 = ([start_guess, *S_d] if durations is None else [start_guess]) + [1.0, 0.0]
-    scale = ([1e-4] * (4 if durations is None else 1)) + [0.01, 0.01]
+    scale = ([1e-4] * (len(S) if durations is None else 1)) + [0.01, 0.01]
     r = least_squares(resid, p0, x_scale=scale)
     E, g, o = unpack(r.x)
     return E, float(g), float(o), float(np.std(r.fun))
@@ -132,12 +272,52 @@ def write_target_csv(path, t, hv, lines):
 
 
 def undriven(t, legs_E, pre_pad=0.3e-3, post_pad=0.6e-3):
-    """The stretches with no ramp: before leg 1 and between the legs (after
-    the last leg the lock may be off, so not used). Bool masks."""
-    segs = [(t > t[0] + 0.2e-3) & (t < legs_E[0][0] - pre_pad)]
-    for a, b in zip(legs_E[:-1], legs_E[1:]):
+    """The stretches with no ramp: before leg 1, between the transports of a
+    leg and between the legs (after the last leg the lock may be off, so not
+    used). legs_E: per leg its landmarks - 4 per transport, as one array of
+    knots or a list of 4-arrays. Bool masks."""
+    tr = [np.asarray(x, float) for E in legs_E for x in np.reshape(np.ravel(
+        np.asarray(E, float)), (-1, 4))]
+    segs = [(t > t[0] + 0.2e-3) & (t < tr[0][0] - pre_pad)]
+    for a, b in zip(tr[:-1], tr[1:]):
         segs.append((t > a[-1] + post_pad) & (t < b[0] - pre_pad))
     return [s for s in segs if s.sum() > 20]
+
+
+TOP_PAD = 0.3e-3      # the hold window of a transport reaches this far past its hold
+AFTER_FALL = 1.0e-3   # the after-fall window: the first ms after a transport's fall
+
+
+def _extreme(t, x, lo, hi):
+    """The signed value of x where |x| is largest over lo <= t <= hi (mdeg)."""
+    m = (t >= lo) & (t <= hi)
+    if not m.any():
+        return float("nan")
+    return float(x[np.flatnonzero(m)[int(np.argmax(np.abs(x[m])))]] * 1e3)
+
+
+def transport_numbers(t, lm_f, lt_f, phi_t, E_tr, next_start=np.inf):
+    """Per transport of one leg: the signed extremes of light - monitors and
+    light - target (lm_f, lt_f, deg, band-limited, on the whole record t)
+    over its hold +- TOP_PAD and over the first ms after its fall (stopped at
+    the next transport's rise), and their rms over its active stretch
+    (target phi_t > 0.5 deg) plus that after-fall window. E_tr: the leg's
+    landmark arrays; next_start: where the next leg starts. List of dicts."""
+    out = []
+    for j, E in enumerate(E_tr):
+        nxt = E_tr[j + 1][0] if j + 1 < len(E_tr) else next_start
+        aft = (E[3], min(E[3] + AFTER_FALL, nxt, t[-1]))
+        act = (((t >= E[0]) & (t <= E[3]) & (phi_t > 0.5))
+               | ((t > aft[0]) & (t <= aft[1])))
+        rms = (lambda x: float(np.sqrt(np.mean(x[act] ** 2)) * 1e3) if act.any()
+               else float("nan"))
+        out.append({"index": j + 1, "landmarks_ms": (np.asarray(E) * 1e3).tolist(),
+                    "top_lm_mdeg": _extreme(t, lm_f, E[1] - TOP_PAD, E[2] + TOP_PAD),
+                    "top_lt_mdeg": _extreme(t, lt_f, E[1] - TOP_PAD, E[2] + TOP_PAD),
+                    "after_fall_lm_mdeg": _extreme(t, lm_f, *aft),
+                    "after_fall_lt_mdeg": _extreme(t, lt_f, *aft),
+                    "lt_rms_mdeg": rms(lt_f), "lm_rms_mdeg": rms(lm_f)})
+    return out
 
 
 def light_minus_monitors(d, pol, sign, v90, pd_delay_us=0.0):
@@ -207,7 +387,13 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
             x[k]["target"] = np.interp(tt, x[k]["t"], x[k]["target"])
             x[k]["u"] = np.interp(tt, x[k]["t"], x[k]["u"])
     v90 = {k: V90.get(x[k]["channel"], (5.1283, 5.1374)[k - 1]) for k in (1, 2)}
-    S = landmarks(tt, x[1]["target"])
+    # the record's transports; S is their envelope (one transport: itself),
+    # Sk all their landmarks: the knots of the time map
+    S_tr = transports(tt, x[1]["target"])
+    S, Sk = envelope(S_tr), np.concatenate(S_tr)
+    if len(S_tr) > 1:
+        log(f"the ILC record holds {len(S_tr)} transports, starting at "
+            + ", ".join(f"{s[0]*1e3:.3f}" for s in S_tr) + " ms")
     t = d.t
     dt_e = float(np.median(np.diff(t)))
     steps = pol["steps"]
@@ -225,22 +411,39 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
         ref_k = 1
         ref_y, src_y, ref_name = mon[1], x[1]["target"], f"MonX1 vs {x[1]['name']} target"
     act = np.flatnonzero(mon[1] > 0.01 * mon[1].max())
-    E1, gain, off, rms = fit_timing(t, ref_y, tt, src_y, S, t[act[0]])
-    timing = [{"leg": 1, "landmarks_ms": (E1 * 1e3).tolist(), "gain": gain, "offset_V": off,
-               "rms_mV": rms * 1e3}]
-    legs_E = [E1]
-    g2 = E1[0] + leg_gap_ms * 1e-3
-    if g2 + (E1[-1] - E1[0]) < t[-1]:
-        E2, g_, o_, r_ = fit_timing(t, ref_y, tt, src_y, S, g2, durations=np.diff(E1))
-        legs_E.append(E2)
-        timing.append({"leg": 2, "landmarks_ms": (E2 * 1e3).tolist(), "gain": g_,
+    # leg 1: every transport on its own; legs_E holds each leg's knots (4 per
+    # transport), legs_tr its landmark arrays, E1 leg 1's envelope
+    E1_tr, gain, off, rms = fit_time_map(t, ref_y, tt, src_y, S_tr, t[act[0]], log=log)
+    E1k, E1 = np.concatenate(E1_tr), envelope(E1_tr)
+    timing = [{"leg": 1, "landmarks_ms": (E1 * 1e3).tolist(),
+               "transports_ms": [(E * 1e3).tolist() for E in E1_tr],
+               "gain": gain, "offset_V": off, "rms_mV": rms * 1e3}]
+    legs_E, legs_tr = [E1k], [E1_tr]
+    # leg 2: the whole record again, same durations and spacings, its own start
+    g2 = E1k[0] + leg_gap_ms * 1e-3
+    if g2 + (E1k[-1] - E1k[0]) < t[-1] and g2 > E1k[-1]:
+        win = 12e-3 if len(S_tr) == 1 else max(12e-3, E1k[-1] - E1k[0] + 1.5e-3)
+        E2k, g_, o_, r_ = fit_timing(t, ref_y, tt, src_y, Sk, g2, durations=np.diff(E1k),
+                                     window=win)
+        E2_tr = list(np.reshape(E2k, (-1, 4)))
+        legs_E.append(E2k)
+        legs_tr.append(E2_tr)
+        timing.append({"leg": 2, "landmarks_ms": (envelope(E2_tr) * 1e3).tolist(),
+                       "transports_ms": [(E * 1e3).tolist() for E in E2_tr], "gain": g_,
                        "offset_V": o_, "rms_mV": r_ * 1e3,
-                       "start_after_leg1_ms": (E2[0] - E1[0]) * 1e3})
-    log(f"time map ({ref_name}): rise {np.diff(E1)[0]*1e3:.3f} / hold "
-        f"{np.diff(E1)[1]*1e3:.3f} / fall {np.diff(E1)[2]*1e3:.3f} ms, "
-        f"{rms*1e3:.1f} mV rms")
+                       "start_after_leg1_ms": (E2k[0] - E1k[0]) * 1e3})
+    elif g2 + (E1k[-1] - E1k[0]) < t[-1]:
+        log(f"no leg 2: {leg_gap_ms:g} ms after leg 1 is inside leg 1's record "
+            f"(its last fall ends {(E1k[-1] - E1k[0])*1e3:.3f} ms after its start)")
+    if len(E1_tr) == 1:
+        log(f"time map ({ref_name}): rise {np.diff(E1)[0]*1e3:.3f} / hold "
+            f"{np.diff(E1)[1]*1e3:.3f} / fall {np.diff(E1)[2]*1e3:.3f} ms, "
+            f"{rms*1e3:.1f} mV rms")
+    else:
+        log(f"time map ({ref_name}): {len(E1_tr)} transports (above), gain {gain:.4f}, "
+            f"{rms*1e3:.1f} mV rms over them all")
 
-    sign = -1.0 if np.median(pol["rotation"][(t > E1[1]) & (t < E1[2])]) < 0 else 1.0
+    sign = -1.0 if np.median(pol["rotation"][(t > E1_tr[0][1]) & (t < E1_tr[0][2])]) < 0 else 1.0
     # the PD's own delay (an anti-alias RC, the detector) is MEASUREMENT, not
     # light: read the light that far later so it lines up with the monitors
     t, rot, pm, lm, mon = light_minus_monitors(d, pol, sign, v90, pd_delay_us)
@@ -286,7 +489,7 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
     legs = []
     for k, E in enumerate(legs_E, 1):
         te = tl + (E[0] - E1[0])
-        src = warp(S, E, te)
+        src = warp(Sk, E, te)
         T = {c: np.interp(src, tt, x[c]["target"], left=0, right=0) for c in (1, 2)}
         phi_t = 90 * (T[1] / v90[1] + T[2] / v90[2])
         phi_l = np.interp(te, t, rot)
@@ -319,7 +522,7 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
     tg = tt.copy()
     dt_g = float(np.median(np.diff(tg)))
     te_g = tg - S[0] + E1[0]
-    src_g = warp(S, E1, te_g)
+    src_g = warp(Sk, E1k, te_g)
     corr_g = np.interp(te_g, tl, corr, left=0, right=0)
     # per-sample error on the coarser ILC grid: the polarimeter's samples
     # merge, so it falls as sqrt(dt_e / dt_g)
@@ -347,9 +550,13 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
         Tp[[0, -1]] = 0.0
         hv_played = np.round(Tp * 1000, 6)        # exactly what the CSV holds
         base = (f"{x[c]['name']} target, time-mapped to the experiment's waveform as recorded "
-                f"in scan {d.name} (rise {np.diff(E1)[0]*1e3:.3f} / hold {np.diff(E1)[1]*1e3:.3f} / "
-                f"fall {np.diff(E1)[2]*1e3:.3f} ms; source {np.diff(S)[0]*1e3:.3f} / "
-                f"{np.diff(S)[1]*1e3:.3f} / {np.diff(S)[2]*1e3:.3f} ms)")
+                f"in scan {d.name} (" + "; ".join(
+                    (f"transport {j + 1} at +{(E[0] - E1[0])*1e3:.3f} ms: " if len(E1_tr) > 1
+                     else "")
+                    + f"rise {np.diff(E)[0]*1e3:.3f} / hold {np.diff(E)[1]*1e3:.3f} / "
+                    f"fall {np.diff(E)[2]*1e3:.3f} ms; source {np.diff(Sj)[0]*1e3:.3f} / "
+                    f"{np.diff(Sj)[1]*1e3:.3f} / {np.diff(Sj)[2]*1e3:.3f} ms"
+                    for j, (E, Sj) in enumerate(zip(E1_tr, S_tr))) + ")")
         src_line = (f"source {x[c]['path']}; {len(tg)} pts at {dt_g*1e6:.4f} us; "
                     f"HV volts at the EOM; written {datetime.date.today()} by "
                     f"ramp-polarimeter rampol/ilc_target.py")
@@ -397,16 +604,41 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
             log(f"removed {os.path.basename(old)} (light - target: double-counts "
                 f"the monitor error once the ILC runs on it)")
 
+    # per transport, from the whole record (a leg's window stops 0.3 ms after
+    # its last fall): light - monitors and light - target band-limited at
+    # f_cut, against the target of every leg (the EOM-ILC panel's definitions)
+    phi_all = np.zeros_like(t)
+    for E in legs_E:
+        src = warp(Sk, E, t)
+        part = 90 * sum(np.interp(src, tt, x[c]["target"], left=0, right=0) / v90[c]
+                        for c in (1, 2))
+        phi_all += np.where((t > E[0] - pad) & (t < E[-1] + AFTER_FALL + pad), part, 0.0)
+    lm_f = corrmod.lowpass(lm, dt_e, f_cut)
+    lt_f = corrmod.lowpass(rot - phi_all, dt_e, f_cut)
+    per_tr = [transport_numbers(t, lm_f, lt_f, phi_all, legs_tr[k],
+                                legs_E[k + 1][0] if k + 1 < len(legs_E) else np.inf)
+              for k in range(len(legs_E))]
+    if len(S_tr) > 1:
+        for k, P in enumerate(per_tr, 1):
+            for p in P:
+                log(f"leg {k} transport {p['index']}: top light-monitors "
+                    f"{p['top_lm_mdeg']:+.0f} mdeg, light-target {p['top_lt_mdeg']:+.0f}; "
+                    f"after the fall {p['after_fall_lm_mdeg']:+.0f} / "
+                    f"{p['after_fall_lt_mdeg']:+.0f} mdeg")
+
     summary = {
         "scan": d.name, "angles": pol["n_angles"],
         "fit_rms_mV": float(np.median(pol["rms"]) * 1e3),
         "sig_psi_mdeg_median": float(np.median(sig) * 1e3),
         "timing_reference": ref_name, "timing": timing,
         "source_landmarks_ms": (S * 1e3).tolist(),
+        "source_transports_ms": [(s_ * 1e3).tolist() for s_ in S_tr],
+        "transports": per_tr[0],
         "rotation_sign_vs_target": sign, "V90_mon": [v90[1], v90[2]],
         "targets": [x[1]["path"], x[2]["path"]], "f_cut_Hz": f_cut,
         "pd_delay_us": float(pd_delay_us),
-        "legs": [{"leg": L["leg"], **{k: L[k] for k in L if k.endswith("_fit")}} for L in legs],
+        "legs": [{"leg": L["leg"], **{k: L[k] for k in L if k.endswith("_fit")},
+                  "transports": P} for L, P in zip(legs, per_tr)],
         "leg2_minus_leg1": (decompose(legs[1]["d_light"] - legs[0]["d_light"], phi_t, dphi_t, active)
                             if len(legs) == 2 else None),
         "line_ripple": {k: (None if v is None else
@@ -424,25 +656,42 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
         json.dump(summary, fh, indent=1)
     np.savez_compressed(os.path.join(out, "target_compare.npz"), t_leg1=tl, phi_target=phi_t,
                         correction_deg=corr, t_ilc=tg, correction_ilc_deg=corr_g,
-                        sigma_ilc_deg=sig_g,
+                        sigma_ilc_deg=sig_g, source_knots_s=Sk,
+                        **{f"leg{k}_knots_s": E for k, E in enumerate(legs_E, 1)},
                         **{f"leg{L['leg']}_{k}": L[k] for L in legs
                            for k in ("phi_light", "phi_mon", "sig", "d_light", "d_mon",
                                      "d_lm", "d_lm_clean", "line")})
     if figs:
-        figures(out, d.name, t, ref_y, tt, src_y, S, legs_E, timing, ref_name, tl, phi_t,
-                legs, corr, f_cut, active, line, segs, lm, rot, mon, v90, line_src)
+        figures(out, d.name, t, ref_y, tt, src_y, Sk, legs_E, timing, ref_name, tl, phi_t,
+                legs, corr, f_cut, active, line, segs, lm, rot, mon, v90, line_src,
+                legs_tr=legs_tr)
     summary["out"] = out
     return summary
 
 
 def figures(out, name, t, ref_y, tt, src_y, S, legs_E, timing, ref_name, tl, phi_t, legs,
-            corr, f_cut, active, line, segs, lm, rot, mon, v90, line_src=None):
+            corr, f_cut, active, line, segs, lm, rot, mon, v90, line_src=None, legs_tr=None):
+    """fig1-5. S, legs_E: the record's and each leg's time-map knots (4 per
+    transport); legs_tr: per leg its transports' landmark arrays (the hold
+    start and end of each are drawn dotted), default from legs_E."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from eomilc import mains
     cols = {1: "#1f77b4", 2: "#d62728"}
     ms = (tl - tl[0]) * 1e3
+    if legs_tr is None:
+        legs_tr = [list(np.reshape(np.ravel(E), (-1, 4))) for E in legs_E]
+
+    def holds(axes, t0=None):
+        """Each transport's hold start and end, dotted: per leg on the time
+        from the trigger (t0 None), else leg 1's on the time from t0."""
+        for a_ in axes:
+            for k, tr in enumerate(legs_tr if t0 is None else legs_tr[:1], 1):
+                for E in tr:
+                    for x_ in (E[1], E[2]):
+                        a_.axvline((x_ - (t0 or 0.0)) * 1e3, ls=":", lw=0.7,
+                                   color=cols.get(k, "0.5") if t0 is None else "0.4")
 
     fig, ax = plt.subplots(2, 1, figsize=(8, 5.5), sharex=True, constrained_layout=True)
     ax[0].plot(t * 1e3, ref_y, color="k", lw=0.8, label="recorded")
@@ -459,6 +708,7 @@ def figures(out, name, t, ref_y, tt, src_y, S, legs_E, timing, ref_name, tl, phi
         m = (t > E[0] - 0.3e-3) & (t < E[-1] + 0.3e-3)
         ax[1].plot(t[m] * 1e3, (ref_y - y)[m] * 1e3, color=cols[tm["leg"]], lw=0.6,
                    label=f"leg {tm['leg']}: rms {tm['rms_mV']:.1f} mV")
+    holds(ax)
     ax[1].set_ylabel("recorded - mapped (mV)")
     ax[1].set_xlabel("time from trigger (ms)")
     ax[1].legend(fontsize=8)
@@ -480,6 +730,7 @@ def figures(out, name, t, ref_y, tt, src_y, S, legs_E, timing, ref_name, tl, phi
                    label=f"monitors - target, leg {L['leg']}")
     s = legs[0]["sig"] * 1e3
     ax[1].fill_between(ms, -s, s, color="0.6", alpha=0.5, lw=0, label="+-1 SD, light")
+    holds(ax, tl[0])
     ax[1].set_ylabel("difference (mdeg)")
     ax[1].set_xlabel("time from leg start (ms)")
     ax[1].legend(fontsize=7, ncol=2)
@@ -504,6 +755,7 @@ def figures(out, name, t, ref_y, tt, src_y, S, legs_E, timing, ref_name, tl, phi
         ax[1].set_xlabel("time from leg start (ms)")
         ax[1].set_ylabel("leg 2 - leg 1 (mdeg)")
         ax[1].set_title("Leg 2 minus leg 1 (one drive plays both)")
+        holds(ax[1:], tl[0])
         ax[1].legend(fontsize=8)
         ax[1].grid(alpha=0.3)
     fig.savefig(os.path.join(out, "fig3_error_structure.png"), dpi=130)
@@ -524,6 +776,7 @@ def figures(out, name, t, ref_y, tt, src_y, S, legs_E, timing, ref_name, tl, phi
     ax[1].set_ylabel("V at the EOM")
     ax[1].set_xlabel("time from leg start (ms)")
     ax[1].set_title("Per-crystal change to the ILC targets (half the angle each)")
+    holds(ax, tl[0])
     ax[1].legend(fontsize=8)
     ax[1].grid(alpha=0.3)
     fig.savefig(os.path.join(out, "fig4_correction.png"), dpi=130)

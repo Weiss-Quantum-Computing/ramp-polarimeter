@@ -390,7 +390,17 @@ way. It writes into `SCAN_FOLDER/analysis/target_compare/`:
 - `fig5_line_ripple` - the undriven stretches with the 60 Hz family (fitted in the line-reference scan, or here only for show)
 - `target_<name>_played.csv` - the ILC target with the experiment's timing: what the ILC should converge to for this sequence (`time_us,voltage_V`, EOM volts, 2 us; loads with `run_ilc.load_target`)
 - `corr_<name>_optical.csv` - the target correction for that crystal, in EOM-ILC's correction format (`eomilc/corrections.py`), for the ILC panel's **Corrections** tab
-- `summary.json` - time map, gain/offset/delay decomposition per leg, leg 2 - leg 1, line ripple, correction sizes
+- `summary.json` - time map, gain/offset/delay decomposition per leg, leg 2 - leg 1, line ripple, correction sizes, and per transport (`transports`, and under each leg) its landmarks, the extremes of light - monitors / light - target over its hold and the first ms after its fall, and their rms
+
+**Several transports in one record** (13 Oct 2026: the hold's drift carries
+into the next transport, so the ILC may train transport 1, idle, transport
+2 16.667 ms later as one record). Each transport is located in the target
+on its own (0.1 % / 99.9 % of its own peak) and gets its own time map
+(start, rise, hold, fall), the figures mark each one's hold dotted, and the
+summary reports each one's numbers. The correction stays one waveform per
+crystal over the whole record. A second leg is fitted only when it starts
+after the record's last fall. A one-transport record comes out exactly as
+before.
 
 **The correction is minus (light - monitors)**, low-passed (2 kHz), split
 between the crystals (half each by default), zero where the target rests.
