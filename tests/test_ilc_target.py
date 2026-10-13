@@ -55,10 +55,12 @@ def expected_landmarks(start):
                      start + 2 * RISE + HOLD - a])
 
 
-def bench_scan(tmp, sg, tt, T, play_t, play_T, name):
+def bench_scan(tmp, sg, tt, T, play_t, play_T, name, parked=None):
     """ILC states for EO1/EO2 (target T on the record tt, drive = T over the
     AWG gain), the bench's AWG playing play_T (on its own grid from the
-    trigger), and a ramp scan of it. Returns (scan folder, x1, x2)."""
+    trigger), and a ramp scan of it. Returns (scan folder, x1, x2). parked
+    (1 or 2): that channel's state carries a flat target and drive, and the
+    bench plays it flat - a solo scan of the other crystal."""
     bench = sim.Bench(seed=7)
     scope, ell, bench = sim.make(sg, bench=bench,
                                  roles={1: "CmdX1", 2: "PD", 3: "MonX1", 4: "MonX2"})
@@ -67,10 +69,11 @@ def bench_scan(tmp, sg, tt, T, play_t, play_T, name):
     states = []
     for ch, eo in ((1, "EO1"), (2, "EO2")):
         p = os.path.join(tmp, f"drive_{name}X{ch}.state.npz")
-        np.savez(p, t=tt, target=T, u=T / bench.awg_gain[ch], dt=DT,
+        Tc, Pc = (np.zeros_like(T), np.zeros_like(play_T)) if ch == parked else (T, play_T)
+        np.savez(p, t=tt, target=Tc, u=Tc / bench.awg_gain[ch], dt=DT,
                  name=f"{name}X{ch}", channel=eo, iteration=1)
         states.append(p)
-        bench.awg_drive[ch] = (len(play_t) * DT, play_T / bench.awg_gain[ch])
+        bench.awg_drive[ch] = (len(play_t) * DT, Pc / bench.awg_gain[ch])
         bench.awg_on[ch] = True
     link, rot = hw.ScopeLink(scope, log=lambda *_: None), hw.Rotator(ell, log=lambda *_: None)
     chans = {1: ("CmdX1", "Trek X1 command"), 2: ("PD", "Analyzer PD"), 3: ("MonX1", "X1"),
@@ -172,6 +175,41 @@ def one_transport(sg):
           {k: round(s["transports"][0][k], 1) for k in keys})
 
 
+def solo(sg):
+    print("\none crystal alone, the other parked (a flat state): the correction goes to it")
+    tmp = tempfile.mkdtemp(prefix="rampol-ilcsolo-")
+    tt, T = record([0.2e-3], 12e-3)
+    pt, pT = record([0.2e-3], 25e-3)
+    keys = ("top_lm_mdeg", "top_lt_mdeg", "after_fall_lm_mdeg", "after_fall_lt_mdeg")
+    for park, lead, other in ((2, "X1", "EO2"), (1, "X2", "EO1")):
+        folder, x1, x2 = bench_scan(tmp, sg, tt, T, pt, pT, f"SO{park}", parked=park)
+        s, lines = run_compare(folder, x1, x2, leg_gap_ms=1e6)
+        mine = "EO1" if lead == "X1" else "EO2"
+        pc = s["correction"]["per_crystal"]
+        check(f"{lead} alone: summary says solo {lead}, driven [{lead}]",
+              s["solo"] == lead and s["driven"] == [lead], (s["solo"], s["driven"]))
+        check(f"{lead} alone: the whole correction on {mine}, none on {other}",
+              pc[other]["peak_V"] == 0.0 and pc[mine]["peak_V"] > 0
+              and s["correction"]["split_X1"] == (1.0 if lead == "X1" else 0.0),
+              {k: round(v["peak_V"], 4) for k, v in pc.items()})
+        check(f"{lead} alone: logged", any(f"{lead} alone" in l and "parked" in l for l in lines))
+        check(f"{lead} alone: the time map and the transport read the driven crystal",
+              len(s["timing"]) == 1 and len(s["transports"]) == 1
+              and close(s["source_landmarks_ms"], BASELINE["source_landmarks_ms"])
+              and (lead == "X1" or "MonX2" in s["timing_reference"] or "CmdX" in s["timing_reference"]),
+              s["timing_reference"])
+        check(f"{lead} alone: the transport's numbers finite",
+              all(np.isfinite(s["transports"][0][k]) for k in keys),
+              {k: round(s["transports"][0][k], 1) for k in keys})
+    tmp2 = tempfile.mkdtemp(prefix="rampol-ilcnone-")
+    folder, x1, x2 = bench_scan(tmp2, sg, tt, np.zeros_like(T), pt, np.zeros_like(pT), "NONE")
+    try:
+        run_compare(folder, x1, x2, leg_gap_ms=1e6)
+        check("both flat is refused", False)
+    except ValueError as e:
+        check("both flat is refused", "nothing was driven" in str(e), str(e)[:60])
+
+
 def two_transports(sg):
     print("\ntwo transports in one record (starts 0.2 and 16.867 ms), played as recorded")
     tmp = tempfile.mkdtemp(prefix="rampol-ilc2-")
@@ -263,6 +301,7 @@ def main():
     sg = hw.load_scope_grab(config.DEFAULTS["scope_grab_path"])
     time_map_checks()
     one_transport(sg)
+    solo(sg)
     two_transports(sg)
     print()
     if FAILS:

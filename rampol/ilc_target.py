@@ -387,9 +387,26 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
             x[k]["target"] = np.interp(tt, x[k]["t"], x[k]["target"])
             x[k]["u"] = np.interp(tt, x[k]["t"], x[k]["u"])
     v90 = {k: V90.get(x[k]["channel"], (5.1283, 5.1374)[k - 1]) for k in (1, 2)}
+    # SOLO scans (13 Oct 2026): one crystal drives while the other is parked
+    # at its idle, so the light's departure from the monitors is that
+    # crystal's alone and the whole correction is attributed to it. A parked
+    # state carries a flat target; everything that reads "the" target (the
+    # transports, the timing reference, the active stretch, the fade) reads
+    # the first ACTIVE crystal's, and `split` is overridden to send the
+    # correction to it. Both active: as before (X1 leads).
+    driven = [k for k in (1, 2) if np.ptp(x[k]["target"]) > 1e-9]
+    if not driven:
+        raise ValueError("both states carry a flat target: nothing was driven")
+    lead = driven[0]
+    solo = None
+    if len(driven) == 1:
+        solo = f"X{lead}"
+        split = 1.0 if lead == 1 else 0.0
+        log(f"{solo} alone: X{3 - lead}'s target is flat (parked), so the whole "
+            f"correction goes to {solo} (split {split:g})")
     # the record's transports; S is their envelope (one transport: itself),
     # Sk all their landmarks: the knots of the time map
-    S_tr = transports(tt, x[1]["target"])
+    S_tr = transports(tt, x[lead]["target"])
     S, Sk = envelope(S_tr), np.concatenate(S_tr)
     if len(S_tr) > 1:
         log(f"the ILC record holds {len(S_tr)} transports, starting at "
@@ -403,14 +420,15 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
     sign0 = 1.0
     _, _, _, _, mon = light_minus_monitors(d, pol, sign0, v90)
 
-    # the reference for timing: a recorded command against its drive, else a monitor
-    ref_k = next((k for k in (1, 2) if f"CmdX{k}" in d.roles), None)
+    # the reference for timing: an ACTIVE crystal's recorded command against
+    # its drive, else the leading active crystal's monitor against its target
+    ref_k = next((k for k in driven if f"CmdX{k}" in d.roles), None)
     if ref_k is not None:
         ref_y, src_y, ref_name = mean(f"CmdX{ref_k}"), x[ref_k]["u"], f"CmdX{ref_k} vs {x[ref_k]['name']} drive"
     else:
-        ref_k = 1
-        ref_y, src_y, ref_name = mon[1], x[1]["target"], f"MonX1 vs {x[1]['name']} target"
-    act = np.flatnonzero(mon[1] > 0.01 * mon[1].max())
+        ref_k = lead
+        ref_y, src_y, ref_name = mon[lead], x[lead]["target"], f"MonX{lead} vs {x[lead]['name']} target"
+    act = np.flatnonzero(mon[lead] > 0.01 * mon[lead].max())
     # leg 1: every transport on its own; legs_E holds each leg's knots (4 per
     # transport), legs_tr its landmark arrays, E1 leg 1's envelope
     E1_tr, gain, off, rms = fit_time_map(t, ref_y, tt, src_y, S_tr, t[act[0]], log=log)
@@ -529,7 +547,7 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
     sig_g = np.interp(te_g, tl, sig_mean, left=0, right=0) * np.sqrt(min(dt_e / dt_g, 1.0))
     # the rotation is measured from rest, so there is nothing to correct where
     # the target is at rest, and the ILC needs both ends exactly at 0 V
-    T1p = np.interp(src_g, tt, x[1]["target"], left=0, right=0)
+    T1p = np.interp(src_g, tt, x[lead]["target"], left=0, right=0)
     fade = np.clip(T1p / (0.02 * T1p.max()), 0, 1)
     corr_g = corr_g * fade
 
@@ -635,6 +653,7 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
         "source_transports_ms": [(s_ * 1e3).tolist() for s_ in S_tr],
         "transports": per_tr[0],
         "rotation_sign_vs_target": sign, "V90_mon": [v90[1], v90[2]],
+        "solo": solo, "driven": [f"X{k}" for k in driven],
         "targets": [x[1]["path"], x[2]["path"]], "f_cut_Hz": f_cut,
         "pd_delay_us": float(pd_delay_us),
         "legs": [{"leg": L["leg"], **{k: L[k] for k in L if k.endswith("_fit")},
