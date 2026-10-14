@@ -210,6 +210,40 @@ def solo(sg):
         check("both flat is refused", "nothing was driven" in str(e), str(e)[:60])
 
 
+def whole_record(sg):
+    print("\nwhole_record: the correction runs lead to tail, faded only at the record's ends")
+    tmp = tempfile.mkdtemp(prefix="rampol-ilcwhole-")
+    tt, T = record([0.2e-3], 12e-3)
+    pt, pT = record([0.2e-3], 25e-3)
+    folder, x1, x2 = bench_scan(tmp, sg, tt, T, pt, pT, "WR1")
+    import csv
+    def col(p):
+        rows = [r for r in csv.reader(open(p)) if r and not r[0].startswith("#") and r[0] != "time_us"]
+        return np.array([float(r[0]) for r in rows]), np.array([float(r[1]) for r in rows])
+    # both comparisons write the same file names: read each before the next runs
+    s0, _ = run_compare(folder, x1, x2, leg_gap_ms=1e6)
+    c0 = next(p for p in s0["correction"]["files"] if os.path.basename(p).startswith("corr_") and "X1" in p)
+    t0, v0 = col(c0)
+    s1, _ = run_compare(folder, x1, x2, leg_gap_ms=1e6, whole_record=True)
+    c1 = next(p for p in s1["correction"]["files"] if os.path.basename(p).startswith("corr_") and "X1" in p)
+    t1, v1 = col(c1)
+    check("the summary says so", s1["whole_record"] is True and s0["whole_record"] is False)
+    rest = (tt * 1e6 > 7.0e3)                  # after the transport (S ends at 6.148 ms)
+    check("both files on the ILC grid", len(v0) == len(tt) and len(v1) == len(tt))
+    check("the active-only file is zero after the transport", np.all(v0[rest] == 0.0),
+          f"max {np.max(np.abs(v0[rest])):.3g} V")
+    check("the whole-record file carries the after-transport light (nonzero there)",
+          np.any(v1[rest] != 0.0) and v1[0] == 0.0 and v1[-1] == 0.0,
+          f"max {np.max(np.abs(v1[rest])):.3g} V after the transport, ends {v1[0]:g} / {v1[-1]:g}")
+    # the low-pass sees different neighbours at the transport's edges (zeros vs
+    # the measured idle), so compare the hold, well inside
+    inside = (tt * 1e6 > 2.9e3) & (tt * 1e6 < 3.5e3)
+    check("inside the transport both agree", np.allclose(v0[inside], v1[inside], atol=2e-3),
+          f"max diff {np.max(np.abs(v0[inside] - v1[inside])):.3g} V")
+    check("the per-transport numbers do not change", close(s0["transports"][0]["top_lm_mdeg"],
+                                                           s1["transports"][0]["top_lm_mdeg"]))
+
+
 def two_transports(sg):
     print("\ntwo transports in one record (starts 0.2 and 16.867 ms), played as recorded")
     tmp = tempfile.mkdtemp(prefix="rampol-ilc2-")
@@ -302,6 +336,7 @@ def main():
     time_map_checks()
     one_transport(sg)
     solo(sg)
+    whole_record(sg)
     two_transports(sg)
     print()
     if FAILS:

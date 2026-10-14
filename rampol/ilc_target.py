@@ -367,7 +367,8 @@ def line_reference(path, sign, v90, line_f, line_h, t_end, load_capture,
 
 def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
             pd_delay_us=0.0, line_f=60.0, line_h=3, split=0.5, line_ref=None,
-            scope_grab_path=None, eomilc_path=None, log=print, figs=True):
+            scope_grab_path=None, eomilc_path=None, log=print, figs=True,
+            whole_record=False):
     """Everything the CLI does; returns the summary dict (and writes the
     outputs). x1/x2: ILC state files (drive_*.state.npz) for EO1 and EO2.
     line_ref: a scan of the same sequence with the ramps off (see LINE
@@ -503,7 +504,16 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
 
     # each leg on its own time window, all compared on leg 1's time axis
     pad = 0.3e-3
-    tl = np.arange(E1[0] - pad, E1[-1] + pad, dt_e)
+    if whole_record:
+        # the ILC's use (14 Oct 2026): the light after the fall is part of
+        # what the loop must correct (the crystal's memory keeps the light
+        # rotated for tens of ms after a transport), so the comparison and
+        # the correction run over the whole played record, lead to tail,
+        # not the transports' window; the record itself is built long enough
+        # to hold the time of interest (a spin echo's full 2 x 16.667 ms)
+        tl = np.arange(E1[0] - (S[0] - tt[0]), E1[0] + (tt[-1] - S[0]), dt_e)
+    else:
+        tl = np.arange(E1[0] - pad, E1[-1] + pad, dt_e)
     legs = []
     for k, E in enumerate(legs_E, 1):
         te = tl + (E[0] - E1[0])
@@ -529,7 +539,10 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
     n_l = len(legs)
     d_mean = np.mean([L["d_lm_clean"] for L in legs], axis=0)
     sig_mean = np.sqrt(np.sum([L["sig"] ** 2 for L in legs], axis=0)) / n_l
-    corr = -corrmod.lowpass(np.where(active, d_mean, 0.0), dt_e, f_cut)
+    # whole_record: everywhere the light was measured, the idle after a
+    # transport included (the memory the monitors cannot see); else only
+    # where the target is active
+    corr = -corrmod.lowpass(d_mean if whole_record else np.where(active, d_mean, 0.0), dt_e, f_cut)
     n_t = int(0.2e-3 / dt_e)
     taper = np.ones_like(corr)
     taper[:n_t] = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, n_t))
@@ -548,7 +561,17 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
     # the rotation is measured from rest, so there is nothing to correct where
     # the target is at rest, and the ILC needs both ends exactly at 0 V
     T1p = np.interp(src_g, tt, x[lead]["target"], left=0, right=0)
-    fade = np.clip(T1p / (0.02 * T1p.max()), 0, 1)
+    if whole_record:
+        # nothing faded where the target rests: the correction holds over the
+        # whole record and only its two ends go exactly to zero (the AWG idles
+        # on the first sample; the ILC's gate fades 200 us at each end)
+        fade = np.ones_like(T1p)
+        n_g = max(2, int(0.2e-3 / dt_g))
+        fade[:n_g] = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, n_g))
+        fade[-n_g:] = fade[:n_g][::-1]
+        fade[[0, -1]] = 0.0
+    else:
+        fade = np.clip(T1p / (0.02 * T1p.max()), 0, 1)
     corr_g = corr_g * fade
 
     out = os.path.join(d.folder, "analysis", "target_compare")
@@ -653,7 +676,7 @@ def compare(scan, x1, x2, f_cut=2000.0, lock_tol=0.006, leg_gap_ms=16.667,
         "source_transports_ms": [(s_ * 1e3).tolist() for s_ in S_tr],
         "transports": per_tr[0],
         "rotation_sign_vs_target": sign, "V90_mon": [v90[1], v90[2]],
-        "solo": solo, "driven": [f"X{k}" for k in driven],
+        "solo": solo, "driven": [f"X{k}" for k in driven], "whole_record": bool(whole_record),
         "targets": [x[1]["path"], x[2]["path"]], "f_cut_Hz": f_cut,
         "pd_delay_us": float(pd_delay_us),
         "legs": [{"leg": L["leg"], **{k: L[k] for k in L if k.endswith("_fit")},
