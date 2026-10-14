@@ -141,6 +141,28 @@ def main():
         err = str(exc)
     check("reads that keep failing still stop it (after the retries)", err is not None, err)
     scope.record = rec0
+    # one block that fails every retry is DROPPED and the step goes on with the
+    # others (14 Oct 2026): count the arms, fail block 2's three attempts
+    singles = {"n": 0}
+    single0 = scope.single
+
+    def counting_single(*a, **k):
+        singles["n"] += 1
+        return single0(*a, **k)
+
+    def bad_block2(*a, **k):
+        if singles["n"] in (2, 3, 4):
+            raise ValueError("invalid literal for int() with base 10: b''")
+        return rec0(*a, **k)
+    scope.single, scope.record = counting_single, bad_block2
+    logs.clear()
+    got = []
+    link.acquire_blocks([1, 2], "single", 3, 3, points=2000,
+                        on_block=lambda k, recs, hits: got.append(k))
+    check("a block that fails all its retries is dropped, the other blocks are kept",
+          got == [0, 2] and any("block 2 DROPPED" in m for m in logs) and singles["n"] == 5,
+          (got, singles["n"], [m for m in logs if "DROPPED" in m][:1]))
+    scope.single, scope.record = single0, rec0
 
     print()
     if FAILS:

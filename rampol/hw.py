@@ -322,12 +322,14 @@ class ScopeLink:
         try:
             if mode == "average":
                 self.set_acquisition("average", per)
+            dropped, last_exc = 0, None
             for k in range(blocks):
                 if cancelled():
                     raise Cancelled()
                 if plan:
                     for ch, exc in self.scope.dither_step(plan, k, blocks).items():
                         self.log(f"  dither: CH{ch} offset refused ({exc})")
+                recs = None
                 for attempt in range(READ_RETRIES + 1):
                     try:
                         recs, hits = self._block(chans, mode, per, points, wait_s, cancelled)
@@ -335,13 +337,25 @@ class ScopeLink:
                     except (Cancelled, NoTrigger):
                         raise
                     except READ_ERRORS as exc:
+                        last_exc = exc
                         if attempt == READ_RETRIES:
-                            raise
+                            # the block is lost, not the run: a step of 7 shots is a
+                            # step (14 Oct 2026; before, three failures in a row ended
+                            # an overnight run). A step that loses EVERY block raises.
+                            dropped += 1
+                            self.log(f"  scope read failed {READ_RETRIES + 1} times "
+                                     f"({type(exc).__name__}: {exc}) - block {k + 1} DROPPED")
+                            self._clear()
+                            break
                         self.log(f"  scope read failed ({type(exc).__name__}: {exc}) - "
                                  f"output queue cleared, block {k + 1} taken again")
                         self._clear()
+                if recs is None:
+                    continue
                 if on_block:
                     on_block(k, recs, hits)
+            if dropped and dropped >= blocks:
+                raise last_exc
         finally:
             if plan:
                 for ch, exc in self.scope.restore_offsets(plan).items():
