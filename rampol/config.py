@@ -325,10 +325,13 @@ def load():
     return cfg
 
 
-def replace_retrying(tmp, path, tries=20, wait=0.05):
+def replace_retrying(tmp, path, tries=60, wait=0.05):
     """os.replace, retried: on Windows a virus scanner, the indexer or
     OneDrive can hold the target open for a moment and the rename then fails
-    with Access is denied (seen 5 Oct 2026 on a scan manifest)."""
+    with Access is denied (seen 5 Oct 2026 on a scan manifest; 14 Oct 2026
+    the 20 x 0.05 s here were not enough for a manifest written a second
+    after its creation, which ended an ILC optical stage). The wait grows
+    to 0.5 s; about 25 s in all before giving up."""
     import time
     for k in range(tries):
         try:
@@ -337,7 +340,7 @@ def replace_retrying(tmp, path, tries=20, wait=0.05):
         except PermissionError:
             if k == tries - 1:
                 raise
-            time.sleep(wait)
+            time.sleep(min(0.5, wait * (1.0 + k / 4.0)))
 
 
 def save(cfg):
